@@ -1,0 +1,44 @@
+[
+  {
+    "dataset_version": "legacy",
+    "version_order": 0,
+    "is_latest": false,
+    "version_weight": 0.6
+  },
+  {
+    "dataset_version": "v1.0",
+    "version_order": 1,
+    "is_latest": false,
+    "version_weight": 0.666667
+  },
+  {
+    "dataset_version": "v2.0",
+    "version_order": 2,
+    "is_latest": false,
+    "version_weight": 0.733333
+  },
+  {
+    "dataset_version": "v3.0",
+    "version_order": 3,
+    "is_latest": false,
+    "version_weight": 0.8
+  },
+  {
+    "dataset_version": "v4.0",
+    "version_order": 4,
+    "is_latest": false,
+    "version_weight": 0.866667
+  },
+  {
+    "dataset_version": "v5.0",
+    "version_order": 5,
+    "is_latest": false,
+    "version_weight": 0.933333
+  },
+  {
+    "dataset_version": "v6.0",
+    "version_order": 6,
+    "is_latest": true,
+    "version_weight": 1.0
+  }
+]
