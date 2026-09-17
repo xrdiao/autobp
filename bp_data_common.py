@@ -4,6 +4,7 @@ import json
 import os
 import pickle
 import sqlite3
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -69,46 +70,79 @@ def open_record_db(path, table_name, indexed_columns):
     return conn
 
 
+def find_existing_record_keys(conn, table_name, keys, chunk_size=500):
+    unique_keys = list(dict.fromkeys(str(key) for key in keys if key))
+    if not unique_keys:
+        return set()
+
+    existing = set()
+    for start in range(0, len(unique_keys), max(1, int(chunk_size))):
+        chunk = unique_keys[start : start + max(1, int(chunk_size))]
+        placeholders = ", ".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"SELECT key FROM {table_name} WHERE key IN ({placeholders})",
+            chunk,
+        ).fetchall()
+        existing.update(row[0] for row in rows)
+    return existing
+
+
 def upsert_record_rows(path, table_name, rows, indexed_columns, key_fn):
     rows = list(rows or [])
     if not rows:
         return 0, 0, 0
     conn = open_record_db(path, table_name, indexed_columns)
-    appended = 0
-    replaced = 0
     skipped = 0
     placeholders = ", ".join(["?"] * (len(indexed_columns) + 3))
     columns_sql = ", ".join(["key", *indexed_columns, "record", "updated_at"])
     update_columns_sql = ", ".join(
         [f"{name}=excluded.{name}" for name in indexed_columns] + ["record=excluded.record", "updated_at=excluded.updated_at"]
     )
-    now_value = int(__import__("time").time())
+    now_value = int(time.time())
     try:
-        with conn:
-            for row in rows:
-                key = str(key_fn(row) or "")
-                if not key:
-                    skipped += 1
-                    continue
-                existed = conn.execute(f"SELECT 1 FROM {table_name} WHERE key = ?", (key,)).fetchone() is not None
-                values = [
+        prepared = []
+        for row in rows:
+            key = str(key_fn(row) or "")
+            if not key:
+                skipped += 1
+                continue
+            prepared.append(
+                (
                     key,
-                    *[None if row.get(name) is None else str(row.get(name)) for name in indexed_columns],
-                    sqlite3.Binary(pickle.dumps(row, protocol=pickle.HIGHEST_PROTOCOL)),
-                    now_value,
-                ]
-                conn.execute(
-                    f"""
-                    INSERT INTO {table_name} ({columns_sql})
-                    VALUES ({placeholders})
-                    ON CONFLICT(key) DO UPDATE SET {update_columns_sql}
-                    """,
-                    values,
+                    [
+                        key,
+                        *[None if row.get(name) is None else str(row.get(name)) for name in indexed_columns],
+                        sqlite3.Binary(pickle.dumps(row, protocol=pickle.HIGHEST_PROTOCOL)),
+                        now_value,
+                    ],
                 )
-                if existed:
-                    replaced += 1
-                else:
-                    appended += 1
+            )
+
+        if not prepared:
+            return 0, 0, skipped
+
+        existing_keys = find_existing_record_keys(conn, table_name, [key for key, _values in prepared])
+        seen_keys = set()
+        appended = 0
+        replaced = 0
+        values = []
+        for key, row_values in prepared:
+            if key in existing_keys or key in seen_keys:
+                replaced += 1
+            else:
+                appended += 1
+            seen_keys.add(key)
+            values.append(row_values)
+
+        with conn:
+            conn.executemany(
+                f"""
+                INSERT INTO {table_name} ({columns_sql})
+                VALUES ({placeholders})
+                ON CONFLICT(key) DO UPDATE SET {update_columns_sql}
+                """,
+                values,
+            )
     finally:
         conn.close()
     return appended, replaced, skipped
@@ -159,22 +193,32 @@ class NameResolver:
             for key, value in display_name_map.items()
             if key and value
         }
+        self._slug_cache = {}
         for slug, display_name in self.display_name_map.items():
             self.alias_map.setdefault(slug, slug)
             self.alias_map.setdefault(normalize_name(display_name), slug)
             self.alias_map.setdefault(slugify_fallback(display_name), slug)
 
     def to_slug(self, value):
+        cache_key = "" if value is None else str(value)
+        if cache_key in self._slug_cache:
+            return self._slug_cache[cache_key]
+
         normalized = normalize_name(value)
         if not normalized:
+            self._slug_cache[cache_key] = ""
             return ""
         fallback = slugify_fallback(value)
         sanitized_fallback = fallback.replace("[", "").replace("]", "")
         for key in (normalized, fallback, sanitized_fallback):
             resolved = self.alias_map.get(key)
             if resolved:
-                return normalize_name(resolved)
-        return sanitized_fallback or fallback or normalized
+                result = normalize_name(resolved)
+                self._slug_cache[cache_key] = result
+                return result
+        result = sanitized_fallback or fallback or normalized
+        self._slug_cache[cache_key] = result
+        return result
 
     def normalize_slug_list(self, values):
         return [slug for slug in (self.to_slug(value) for value in (values or [])) if slug]

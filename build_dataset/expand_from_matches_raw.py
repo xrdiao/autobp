@@ -91,9 +91,13 @@ def save_with_log(label: str, save_func, data, path: str):
     size_mb = os.path.getsize(path) / 1024 / 1024
     print(f"Saved {label}: {size_mb:.1f} MB in {elapsed:.1f}s", flush=True)
 
-def result_to_win_flag(result) -> bool:
+def result_to_win_flag(result) -> bool | None:
     text = str(result or "").strip().lower()
-    return text in {"win", "victory", "winner"}
+    if text in {"win", "victory", "winner"}:
+        return True
+    if text in {"lose", "loss", "defeat"}:
+        return False
+    return None
 
 def get_side_value(picks: list, field_name: str, value_name: str):
     for x in picks:
@@ -116,19 +120,6 @@ def build_combined_sequence(match: dict):
             })
     combined.sort(key=lambda x: x["order"])
     return combined
-
-def extract_future_sequence(combined_sequence: list, start_idx: int):
-    remaining = combined_sequence[start_idx:]
-    my_future = [item.get("name") for item in remaining if item.get("side") == "me" and item.get("name")]
-    enemy_future = [item.get("name") for item in remaining if item.get("side") == "enemy" and item.get("name")]
-    my_future_slugs = [item.get("slug") for item in remaining if item.get("side") == "me" and item.get("slug")]
-    enemy_future_slugs = [item.get("slug") for item in remaining if item.get("side") == "enemy" and item.get("slug")]
-    return {
-        "remaining_my_picks": my_future,
-        "remaining_enemy_picks": enemy_future,
-        "remaining_my_pick_slugs": my_future_slugs,
-        "remaining_enemy_pick_slugs": enemy_future_slugs,
-    }
 
 def validate_match_sequence(combined_sequence: list) -> bool:
     if len(combined_sequence) != 10:
@@ -171,17 +162,43 @@ def expand_one_match(match: dict):
     self_info = match.get("self") or {}
     opponent_info = match.get("opponent") or {}
 
-    my_current = []
-    enemy_current = []
     samples = []
     me_only_samples = []
-    final_my_picks = [item.get("name") for item in combined_sequence if item.get("side") == "me" and item.get("name")]
-    final_enemy_picks = [item.get("name") for item in combined_sequence if item.get("side") == "enemy" and item.get("name")]
-    final_my_pick_slugs = [item.get("slug") for item in combined_sequence if item.get("side") == "me" and item.get("slug")]
-    final_enemy_pick_slugs = [item.get("slug") for item in combined_sequence if item.get("side") == "enemy" and item.get("slug")]
+    my_sequence = [item for item in combined_sequence if item.get("side") == "me"]
+    enemy_sequence = [item for item in combined_sequence if item.get("side") == "enemy"]
 
-    for idx, step in enumerate(combined_sequence):
-        future_info = extract_future_sequence(combined_sequence, idx)
+    def build_remaining_values(sequence, key):
+        remaining = [[] for _ in range(len(sequence) + 1)]
+        for index in range(len(sequence) - 1, -1, -1):
+            values = remaining[index + 1].copy()
+            value = sequence[index].get(key)
+            if value:
+                values.insert(0, value)
+            remaining[index] = values
+        return remaining
+
+    my_remaining_picks = build_remaining_values(my_sequence, "name")
+    enemy_remaining_picks = build_remaining_values(enemy_sequence, "name")
+    my_remaining_slugs = build_remaining_values(my_sequence, "slug")
+    enemy_remaining_slugs = build_remaining_values(enemy_sequence, "slug")
+    final_my_picks = my_remaining_picks[0]
+    final_enemy_picks = enemy_remaining_picks[0]
+    final_my_pick_slugs = my_remaining_slugs[0]
+    final_enemy_pick_slugs = enemy_remaining_slugs[0]
+    my_current = []
+    enemy_current = []
+    my_current_slugs = []
+    enemy_current_slugs = []
+    my_seen = 0
+    enemy_seen = 0
+
+    for step in combined_sequence:
+        future_info = {
+            "remaining_my_picks": my_remaining_picks[my_seen],
+            "remaining_enemy_picks": enemy_remaining_picks[enemy_seen],
+            "remaining_my_pick_slugs": my_remaining_slugs[my_seen],
+            "remaining_enemy_pick_slugs": enemy_remaining_slugs[enemy_seen],
+        }
         sample = {
             "sample_id": f"{match_id}_{step['order']}",
             "match_id": match_id,
@@ -206,9 +223,9 @@ def expand_one_match(match: dict):
             "first_pick_side": first_pick_side,
             "current_side": step["side"],
             "my_picks": my_current.copy(),
-            "my_picks_slugs": [item.get("slug") for item in combined_sequence[:idx] if item.get("side") == "me" and item.get("slug")],
+            "my_picks_slugs": my_current_slugs.copy(),
             "enemy_picks": enemy_current.copy(),
-            "enemy_picks_slugs": [item.get("slug") for item in combined_sequence[:idx] if item.get("side") == "enemy" and item.get("slug")],
+            "enemy_picks_slugs": enemy_current_slugs.copy(),
             "my_ban": my_ban,
             "my_ban_slug": my_ban_slug,
             "enemy_ban": enemy_ban,
@@ -233,8 +250,14 @@ def expand_one_match(match: dict):
         if step["side"] == "me":
             me_only_samples.append(sample)
             my_current.append(step["name"])
+            if step.get("slug"):
+                my_current_slugs.append(step["slug"])
+            my_seen += 1
         else:
             enemy_current.append(step["name"])
+            if step.get("slug"):
+                enemy_current_slugs.append(step["slug"])
+            enemy_seen += 1
 
     return samples, me_only_samples
 
@@ -422,12 +445,6 @@ def expand_from_matches_raw(
         print(f"All training samples pt: {len(all_samples)} (+{all_appended}, replaced {all_replaced})")
         print(f"Me-turn training samples pt: {len(me_only_samples)} (+{me_appended}, replaced {me_replaced})")
     return
-
-    print(f"原始比赛数: {len(matches_raw)}")
-    print(f"有效比赛数: {valid_match_count}")
-    print(f"跳过比赛数: {skipped_match_count}")
-    print(f"全部训练样本数: {total_samples}")
-    print(f"仅我方回合样本数: {total_me_only}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Expand raw BP matches into training samples.")

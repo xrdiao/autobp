@@ -97,10 +97,13 @@ def enrich_rank_context(rank=None, tier_key=None, explicit_weight=None):
 
 def get_rank_context_from_record(record):
     record = record or {}
+    explicit_weight = record.get("sample_weight")
+    if explicit_weight in (None, ""):
+        explicit_weight = record.get("rank_weight")
     return enrich_rank_context(
         rank=record.get("player_rank"),
         tier_key=record.get("rank_tier"),
-        explicit_weight=record.get("rank_weight") or record.get("sample_weight"),
+        explicit_weight=explicit_weight,
     )
 
 

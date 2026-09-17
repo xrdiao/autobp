@@ -4,7 +4,6 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import torch
 from bs4 import BeautifulSoup
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -15,7 +14,7 @@ from dataset_versions import extract_dataset_version_from_path, get_dataset_vers
 from rank_tiers import enrich_rank_context, get_rank_tier_spec  # noqa: E402
 
 try:
-    import lxml  # noqa: F401
+    __import__("lxml")
     HTML_PARSER = "lxml"
 except Exception:
     HTML_PARSER = "html.parser"
@@ -36,17 +35,28 @@ GENERIC_PLAYER_LABELS = {
 }
 MIN_VALID_RATING = 800
 MAX_VALID_RATING = 4000
+MONSTER_PATH = "/monster/"
+PLAYER_PATH = "/player/"
+WHITESPACE_RE = re.compile(r"\s+")
+NAME_PREFIX_RE = re.compile(r"^(.*?)\s*\(")
+MONSTER_HREF_RE = re.compile(r"/monster/([^/?#]+)")
+PLAYER_ID_RE = re.compile(r"/player/(\d+)")
+PLAYER_NAME_RE = re.compile(r"(overview|picks|statistics|stats|builds|runes|artifacts)")
+RATING_CANDIDATE_RE = re.compile(r"\b(\d{3,4})\b")
+WIN_RE = re.compile(r"\bwin\b")
+LOSS_RE = re.compile(r"\bloss\b")
+TIME_AGO_RE = re.compile(r"(\d+\s+(seconds?|minutes?|hours?|days?)\s+ago)")
 
 
 def clean_text(text: str) -> str:
     if not text:
         return ""
-    return re.sub(r"\s+", " ", text).strip()
+    return WHITESPACE_RE.sub(" ", text).strip()
 
 
 def parse_name_from_alt(alt: str) -> str:
     alt = clean_text(alt)
-    m = re.match(r"^(.*?)\s*\(", alt)
+    m = NAME_PREFIX_RE.match(alt)
     if m:
         return m.group(1).strip()
     return alt
@@ -55,14 +65,14 @@ def parse_name_from_alt(alt: str) -> str:
 def extract_slug(href: str) -> Optional[str]:
     if not href:
         return None
-    m = re.search(r"/monster/([^/?#]+)", href)
+    m = MONSTER_HREF_RE.search(href)
     return m.group(1).strip() if m else None
 
 
 def extract_player_id(href: str) -> Optional[int]:
     if not href:
         return None
-    m = re.search(r"/player/(\d+)", href)
+    m = PLAYER_ID_RE.search(href)
     return int(m.group(1)) if m else None
 
 
@@ -96,7 +106,7 @@ def clean_player_name(text: str) -> Optional[str]:
     lowered = text.lower()
     if lowered in GENERIC_PLAYER_LABELS:
         return None
-    if re.fullmatch(r"(overview|picks|statistics|stats|builds|runes|artifacts)", lowered):
+    if PLAYER_NAME_RE.fullmatch(lowered):
         return None
     if text.isdigit():
         return None
@@ -105,7 +115,7 @@ def clean_player_name(text: str) -> Optional[str]:
 def extract_rating_candidates(text: str) -> List[int]:
     values = []
     seen = set()
-    for raw in re.findall(r"\b(\d{3,4})\b", text or ""):
+    for raw in RATING_CANDIDATE_RE.findall(text or ""):
         value = int(raw)
         if not (MIN_VALID_RATING <= value <= MAX_VALID_RATING):
             continue
@@ -128,28 +138,22 @@ def parse_monster_anchor(a_tag) -> Optional[Dict[str, Any]]:
 
     alt = clean_text(img.get("alt", ""))
     title = ""
-
     title_node = a_tag.find(attrs={"title": True})
     if title_node:
         title = clean_text(title_node.get("title", ""))
 
     order = None
+    is_first_pick = False
     for span in a_tag.find_all("span"):
         txt = clean_text(span.get_text())
-        if txt.isdigit():
+        if order is None and txt.isdigit():
             order = int(txt)
-            break
+        if not is_first_pick and txt.lower() == "1st":
+            is_first_pick = True
 
     full_text = f"{alt} {title}".lower()
     is_banned = "(banned)" in full_text
     is_leader = "(leader)" in full_text
-
-    is_first_pick = False
-    for span in a_tag.find_all("span"):
-        txt = clean_text(span.get_text()).lower()
-        if txt == "1st":
-            is_first_pick = True
-            break
 
     return {
         "slug": slug,
@@ -214,52 +218,67 @@ def parse_player_block(container) -> Dict[str, Any]:
 
 def split_mobile_match_blocks(soup: BeautifulSoup):
     all_divs = soup.find_all("div")
-    blocks = []
+    stats = {}
+    for anchor in soup.find_all("a", href=True):
+        href = anchor.get("href", "")
+        if MONSTER_PATH in href:
+            kind = 0
+        elif PLAYER_PATH in href:
+            kind = 1
+        else:
+            continue
 
-    for div in all_divs:
+        for parent in anchor.parents:
+            if parent.name != "div":
+                continue
+            entry = stats.setdefault(id(parent), [parent, 0, 0])
+            entry[kind + 1] += 1
+
+    qualified = {}
+    for index, div in enumerate(all_divs):
+        entry = stats.get(id(div))
+        if not entry or entry[1] < 10 or entry[2] < 1:
+            continue
         text = clean_text(div.get_text(" ", strip=True)).lower()
-        has_result = ("loss" in text or "defeat" in text or "win" in text or "victory" in text)
+        if any(marker in text for marker in ("loss", "defeat", "win", "victory")):
+            qualified[id(div)] = (div, index, text)
 
-        monster_links = div.find_all("a", href=True)
-        monster_count = sum(1 for a in monster_links if "/monster/" in a.get("href", ""))
-        player_count = sum(1 for a in monster_links if "/player/" in a.get("href", ""))
+    has_qualified_child = set()
+    for div, _index, _text in qualified.values():
+        for parent in div.parents:
+            parent_id = id(parent)
+            if parent_id in qualified:
+                has_qualified_child.add(parent_id)
 
-        if has_result and monster_count >= 10 and player_count >= 1:
-            blocks.append(div)
-
-    unique_blocks = []
-    for blk in blocks:
-        for other in blocks:
-            if blk is other:
-                continue
-            if blk in other.find_all("div"):
-                continue
-        unique_blocks.append(blk)
+    blocks = [
+        (div, index, text)
+        for block_id, (div, index, text) in qualified.items()
+        if block_id not in has_qualified_child
+    ]
+    blocks.sort(key=lambda item: item[1])
 
     dedup = []
     seen = set()
-    for blk in unique_blocks:
-        key = clean_text(blk.get_text(" ", strip=True))
-        if key and key not in seen:
-            seen.add(key)
-            dedup.append(blk)
-
+    for block, _index, text in blocks:
+        if text and text not in seen:
+            seen.add(text)
+            dedup.append(block)
     return dedup
 
 
-def parse_result_and_time(block) -> Dict[str, str]:
-    text = clean_text(block.get_text(" ", strip=True))
+def parse_result_and_time(block, text=None) -> Dict[str, str]:
+    text = clean_text(block.get_text(" ", strip=True)) if text is None else text
 
     result = None
     time_ago = None
 
     text_lower = text.lower()
-    if "victory" in text_lower or re.search(r"\bwin\b", text_lower):
+    if "victory" in text_lower or WIN_RE.search(text_lower):
         result = "win"
-    elif "defeat" in text_lower or re.search(r"\bloss\b", text_lower):
+    elif "defeat" in text_lower or LOSS_RE.search(text_lower):
         result = "loss"
 
-    m = re.search(r"(\d+\s+(seconds?|minutes?|hours?|days?)\s+ago)", text_lower)
+    m = TIME_AGO_RE.search(text_lower)
     if m:
         time_ago = m.group(1)
 
@@ -270,9 +289,17 @@ def parse_result_and_time(block) -> Dict[str, str]:
 
 
 def parse_match_block(block, page_player_id=None, match_index=0) -> Optional[Dict[str, Any]]:
-    info = parse_result_and_time(block)
+    block_text = clean_text(block.get_text(" ", strip=True))
+    info = parse_result_and_time(block, block_text)
 
-    monster_anchors = [a for a in block.find_all("a", href=True) if "/monster/" in a.get("href", "")]
+    monster_anchors = []
+    player_anchors = []
+    for anchor in block.find_all("a", href=True):
+        href = anchor.get("href", "")
+        if MONSTER_PATH in href:
+            monster_anchors.append(anchor)
+        if PLAYER_PATH in href:
+            player_anchors.append(anchor)
     if len(monster_anchors) < 10:
         return None
 
@@ -288,7 +315,6 @@ def parse_match_block(block, page_player_id=None, match_index=0) -> Optional[Dic
     enemy_picks = parsed_monsters[:5]
     my_picks = parsed_monsters[5:10]
 
-    player_anchors = [a for a in block.find_all("a", href=True) if "/player/" in a.get("href", "")]
     player_infos = []
 
     for a in player_anchors:
@@ -339,7 +365,7 @@ def parse_match_block(block, page_player_id=None, match_index=0) -> Optional[Dic
                 opp_info["player_id"] = only_info.get("player_id")
                 opp_info["name"] = only_info.get("name")
 
-    ratings = extract_rating_candidates(block.get_text(" ", strip=True))
+    ratings = extract_rating_candidates(block_text)
     if len(ratings) >= 2:
         opp_info["rating"] = ratings[0]
         self_info["rating"] = ratings[1]
@@ -468,6 +494,8 @@ def process_html_file(html_path: str, dataset_root=None, version_weights=None):
 
 
 if __name__ == "__main__":
+    import torch
+
     html_path = "D:\\jupyter\\auto_bp\\dataset\\1.html"
 
     raw_matches, dataset_matches = process_html_file(html_path)

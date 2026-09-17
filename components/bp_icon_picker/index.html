@@ -1,0 +1,482 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root {
+      color: #273142;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 14px;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: #ffffff;
+    }
+
+    button {
+      font: inherit;
+    }
+
+    .picker-shell {
+      display: grid;
+      grid-template-columns: minmax(0, 7fr) minmax(260px, 3fr);
+      gap: 18px;
+      align-items: start;
+    }
+
+    .gallery-panel,
+    .state-panel {
+      min-width: 0;
+    }
+
+    .panel-title {
+      margin: 0 0 8px;
+      color: #293042;
+      font-size: 1.15rem;
+      font-weight: 700;
+    }
+
+    .gallery-meta {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      margin: 0 0 8px;
+      color: #718096;
+      font-size: 0.78rem;
+    }
+
+    .monster-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(74px, 1fr));
+      gap: 6px;
+    }
+
+    .monster-card {
+      display: flex;
+      min-width: 0;
+      min-height: 108px;
+      flex-direction: column;
+      align-items: center;
+      padding: 4px 3px 3px;
+      color: #273142;
+      background: #ffffff;
+      border: 1px solid #d7deea;
+      border-radius: 5px;
+      cursor: pointer;
+      text-align: center;
+      transition: border-color 120ms ease, box-shadow 120ms ease, transform 120ms ease;
+    }
+
+    .monster-card:hover {
+      border-color: #4b72c2;
+      box-shadow: 0 2px 8px rgba(43, 72, 125, 0.16);
+      transform: translateY(-1px);
+    }
+
+    .monster-card:focus-visible {
+      outline: 2px solid #4b72c2;
+      outline-offset: 1px;
+    }
+
+    .monster-icon {
+      width: 62px;
+      height: 62px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      background: #f3f5f8;
+      border-radius: 4px;
+    }
+
+    .monster-icon img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    .monster-icon-placeholder,
+    .state-icon-placeholder {
+      color: #8a94a6;
+      font-size: 1.25rem;
+      font-weight: 700;
+    }
+
+    .monster-name {
+      width: 100%;
+      min-height: 2.25em;
+      margin-top: 3px;
+      overflow-wrap: anywhere;
+      font-size: 0.69rem;
+      line-height: 1.1;
+    }
+
+    .monster-subtitle {
+      width: 100%;
+      min-height: 1.05em;
+      overflow: hidden;
+      color: #748094;
+      font-size: 0.6rem;
+      line-height: 1.05;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+    }
+
+    .state-section {
+      margin: 0 0 14px;
+    }
+
+    .state-section-title {
+      margin: 0 0 6px;
+      color: #293042;
+      font-size: 0.98rem;
+      font-weight: 700;
+    }
+
+    .state-grid {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 4px;
+    }
+
+    .state-slot {
+      min-width: 0;
+      padding: 4px 2px 3px;
+      text-align: center;
+      background: #ffffff;
+      border: 1px solid #d7deea;
+      border-radius: 5px;
+    }
+
+    .state-slot.empty {
+      min-height: 105px;
+      color: #8a94a6;
+      background: #f7f9fc;
+    }
+
+    .state-slot-remove {
+      display: block;
+      width: 100%;
+      padding: 0;
+      color: #273142;
+      background: transparent;
+      border: 0;
+      cursor: pointer;
+      text-align: center;
+    }
+
+    .state-slot-remove:focus-visible,
+    .leader-link:focus-visible {
+      outline: 2px solid #4b72c2;
+      outline-offset: 1px;
+    }
+
+    .state-slot-number {
+      color: #748094;
+      font-size: 0.6rem;
+      line-height: 1.1;
+    }
+
+    .state-icon {
+      width: 46px;
+      height: 46px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin: 2px auto;
+      overflow: hidden;
+      background: #f3f5f8;
+      border-radius: 4px;
+    }
+
+    .state-icon img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    .state-name {
+      min-height: 2.2em;
+      overflow-wrap: anywhere;
+      font-size: 0.6rem;
+      line-height: 1.08;
+    }
+
+    .state-slot-empty {
+      display: flex;
+      min-height: 78px;
+      align-items: center;
+      justify-content: center;
+      font-size: 0.7rem;
+    }
+
+    .leader-link {
+      display: block;
+      width: 100%;
+      margin-top: 3px;
+      padding: 0;
+      color: #748094;
+      background: transparent;
+      border: 0;
+      cursor: pointer;
+      font-size: 0.59rem;
+    }
+
+    .leader-link:hover,
+    .leader-link.leader-active {
+      color: #b7791f;
+      font-weight: 700;
+    }
+
+    .turn-line {
+      margin: 0 0 12px;
+      color: #718096;
+      font-size: 0.78rem;
+    }
+
+    .empty-gallery {
+      padding: 24px 8px;
+      color: #718096;
+      text-align: center;
+    }
+
+    @media (max-width: 820px) {
+      .picker-shell {
+        grid-template-columns: 1fr;
+      }
+
+      .state-panel {
+        order: -1;
+      }
+
+      .monster-grid {
+        grid-template-columns: repeat(auto-fill, minmax(68px, 1fr));
+      }
+
+      .monster-card {
+        min-height: 101px;
+      }
+
+      .monster-icon {
+        width: 56px;
+        height: 56px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main id="app"></main>
+  <script>
+    const app = document.getElementById("app");
+    let localState = {};
+    let eventCounter = 0;
+
+    function sendMessage(type, data) {
+      window.parent.postMessage(
+        Object.assign({isStreamlitMessage: true, type: type}, data),
+        "*"
+      );
+    }
+
+    function setFrameHeight() {
+      const height = Math.max(
+        document.body.scrollHeight,
+        document.documentElement.scrollHeight
+      );
+      sendMessage("streamlit:setFrameHeight", {height: height});
+    }
+
+    function setComponentValue(action) {
+      eventCounter += 1;
+      sendMessage("streamlit:setComponentValue", {
+        value: Object.assign({}, localState, {
+          action: action,
+          event_id: `${Date.now()}-${eventCounter}`
+        }),
+        dataType: "json"
+      });
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    function imageMarkup(item, stateIcon) {
+      const className = stateIcon ? "state-icon" : "monster-icon";
+      if (item.image) {
+        return `<div class="${className}"><img src="${item.image}" alt="${escapeHtml(item.name)}" loading="lazy"></div>`;
+      }
+      return `<div class="${className}"><span class="${stateIcon ? "state-icon-placeholder" : "monster-icon-placeholder"}">?</span></div>`;
+    }
+
+    function uniqueValues(values, maxLength) {
+      const result = [];
+      for (const value of values || []) {
+        const text = String(value || "");
+        if (!text || result.includes(text)) {
+          continue;
+        }
+        result.push(text);
+        if (maxLength && result.length >= maxLength) {
+          break;
+        }
+      }
+      return result;
+    }
+
+    function getCurrentSide(args) {
+      return args.current_side || "me";
+    }
+
+    function render(args) {
+      const incoming = args || {};
+      localState = {
+        first_pick_side: incoming.first_pick_side || "me",
+        my_picks: uniqueValues(incoming.my_picks, 5),
+        enemy_picks: uniqueValues(incoming.enemy_picks, 5),
+        my_leader: incoming.my_leader || "",
+        enemy_leader: incoming.enemy_leader || ""
+      };
+
+      const currentSide = getCurrentSide(incoming);
+      const occupied = new Set([...localState.my_picks, ...localState.enemy_picks]);
+      const items = incoming.items || [];
+      const galleryMarkup = items.map((item) => {
+        const name = String(item.name || "");
+        return `
+          <button class="monster-card" type="button" data-action="add" data-name="${escapeHtml(name)}">
+            ${imageMarkup(item, false)}
+            <div class="monster-name">${escapeHtml(name)}</div>
+            <div class="monster-subtitle">${escapeHtml(item.attr || "")}</div>
+          </button>
+        `;
+      }).join("");
+
+      const stateMarkup = (side, title, values, leader) => {
+        const slots = [];
+        for (let index = 0; index < 5; index += 1) {
+          const name = values[index] || "";
+          if (!name) {
+            slots.push(`
+              <div class="state-slot empty">
+                <div class="state-slot-number">${index + 1}</div>
+                <div class="state-slot-empty">空位</div>
+              </div>
+            `);
+            continue;
+          }
+          const item = (incoming.state_items || {})[name] || {name: name, image: ""};
+          const active = leader === name ? " leader-active" : "";
+          slots.push(`
+            <div class="state-slot">
+              <button class="state-slot-remove" type="button" data-action="remove" data-name="${escapeHtml(name)}" title="点击移除">
+                <div class="state-slot-number">${index + 1}</div>
+                ${imageMarkup(item, true)}
+                <div class="state-name">${escapeHtml(name)}</div>
+              </button>
+              <button class="leader-link${active}" type="button" data-action="leader" data-side="${side}" data-name="${escapeHtml(name)}">
+                ${leader === name ? "队长" : "设为队长"}
+              </button>
+            </div>
+          `);
+        }
+        return `
+          <section class="state-section">
+            <h2 class="state-section-title">${title}</h2>
+            <div class="state-grid">${slots.join("")}</div>
+          </section>
+        `;
+      };
+
+      app.innerHTML = `
+        <div class="picker-shell">
+          <section class="gallery-panel">
+            <h1 class="panel-title">魔灵图库</h1>
+            <div class="gallery-meta">
+              <span>${items.length} 个</span>
+            </div>
+            <div class="monster-grid">
+              ${galleryMarkup || '<div class="empty-gallery">没有符合条件的魔灵</div>'}
+            </div>
+          </section>
+          <aside class="state-panel">
+            <h1 class="panel-title">当前 BP</h1>
+            <p class="turn-line">第 ${Math.min(Number(incoming.current_turn || 1), 10)} 回合 · ${escapeHtml(incoming.phase || "")} · 当前轮到：${currentSide === "me" ? "我方" : currentSide === "enemy" ? "对方" : "无"}</p>
+            ${stateMarkup("my", "我方已选", localState.my_picks, localState.my_leader)}
+            ${stateMarkup("enemy", "对方已选", localState.enemy_picks, localState.enemy_leader)}
+          </aside>
+        </div>
+      `;
+
+      app.querySelectorAll("[data-action]").forEach((element) => {
+        element.addEventListener("click", () => {
+          const action = element.dataset.action;
+          const name = element.dataset.name || "";
+          if (action === "add") {
+            if (!name || occupied.has(name) || currentSide === "none") {
+              return;
+            }
+            if (currentSide === "me" && localState.my_picks.length < 5) {
+              localState.my_picks.push(name);
+            } else if (currentSide === "enemy" && localState.enemy_picks.length < 5) {
+              localState.enemy_picks.push(name);
+            } else {
+              return;
+            }
+            render(Object.assign({}, incoming, localState));
+            setComponentValue("add");
+            return;
+          }
+
+          if (action === "remove") {
+            localState.my_picks = localState.my_picks.filter((value) => value !== name);
+            localState.enemy_picks = localState.enemy_picks.filter((value) => value !== name);
+            if (localState.my_leader === name) {
+              localState.my_leader = "";
+            }
+            if (localState.enemy_leader === name) {
+              localState.enemy_leader = "";
+            }
+            render(Object.assign({}, incoming, localState));
+            setComponentValue("remove");
+            return;
+          }
+
+          if (action === "leader") {
+            const side = element.dataset.side;
+            const key = side === "my" ? "my_leader" : "enemy_leader";
+            localState[key] = localState[key] === name ? "" : name;
+            render(Object.assign({}, incoming, localState));
+            setComponentValue("leader");
+            return;
+          }
+
+        });
+      });
+
+      requestAnimationFrame(setFrameHeight);
+    }
+
+    window.addEventListener("message", (event) => {
+      if (!event.data || event.data.type !== "streamlit:render") {
+        return;
+      }
+      render(event.data.args || {});
+    });
+
+    sendMessage("streamlit:componentReady", {apiVersion: 1});
+    sendMessage("streamlit:setFrameHeight", {height: 120});
+  </script>
+</body>
+</html>

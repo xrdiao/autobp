@@ -106,7 +106,7 @@ def _group_rows(slots: list[SlotDetection]) -> list[list[int]]:
     row_centers: list[float] = []
     row_groups: list[list[int]] = []
 
-    for idx, slot in enumerate(sorted(range(len(slots)), key=lambda i: (slots[i].bbox.y, slots[i].bbox.x))):
+    for slot in sorted(range(len(slots)), key=lambda i: (slots[i].bbox.y, slots[i].bbox.x)):
         y_center = slots[slot].bbox.y + slots[slot].bbox.h * 0.5
         best_row = -1
         best_delta = float("inf")

@@ -10,8 +10,12 @@ _ROLE_DEFAULTS = {
         "transformer": {"temperature_floor": 4.0, "prior_floor": 0.10},
         "legacy": {"temperature_floor": 1.0, "prior_floor": 0.0},
     },
+    "prefix_value": {
+        "transformer": {"temperature_floor": 1.0, "prior_floor": 0.0},
+        "legacy": {"temperature_floor": 1.0, "prior_floor": 0.0},
+    },
     "draft_value": {
-        "transformer": {"temperature_floor": 5.5, "prior_floor": 0.10},
+        "transformer": {"temperature_floor": 1.0, "prior_floor": 0.0},
         "legacy": {"temperature_floor": 4.0, "prior_floor": 0.0},
     },
 }

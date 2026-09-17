@@ -22,7 +22,7 @@ from bp_transformer_common import (
 from dataset_versions import summarize_dataset_version_counts
 from rank_tiers import RANK_TIER_WEIGHTS, get_rank_context_from_record, summarize_rank_tier_counts
 
-DATA_PATH = str(PROJECT_ROOT / "data" / "bp_dataset.sqlite")
+DATA_PATH = str(PROJECT_ROOT / "data" / "bp_samples.sqlite")
 SAVE_DIR = str(PROJECT_ROOT / "models")
 
 MODEL_PATH = os.path.join(SAVE_DIR, "bp_draft_value_net.pt")
@@ -76,6 +76,13 @@ def parse_result_label(sample):
     if "is_win" in sample:
         return 1.0 if bool(sample["is_win"]) else 0.0
 
+    if "won" in sample:
+        value = sample["won"]
+        if isinstance(value, bool):
+            return 1.0 if value else 0.0
+        if isinstance(value, (int, float)):
+            return 1.0 if float(value) > 0 else 0.0
+
     if "winner" in sample:
         value = normalize_name(sample["winner"])
         if value in ["me", "self", "player", "win"]:
@@ -120,29 +127,79 @@ class MonsterVocab:
         return dict(self.slug_to_id)
 
 
+def _first_list(sample, keys):
+    for key in keys:
+        values = sample.get(key)
+        if values:
+            return [slugify_fallback(value) for value in values if value][:5]
+    return []
+
+
+def _pick_slugs(sample, side):
+    return _first_list(
+        sample,
+        (
+            f"final_{side}_pick_slugs",
+            f"{side}_pick_slugs",
+            f"{side}_picks_slugs",
+            f"final_{side}_picks",
+            f"{side}_picks",
+        ),
+    )
+
+
+def _ban_slug(sample, side):
+    for key in (f"{side}_ban_slug", f"{side}_ban"):
+        value = sample.get(key)
+        if value:
+            return slugify_fallback(value)
+    return ""
+
+
+def _leader_slug(sample, side):
+    for key in (f"{side}_leader_slug", f"{side}_leader"):
+        value = sample.get(key)
+        if value:
+            return slugify_fallback(value)
+    return ""
+
+
+def normalize_full_draft_sample(sample):
+    item = dict(sample)
+    item["my_pick_slugs"] = _pick_slugs(item, "my")
+    item["enemy_pick_slugs"] = _pick_slugs(item, "enemy")
+    item["my_ban"] = _ban_slug(item, "my")
+    item["enemy_ban"] = _ban_slug(item, "enemy")
+    item["my_leader"] = _leader_slug(item, "my")
+    item["enemy_leader"] = _leader_slug(item, "enemy")
+    return item
+
+
 def extract_slugs_from_full_sample(sample):
+    normalized = normalize_full_draft_sample(sample)
     out = []
 
     for key in ["my_pick_slugs", "enemy_pick_slugs"]:
-        for monster in sample.get(key, []) or []:
+        for monster in normalized.get(key, []) or []:
             out.append(normalize_name(monster))
 
     for key in ["my_ban", "enemy_ban", "my_leader", "enemy_leader"]:
-        value = sample.get(key)
+        value = normalized.get(key)
         if value:
-            out.append(slugify_fallback(value))
+            out.append(normalize_name(value))
 
     return [x for x in out if x]
 
 
 def build_full_draft_signature(sample):
+    normalized = normalize_full_draft_sample(sample)
     return (
-        tuple(normalize_name(x) for x in (sample.get("my_pick_slugs") or []) if x),
-        tuple(normalize_name(x) for x in (sample.get("enemy_pick_slugs") or []) if x),
-        slugify_fallback(sample.get("my_ban")) if sample.get("my_ban") else "",
-        slugify_fallback(sample.get("enemy_ban")) if sample.get("enemy_ban") else "",
-        slugify_fallback(sample.get("my_leader")) if sample.get("my_leader") else "",
-        slugify_fallback(sample.get("enemy_leader")) if sample.get("enemy_leader") else "",
+        tuple(normalized["my_pick_slugs"]),
+        tuple(normalized["enemy_pick_slugs"]),
+        normalized["my_ban"],
+        normalized["enemy_ban"],
+        normalized["my_leader"],
+        normalized["enemy_leader"],
     )
 
 
@@ -165,14 +222,15 @@ def build_aggregated_sample(first_sample, labels, rank_weights, weight_mode="sqr
     else:
         sample_weight = mean_rank_weight
 
-    rank_context = get_rank_context_from_record(first_sample)
+    normalized = normalize_full_draft_sample(first_sample)
+    rank_context = get_rank_context_from_record(normalized)
     return {
-        "my_pick_slugs": [normalize_name(x) for x in (first_sample.get("my_pick_slugs") or []) if x][:5],
-        "enemy_pick_slugs": [normalize_name(x) for x in (first_sample.get("enemy_pick_slugs") or []) if x][:5],
-        "my_ban": slugify_fallback(first_sample.get("my_ban")) if first_sample.get("my_ban") else "",
-        "enemy_ban": slugify_fallback(first_sample.get("enemy_ban")) if first_sample.get("enemy_ban") else "",
-        "my_leader": slugify_fallback(first_sample.get("my_leader")) if first_sample.get("my_leader") else "",
-        "enemy_leader": slugify_fallback(first_sample.get("enemy_leader")) if first_sample.get("enemy_leader") else "",
+        "my_pick_slugs": normalized["my_pick_slugs"],
+        "enemy_pick_slugs": normalized["enemy_pick_slugs"],
+        "my_ban": normalized["my_ban"],
+        "enemy_ban": normalized["enemy_ban"],
+        "my_leader": normalized["my_leader"],
+        "enemy_leader": normalized["enemy_leader"],
         "rank_tier": rank_context["rank_tier"],
         "rank_tier_label": rank_context["rank_tier_label"],
         "soft_label": soft_label,
@@ -384,7 +442,7 @@ class BPDraftValueNet(nn.Module):
 def load_samples(path):
     suffix = os.path.splitext(path)[1].lower()
     if suffix in {".sqlite", ".db"}:
-        return load_record_rows(path, "bp_dataset")
+        return load_record_rows(path, "bp_samples")
     if suffix == ".pt":
         try:
             return torch.load(path, map_location="cpu", weights_only=False)
@@ -543,6 +601,7 @@ def main():
 
     samples = load_samples(DATA_PATH)
     print(f"loaded full draft samples: {len(samples)}")
+    samples = [normalize_full_draft_sample(sample) for sample in samples]
 
     filtered = [sample for sample in samples if parse_result_label(sample) is not None]
     print(f"samples with result label: {len(filtered)}")
@@ -625,7 +684,7 @@ def main():
     save_vocab(vocab, VOCAB_PATH)
 
     meta = {
-        "model_type": "bp_draft_value_transformer_v1",
+        "model_type": "bp_draft_value_transformer_v2",
         "architecture": "transformer_encoder",
         "data_path": DATA_PATH,
         "embed_dim": EMBED_DIM,
@@ -653,8 +712,8 @@ def main():
         "uncalibrated_val_loss": float(uncalibrated_val_loss),
         "calibrated_val_loss": float(calibrated_val_loss),
         "notes": [
-            "transformer encoder full-draft evaluator for ban recommendation",
-            "uses the same aggregated soft-label full-draft data as the previous NN model",
+            "transformer encoder full-draft evaluator for counterfactual ban recommendation",
+            "trained from the current chronological bp_samples.sqlite full-draft states",
             "validation split is grouped by full draft signature",
             "sample aggregation and loss both respect rank tier and dataset version weights",
         ],

@@ -12,6 +12,13 @@ MISSING_REPORT_PATH = "json//missing_images_report.json"
 # 只接受 unit_icon 开头的图片
 UNIT_ICON_PATTERN = re.compile(r"^unit_icon.*\.(png|jpg|jpeg|webp)$", re.IGNORECASE)
 
+try:
+    __import__("lxml")
+    HTML_PARSER = "lxml"
+except Exception:
+    HTML_PARSER = "html.parser"
+
+
 def clean_text(text: str) -> str:
     if not text:
         return ""
@@ -67,7 +74,7 @@ def parse_html_file(html_path: str):
     with open(html_path, "r", encoding="utf-8") as f:
         html = f.read()
 
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, HTML_PARSER)
     image_map = {}
     missing_files = []
     skipped_non_unit_icon = 0

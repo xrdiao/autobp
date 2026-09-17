@@ -3,24 +3,19 @@ from __future__ import annotations
 import os
 import re
 from collections import Counter
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, Optional
 
-DATASET_ROOT = Path("dataset")
+DATASET_ROOT = Path(__file__).resolve().parent / "dataset"
 LEGACY_DATASET_VERSION = "legacy"
 DEFAULT_VERSION_WEIGHT_MIN = 0.6
 DEFAULT_VERSION_WEIGHT_MAX = 1.0
 VERSION_DIR_RE = re.compile(r"^v(?P<body>\d+(?:\.\d+)*)$", re.IGNORECASE)
 
 
-def normalize_dataset_version(value: object) -> str:
-    if value is None:
-        return LEGACY_DATASET_VERSION
-
-    text = str(value).strip()
-    if not text:
-        return LEGACY_DATASET_VERSION
-
+@lru_cache(maxsize=256)
+def _normalize_dataset_version_text(text: str) -> str:
     match = VERSION_DIR_RE.match(text)
     if not match:
         return text.lower()
@@ -31,12 +26,28 @@ def normalize_dataset_version(value: object) -> str:
     return "v" + ".".join(parts)
 
 
-def parse_dataset_version_parts(value: object) -> Optional[tuple[int, ...]]:
-    normalized = normalize_dataset_version(value)
+def normalize_dataset_version(value: object) -> str:
+    if value is None:
+        return LEGACY_DATASET_VERSION
+
+    text = str(value).strip()
+    if not text:
+        return LEGACY_DATASET_VERSION
+
+    return _normalize_dataset_version_text(text)
+
+
+@lru_cache(maxsize=256)
+def _parse_normalized_dataset_version(normalized: str) -> Optional[tuple[int, ...]]:
     match = VERSION_DIR_RE.match(normalized)
     if not match:
         return None
     return tuple(int(part) for part in match.group("body").split("."))
+
+
+def parse_dataset_version_parts(value: object) -> Optional[tuple[int, ...]]:
+    normalized = normalize_dataset_version(value)
+    return _parse_normalized_dataset_version(normalized)
 
 
 def is_version_dir_name(value: object) -> bool:
@@ -137,7 +148,7 @@ def extract_dataset_version_from_path(path: str | Path, dataset_root: Path | str
     root = Path(dataset_root)
 
     try:
-        rel_path = path_obj.resolve().relative_to(root.resolve())
+        rel_path = Path(os.path.relpath(str(path_obj), str(root)))
     except Exception:
         rel_path = path_obj
 

@@ -1,0 +1,910 @@
+from __future__ import annotations
+
+import json
+import math
+import os
+from functools import lru_cache
+from pathlib import Path
+
+from bp_mechanism import BPMechanismLayer, DEFAULT_MECHANISM_PATH
+from bp_transformer_common import PROJECT_ROOT, normalize_name, slugify_fallback
+
+DEFAULT_STATS_PATH = PROJECT_ROOT / "json" / "lucksack_stats.json"
+DEFAULT_CATALOG_PATH = PROJECT_ROOT / "json" / "lucksack_monster_catalog.json"
+DEFAULT_SWKIT_TIER_PATH = PROJECT_ROOT / "json" / "swkit_rta_tiers.json"
+DEFAULT_SWRT_STATS_PATH = PROJECT_ROOT / "json" / "swrt_rta_stats.json"
+
+RTA_TIER_BASE_SCORE = {
+    "SSS": 0.62,
+    "SS": 0.59,
+    "S": 0.56,
+    "A": 0.53,
+    "B": 0.50,
+    "C": 0.47,
+}
+
+
+def _as_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _as_int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _clamp(value, low=0.0, high=1.0):
+    return max(float(low), min(float(high), float(value)))
+
+
+def _combo_key(values):
+    normalized = tuple(
+        sorted({normalize_name(value) for value in values if normalize_name(value)})
+    )
+    return _combo_key_cached(normalized)
+
+
+@lru_cache(maxsize=65536)
+def _combo_key_cached(values):
+    return "|".join(values)
+
+
+def _pick_phase(turn):
+    try:
+        turn = int(turn)
+    except (TypeError, ValueError):
+        return None
+    if turn <= 0 or turn > 10:
+        return None
+    if turn == 1:
+        return 1
+    if turn <= 3:
+        return 2
+    if turn <= 5:
+        return 3
+    if turn <= 7:
+        return 4
+    if turn <= 9:
+        return 5
+    return 6
+
+
+class BPLucksackStats:
+    """Reads the public Lucksack snapshot used as a statistical evidence layer."""
+
+    def __init__(
+        self,
+        stats_path=DEFAULT_STATS_PATH,
+        catalog_path=DEFAULT_CATALOG_PATH,
+        rank_group=None,
+        swkit_tier_path=DEFAULT_SWKIT_TIER_PATH,
+        swrt_stats_path=DEFAULT_SWRT_STATS_PATH,
+        mechanism_path=DEFAULT_MECHANISM_PATH,
+    ):
+        self.stats_path = Path(stats_path)
+        self.catalog_path = Path(catalog_path)
+        self.swkit_tier_path = Path(swkit_tier_path)
+        self.swrt_stats_path = Path(swrt_stats_path)
+        self.mechanism_path = Path(mechanism_path)
+        self.data = self._load_json(self.stats_path, {})
+        self.catalog = self._load_json(self.catalog_path, [])
+        self.swkit_tiers = self._load_json(self.swkit_tier_path, {})
+        self.swrt_stats = self._load_json(self.swrt_stats_path, {})
+        self.mechanisms = BPMechanismLayer(self.mechanism_path)
+        self.rank_group = str(
+            rank_group
+            or os.getenv("BP_LUCKSACK_RANK_GROUP", "").strip()
+            or self.data.get("default_rank_group")
+            or "102"
+        )
+        self.display_name_map = {}
+        self.image_name_map = {}
+        self.name_slug_aliases = {}
+        self._build_catalog_maps()
+        self._solo = self._build_solo_index()
+        self._duo = self._build_combo_index("duo")
+        self._trio = self._build_combo_index("trio")
+        self._draft_position = self._build_draft_position_index()
+        self._rta_tiers = self._build_rta_tier_index()
+        self._swrt_by_slug = {}
+        self._swrt_id_to_slug = {}
+        self._swrt_matchups = {}
+        self._swrt_pair_matchups = {}
+        self._build_swrt_index()
+        self._summary = self._build_summary()
+        self._rank_distribution = self._build_rank_distribution()
+        self._resolve_cache = {}
+        self._candidate_slug_cache = None
+        self._score_cache = {}
+        self._ban_score_cache = {}
+
+    @staticmethod
+    def _load_json(path, default):
+        if not Path(path).exists():
+            return default
+        with open(path, "r", encoding="utf-8") as file:
+            value = json.load(file)
+        return value
+
+    @property
+    def ready(self):
+        statistics = self.data.get("statistics") or {}
+        return bool(self.data and statistics.get("solo"))
+
+    @property
+    def source_label(self):
+        if not self.ready:
+            return "unavailable"
+        season = self.data.get("season") or {}
+        patch = self.data.get("patch") or {}
+        season_name = season.get("season_name") or season.get("season_number") or "season"
+        patch_name = patch.get("patch_name") or patch.get("patch_id") or "patch"
+        return f"lucksack:{season_name}:{patch_name}:rank={self.rank_group}"
+
+    def _build_catalog_maps(self):
+        for item in self.catalog if isinstance(self.catalog, list) else []:
+            slug = normalize_name(item.get("slug"))
+            if not slug:
+                continue
+            display_name = str(item.get("slabel") or item.get("label") or slug).strip()
+            label = str(item.get("label") or display_name).strip()
+            self.display_name_map[slug] = display_name
+            if item.get("image"):
+                self.image_name_map[slug] = item["image"]
+            aliases = {
+                slug,
+                normalize_name(display_name),
+                normalize_name(label),
+                slugify_fallback(display_name),
+                slugify_fallback(label),
+            }
+            for alias in aliases:
+                if alias:
+                    self.name_slug_aliases.setdefault(alias, slug)
+
+    def _rank_records(self, kind):
+        statistics = self.data.get("statistics") or {}
+        kind_records = statistics.get(kind) or {}
+        records = kind_records.get(self.rank_group)
+        if records is None:
+            records = kind_records.get(str(self.data.get("default_rank_group") or "102"), [])
+        return records or []
+
+    def _build_solo_index(self):
+        index = {}
+        for record in self._rank_records("solo"):
+            slug = normalize_name(record.get("monster_slug"))
+            if slug:
+                index[slug] = record
+        return index
+
+    def _build_combo_index(self, kind):
+        index = {}
+        for record in self._rank_records(kind):
+            slugs = record.get("monster_slug")
+            if not isinstance(slugs, list):
+                continue
+            key = _combo_key(slugs)
+            if key:
+                index[key] = record
+        return index
+
+    def _build_draft_position_index(self):
+        dashboard = self.data.get("meta_dashboard") or {}
+        groups = dashboard.get("draft_position") or {}
+        phases = groups.get(self.rank_group)
+        if phases is None:
+            phases = groups.get(str(self.data.get("default_rank_group") or "102"), {})
+        index = {}
+        for phase in (phases or {}).get("phases", []):
+            phase_number = _as_int(phase.get("pick_phase"), 0)
+            if phase_number <= 0:
+                continue
+            for record in phase.get("points") or []:
+                slug = normalize_name(record.get("monster_slug"))
+                if slug:
+                    index[(phase_number, slug)] = record
+        return index
+
+    def _build_rta_tier_index(self):
+        entries = self.swkit_tiers.get("entries_by_id") or {}
+        catalog_by_id = {
+            str(item.get("com2us_id")): normalize_name(item.get("slug"))
+            for item in self.catalog
+            if item.get("com2us_id") and item.get("slug")
+        }
+        return {
+            catalog_by_id[unit_id]: record
+            for unit_id, record in entries.items()
+            if unit_id in catalog_by_id
+        }
+
+    def _build_swrt_index(self):
+        if not isinstance(self.swrt_stats, dict):
+            return
+        self._swrt_id_to_slug = {
+            str(item.get("com2us_id")): normalize_name(item.get("slug"))
+            for item in self.catalog
+            if item.get("com2us_id") and item.get("slug")
+        }
+        statistics = self.swrt_stats.get("statistics") or []
+        for record in statistics:
+            unit_id = str(record.get("monsterId") or "")
+            slug = self._swrt_id_to_slug.get(unit_id)
+            if not slug:
+                slug = slugify_fallback(
+                    record.get("monsterName")
+                    or record.get("monsterNameCn")
+                    or record.get("monsterNameZho")
+                )
+                if slug:
+                    self._swrt_id_to_slug[unit_id] = slug
+            if not slug:
+                continue
+            self._swrt_by_slug[slug] = record
+            self.display_name_map.setdefault(
+                slug,
+                str(
+                    record.get("monsterName")
+                    or record.get("monsterNameCn")
+                    or record.get("monsterNameZho")
+                    or slug
+                ).strip(),
+            )
+            if record.get("imageFilename"):
+                self.image_name_map.setdefault(slug, record["imageFilename"])
+            for alias in (
+                record.get("monsterName"),
+                record.get("monsterNameCn"),
+                record.get("monsterNameZho"),
+                unit_id,
+            ):
+                alias = normalize_name(alias)
+                if alias:
+                    self.name_slug_aliases.setdefault(alias, slug)
+
+        highdata_by_id = self.swrt_stats.get("highdata_by_id") or {}
+        for unit_id, highdata in highdata_by_id.items():
+            slug = self._swrt_id_to_slug.get(str(unit_id))
+            if not slug:
+                continue
+            for list_name in (
+                "highOneVsOneList",
+                "lowOneVsOneList",
+                "lowOneVsOneElementalsList",
+            ):
+                for record in highdata.get(list_name) or []:
+                    opponent_slug = self._swrt_id_to_slug.get(str(record.get("opponentMonsterId") or ""))
+                    if opponent_slug:
+                        self._swrt_matchups.setdefault((slug, opponent_slug), record)
+            for list_name in ("highOneVsTwoList", "lowOneVsTwoList"):
+                for record in highdata.get(list_name) or []:
+                    opponent_slugs = [
+                        self._swrt_id_to_slug.get(str(record.get("opponentMonsterOneId") or "")),
+                        self._swrt_id_to_slug.get(str(record.get("opponentMonsterTwoId") or "")),
+                    ]
+                    if all(opponent_slugs):
+                        self._swrt_pair_matchups.setdefault(
+                            (slug, _combo_key(opponent_slugs)),
+                            record,
+                        )
+
+    def _build_summary(self):
+        dashboard = self.data.get("meta_dashboard") or {}
+        summaries = dashboard.get("summary") or {}
+        summary = summaries.get(self.rank_group)
+        if summary is None:
+            summary = summaries.get(str(self.data.get("default_rank_group") or "102"), {})
+        return summary or {}
+
+    def _build_rank_distribution(self):
+        dashboard = self.data.get("meta_dashboard") or {}
+        return dashboard.get("rank_distribution") or {}
+
+    def _confidence(self, games, cap=5000):
+        games = max(0.0, _as_float(games))
+        if games <= 0:
+            return 0.0
+        return _clamp(math.log1p(games) / math.log1p(cap))
+
+    def _solo_record(self, slug):
+        return self._solo.get(normalize_name(slug))
+
+    def _solo_score(self, slug):
+        record = self._solo_record(slug)
+        if not record:
+            return 0.5, 0.0, None
+        win_rate = _as_float(record.get("win_rate"), 0.5)
+        pick_win_rate = _as_float(record.get("pick_win_rate"), win_rate)
+        confidence = self._confidence(record.get("played_count"))
+        score = (
+            0.65 * (0.5 + (win_rate - 0.5) * confidence)
+            + 0.35 * (0.5 + (pick_win_rate - 0.5) * confidence)
+        )
+        return _clamp(score, 0.2, 0.8), confidence, record
+
+    def _solo_contest_score(self, slug):
+        record = self._solo_record(slug)
+        if not record:
+            return 0.5, 0.0
+        ban_rate = _as_float(record.get("ban_rate"), 0.0)
+        played_rate = _as_float(record.get("played_rate"), 0.0)
+        confidence = self._confidence(record.get("played_count"))
+        ban_pressure = _clamp(0.5 + 0.35 * min(1.0, ban_rate / 0.35))
+        usage_pressure = _clamp(0.5 + 0.15 * min(1.0, played_rate / 0.45))
+        return _clamp(0.7 * ban_pressure + 0.3 * usage_pressure), confidence
+
+    def _combo_record(self, kind, slugs):
+        key = _combo_key(slugs)
+        if not key:
+            return None
+        return (self._duo if kind == "duo" else self._trio).get(key)
+
+    def _combo_score(self, kind, slugs):
+        record = self._combo_record(kind, slugs)
+        if not record:
+            return 0.5, 0.0, None
+        games = record.get("played_count", record.get("appearances", 0))
+        win_rate = _as_float(record.get("win_rate"), 0.5)
+        if "winrate" in record:
+            win_rate = _as_float(record.get("winrate"), 0.5)
+        confidence = self._confidence(games, cap=3000 if kind == "duo" else 1500)
+        score = 0.5 + (win_rate - 0.5) * confidence
+        return _clamp(score, 0.2, 0.8), confidence, record
+
+    def _draft_position_score(self, slug, turn):
+        phase = _pick_phase(turn)
+        if phase is None:
+            return 0.5, 0.0, None
+        record = self._draft_position.get((phase, normalize_name(slug)))
+        if not record:
+            return 0.5, 0.0, None
+        win_rate = _as_float(record.get("win_rate"), 0.5)
+        confidence = self._confidence(
+            record.get("pick_count"),
+            cap=50000,
+        )
+        score = 0.5 + (win_rate - 0.5) * confidence
+        return _clamp(score, 0.2, 0.8), confidence, record
+
+    def _rta_tier_score(self, slug):
+        record = self._rta_tiers.get(normalize_name(slug))
+        if not record:
+            return 0.5, 0.0, None
+        tier_score = RTA_TIER_BASE_SCORE.get(str(record.get("tier") or "").upper(), 0.5)
+        win_rate = _as_float(record.get("win"), 50.0) / 100.0
+        pick_rate = max(0.0, _as_float(record.get("pick"), 0.0))
+        confidence = self._confidence(pick_rate, cap=40)
+        score = (
+            0.55 * tier_score
+            + 0.35 * (0.5 + (win_rate - 0.5) * max(0.45, confidence))
+            + 0.10 * (0.5 + 0.05 * confidence)
+        )
+        return _clamp(score, 0.2, 0.8), confidence, record
+
+    def _swrt_solo_score(self, slug):
+        record = self._swrt_by_slug.get(normalize_name(slug))
+        if not record:
+            return 0.5, 0.0, None
+        win_rate = _as_float(record.get("winRate"), 0.5)
+        confidence = self._confidence(record.get("pickTotal"), cap=50000)
+        usage = min(1.0, max(0.0, _as_float(record.get("pickRate"), 0.0)) / 0.35)
+        ban = min(1.0, max(0.0, _as_float(record.get("banRate"), 0.0)) / 0.35)
+        score = (
+            0.70 * (0.5 + (win_rate - 0.5) * confidence)
+            + 0.20 * (0.5 + 0.04 * usage)
+            + 0.10 * (0.5 + 0.03 * ban)
+        )
+        return _clamp(score, 0.2, 0.8), confidence, record
+
+    def _swrt_matchup_score(self, action_slugs, enemy_slugs):
+        scores = []
+        coverage = []
+        evidence = []
+        for action_slug in action_slugs:
+            for enemy_slug in enemy_slugs:
+                record = self._swrt_matchups.get((action_slug, enemy_slug))
+                if not record:
+                    continue
+                games = _as_int(record.get("pickTotal"))
+                win_rate = _as_float(record.get("winRate"), 0.5)
+                confidence = self._confidence(games, cap=3000)
+                score = 0.5 + (win_rate - 0.5) * confidence
+                scores.append(_clamp(score, 0.2, 0.8))
+                coverage.append(confidence)
+                evidence.append(
+                    {
+                        "kind": "swrt_matchup",
+                        "slug": action_slug,
+                        "opponent_slug": enemy_slug,
+                        "played": games,
+                        "win_rate": round(win_rate, 6),
+                    }
+                )
+            if len(enemy_slugs) >= 2:
+                for index in range(len(enemy_slugs)):
+                    for next_index in range(index + 1, len(enemy_slugs)):
+                        opponent_slugs = [enemy_slugs[index], enemy_slugs[next_index]]
+                        record = self._swrt_pair_matchups.get(
+                            (action_slug, _combo_key(opponent_slugs))
+                        )
+                        if not record:
+                            continue
+                        games = _as_int(record.get("pickTotal"))
+                        win_rate = _as_float(record.get("winRate"), 0.5)
+                        confidence = self._confidence(games, cap=2000)
+                        score = 0.5 + (win_rate - 0.5) * confidence
+                        scores.append(_clamp(score, 0.2, 0.8))
+                        coverage.append(confidence)
+                        evidence.append(
+                            {
+                                "kind": "swrt_team_matchup",
+                                "slug": action_slug,
+                                "opponent_slugs": sorted(opponent_slugs),
+                                "played": games,
+                                "win_rate": round(win_rate, 6),
+                            }
+                        )
+        if not scores:
+            return 0.5, 0.0, []
+        return (
+            _clamp(sum(scores) / len(scores), 0.2, 0.8),
+            round(sum(coverage) / len(coverage), 6) if coverage else 0.0,
+            evidence,
+        )
+
+    def resolve_slug(self, value):
+        normalized = normalize_name(value)
+        if not normalized:
+            return ""
+        cached = self._resolve_cache.get(normalized)
+        if cached is not None:
+            return cached
+        fallback = slugify_fallback(value)
+        slug = (
+            self.name_slug_aliases.get(normalized)
+            or self.name_slug_aliases.get(fallback)
+            or fallback
+        )
+        self._resolve_cache[normalized] = slug
+        return slug
+
+    def to_display_name(self, slug):
+        slug = normalize_name(slug)
+        return self.display_name_map.get(slug, slug)
+
+    def to_image_name(self, slug):
+        slug = normalize_name(slug)
+        return self.image_name_map.get(slug, self.to_display_name(slug))
+
+    def candidate_slugs(self):
+        """Return current RTA candidates plus searchable four-star catalog entries."""
+        if self._candidate_slug_cache is None:
+            slugs = set(self._solo) | set(self._swrt_by_slug)
+            for item in self.catalog if isinstance(self.catalog, list) else []:
+                if not item.get("searchable", True):
+                    continue
+                if _as_int(item.get("natural_stars")) < 4:
+                    continue
+                slug = normalize_name(item.get("slug"))
+                if slug:
+                    slugs.add(slug)
+            self._candidate_slug_cache = tuple(sorted(slugs))
+        return list(self._candidate_slug_cache)
+
+    def pick_frequency(self, slug):
+        record = self._solo_record(slug)
+        return _as_int((record or {}).get("played_count"))
+
+    def score_action(self, my_picks, enemy_picks, action, turn=None):
+        key = (
+            tuple(self.resolve_slug(value) for value in my_picks or []),
+            tuple(self.resolve_slug(value) for value in enemy_picks or []),
+            tuple(self.resolve_slug(value) for value in action or []),
+            None if turn is None else int(turn),
+        )
+        cached = self._score_cache.get(key)
+        if cached is None:
+            cached = self._score_action_uncached(my_picks, enemy_picks, action, turn)
+            self._score_cache[key] = cached
+        return cached
+
+    def _score_action_uncached(self, my_picks, enemy_picks, action, turn=None):
+        action_slugs = [self.resolve_slug(value) for value in (action or [])]
+        action_slugs = [slug for slug in action_slugs if slug]
+        own_slugs = [self.resolve_slug(value) for value in (my_picks or [])]
+        all_own = list(dict.fromkeys(own_slugs + action_slugs))
+        mechanism_detail = self.mechanisms.score_action(
+            my_picks=my_picks,
+            enemy_picks=enemy_picks,
+            action=action,
+        )
+        if not action_slugs:
+            return {
+                "score": 0.5,
+                "solo_score": 0.5,
+                "synergy_score": 0.5,
+                "coverage": 0.0,
+                "swrt_solo_score": 0.5,
+                "swrt_solo_coverage": 0.0,
+                "matchup_score": 0.5,
+                "matchup_coverage": 0.0,
+                "matchup_weight": 0.0,
+                "source": self.source_label,
+                "evidence": [],
+                "mechanism_score": float(mechanism_detail.get("score", 0.5)),
+                "mechanism_available": bool(mechanism_detail.get("available")),
+                "mechanism_coverage": float(mechanism_detail.get("coverage", 0.0)),
+                "mechanism_coverage_gain": float(mechanism_detail.get("coverage_gain", 0.0)),
+                "mechanism_reasons": list(mechanism_detail.get("reasons", [])),
+            }
+
+        solo_scores = []
+        coverage = []
+        evidence = []
+        enemy_slugs = [self.resolve_slug(value) for value in (enemy_picks or [])]
+        enemy_slugs = [slug for slug in enemy_slugs if slug]
+        for slug in action_slugs:
+            score, confidence, record = self._solo_score(slug)
+            solo_scores.append(score)
+            if record:
+                coverage.append(confidence)
+                evidence.append(
+                    {
+                        "kind": "solo",
+                        "slug": slug,
+                        "played": _as_int(record.get("played_count")),
+                        "win_rate": round(_as_float(record.get("win_rate"), 0.5), 6),
+                        "pick_win_rate": round(_as_float(record.get("pick_win_rate"), 0.5), 6),
+                        "pick_rate": round(_as_float(record.get("played_rate"), 0.0), 6),
+                        "ban_rate": round(_as_float(record.get("ban_rate"), 0.0), 6),
+                        "lead_rate": round(_as_float(record.get("lead_rate"), 0.0), 6),
+                    }
+                )
+
+        swrt_solo_scores = []
+        swrt_solo_coverage = []
+        for slug in action_slugs:
+            score, confidence, record = self._swrt_solo_score(slug)
+            if record:
+                swrt_solo_scores.append(score)
+                swrt_solo_coverage.append(confidence)
+                evidence.append(
+                    {
+                        "kind": "swrt_solo",
+                        "slug": slug,
+                        "played": _as_int(record.get("pickTotal")),
+                        "win_rate": round(_as_float(record.get("winRate"), 0.5), 6),
+                        "pick_rate": round(_as_float(record.get("pickRate"), 0.0), 6),
+                        "ban_rate": round(_as_float(record.get("banRate"), 0.0), 6),
+                    }
+                )
+
+        synergy_scores = []
+        synergy_coverage = []
+        for slug in action_slugs:
+            for other in all_own:
+                if slug == other:
+                    continue
+                score, confidence, record = self._combo_score("duo", [slug, other])
+                if record:
+                    solo_a, _, _ = self._solo_score(slug)
+                    solo_b, _, _ = self._solo_score(other)
+                    lift = (score - 0.5) - ((solo_a - 0.5) + (solo_b - 0.5)) / 2.0
+                    synergy_scores.append(0.5 + lift * confidence)
+                    synergy_coverage.append(confidence)
+                    evidence.append(
+                        {
+                            "kind": "duo",
+                            "slugs": sorted([slug, other]),
+                            "played": _as_int(record.get("played_count", record.get("appearances"))),
+                            "win_rate": round(_as_float(record.get("win_rate", record.get("winrate")), 0.5), 6),
+                        }
+                    )
+
+        rta_scores = []
+        rta_coverage = []
+        for slug in action_slugs:
+            score, confidence, record = self._rta_tier_score(slug)
+            if record:
+                rta_scores.append(score)
+                rta_coverage.append(confidence)
+                evidence.append(
+                    {
+                        "kind": "swkit_rta_tier",
+                        "slug": slug,
+                        "tier": record.get("tier"),
+                        "pick_rate": round(_as_float(record.get("pick"), 0.0), 6),
+                        "win_rate": round(_as_float(record.get("win"), 50.0) / 100.0, 6),
+                        "tier_date": self.swkit_tiers.get("tier_date", ""),
+                    }
+                )
+
+        if len(all_own) >= 3:
+            for slug in action_slugs:
+                others = [item for item in all_own if item != slug]
+                for index in range(len(others)):
+                    for next_index in range(index + 1, len(others)):
+                        trio = [slug, others[index], others[next_index]]
+                        score, confidence, record = self._combo_score("trio", trio)
+                        if record:
+                            synergy_scores.append(0.5 + (score - 0.5) * confidence)
+                            synergy_coverage.append(confidence)
+                            evidence.append(
+                                {
+                                    "kind": "trio",
+                                    "slugs": sorted(trio),
+                                    "played": _as_int(record.get("played_count", record.get("appearances"))),
+                                    "win_rate": round(_as_float(record.get("win_rate", record.get("winrate")), 0.5), 6),
+                                }
+                            )
+
+        phase_scores = []
+        phase_coverage = []
+        if turn is not None:
+            for slug in action_slugs:
+                score, confidence, record = self._draft_position_score(slug, turn)
+                if record:
+                    phase_scores.append(score)
+                    phase_coverage.append(confidence)
+                    evidence.append(
+                        {
+                            "kind": "draft_position",
+                            "phase": _pick_phase(turn),
+                            "slug": slug,
+                            "played": _as_int(record.get("pick_count")),
+                            "win_rate": round(_as_float(record.get("win_rate"), 0.5), 6),
+                            "pick_rate": round(_as_float(record.get("pick_rate"), 0.0), 6),
+                        }
+                    )
+
+        solo_score = sum(solo_scores) / len(solo_scores)
+        synergy_score = (
+            sum(synergy_scores) / len(synergy_scores)
+            if synergy_scores
+            else 0.5
+        )
+        phase_score = (
+            sum(phase_scores) / len(phase_scores)
+            if phase_scores
+            else 0.5
+        )
+        rta_tier_score = (
+            sum(rta_scores) / len(rta_scores)
+            if rta_scores
+            else 0.5
+        )
+        swrt_solo_score = (
+            sum(swrt_solo_scores) / len(swrt_solo_scores)
+            if swrt_solo_scores
+            else 0.5
+        )
+        if swrt_solo_scores:
+            solo_score = _clamp(0.78 * solo_score + 0.22 * swrt_solo_score, 0.2, 0.8)
+        matchup_score, matchup_coverage, matchup_evidence = self._swrt_matchup_score(
+            action_slugs,
+            enemy_slugs,
+        )
+        evidence.extend(matchup_evidence)
+        for threat in mechanism_detail.get("threats", [])[:4]:
+            if threat.get("gain", 0.0) <= 0:
+                continue
+            evidence.append(
+                {
+                    "kind": "mechanism_counter",
+                    "threat": threat.get("threat"),
+                    "label": threat.get("label"),
+                    "gain": round(_as_float(threat.get("gain")), 6),
+                    "responses": list(threat.get("responses") or []),
+                    "enemy_sources": list(threat.get("enemy_sources") or []),
+                }
+            )
+        base_score = _clamp(
+            (
+                0.55 * solo_score
+                + 0.22 * synergy_score
+                + 0.13 * phase_score
+                + 0.10 * rta_tier_score
+            )
+            if phase_scores and rta_scores
+            else (
+                0.60 * solo_score
+                + 0.25 * synergy_score
+                + 0.15 * phase_score
+                if phase_scores
+                else (
+                    0.63 * solo_score
+                    + 0.27 * synergy_score
+                    + 0.10 * rta_tier_score
+                    if rta_scores
+                    else 0.70 * solo_score + 0.30 * synergy_score
+                )
+            ),
+            0.2,
+            0.8,
+        )
+        matchup_weight = 0.0
+        if matchup_coverage > 0:
+            matchup_weight = 0.10 + 0.10 * min(1.0, matchup_coverage)
+        score = _clamp(
+            (1.0 - matchup_weight) * base_score + matchup_weight * matchup_score,
+            0.2,
+            0.8,
+        )
+        return {
+            "score": round(score, 6),
+            "solo_score": round(solo_score, 6),
+            "synergy_score": round(synergy_score, 6),
+            "draft_position_score": round(phase_score, 6),
+            "coverage": round(sum(coverage) / len(coverage), 6) if coverage else 0.0,
+            "draft_position_coverage": (
+                round(sum(phase_coverage) / len(phase_coverage), 6)
+                if phase_coverage
+                else 0.0
+            ),
+            "rta_tier_score": round(rta_tier_score, 6),
+            "rta_tier_coverage": (
+                round(sum(rta_coverage) / len(rta_coverage), 6)
+                if rta_coverage
+                else 0.0
+            ),
+            "swrt_solo_score": round(swrt_solo_score, 6),
+            "swrt_solo_coverage": (
+                round(sum(swrt_solo_coverage) / len(swrt_solo_coverage), 6)
+                if swrt_solo_coverage
+                else 0.0
+            ),
+            "matchup_score": round(matchup_score, 6),
+            "matchup_coverage": round(matchup_coverage, 6),
+            "matchup_weight": round(matchup_weight, 6),
+            "mechanism_score": float(mechanism_detail.get("score", 0.5)),
+            "mechanism_available": bool(mechanism_detail.get("available")),
+            "mechanism_coverage": float(mechanism_detail.get("coverage", 0.0)),
+            "mechanism_coverage_before": float(mechanism_detail.get("coverage_before", 0.0)),
+            "mechanism_coverage_gain": float(mechanism_detail.get("coverage_gain", 0.0)),
+            "mechanism_threats": mechanism_detail.get("threats", []),
+            "mechanism_action_tags": mechanism_detail.get("action_tags", []),
+            "mechanism_reasons": list(mechanism_detail.get("reasons", [])),
+            "summary_first_pick_win_rate": _as_float(
+                self._summary.get("first_pick_win_rate"),
+                0.5,
+            ),
+            "summary_second_pick_win_rate": _as_float(
+                self._summary.get("second_pick_win_rate"),
+                0.5,
+            ),
+            "summary_total_battles": _as_int(self._summary.get("total_battles")),
+            "rank_distribution": self._rank_distribution,
+            "rank_group": self.rank_group,
+            "season": self.data.get("season") or {},
+            "patch": self.data.get("patch") or {},
+            "data_coverage": round(
+                0.50
+                * max(
+                    sum(coverage) / len(coverage) if coverage else 0.0,
+                    sum(synergy_coverage) / len(synergy_coverage)
+                    if synergy_coverage
+                    else 0.0,
+                    sum(swrt_solo_coverage) / len(swrt_solo_coverage)
+                    if swrt_solo_coverage
+                    else 0.0,
+                    matchup_coverage,
+                )
+                + 0.25
+                * (
+                    sum(phase_coverage) / len(phase_coverage)
+                    if phase_coverage
+                    else 0.0
+                )
+                + 0.25
+                * (
+                    sum(rta_coverage) / len(rta_coverage)
+                    if rta_coverage
+                    else 0.0
+                ),
+                6,
+            ),
+            "source": self.source_label,
+            "evidence": evidence[:12],
+        }
+
+    def score_ban_action(self, my_picks, enemy_picks, target):
+        key = (
+            tuple(self.resolve_slug(value) for value in my_picks or []),
+            tuple(self.resolve_slug(value) for value in enemy_picks or []),
+            self.resolve_slug(target),
+        )
+        cached = self._ban_score_cache.get(key)
+        if cached is None:
+            cached = self._score_ban_action_uncached(my_picks, enemy_picks, target)
+            self._ban_score_cache[key] = cached
+        return cached
+
+    def _score_ban_action_uncached(self, my_picks, enemy_picks, target):
+        target_slug = self.resolve_slug(target)
+        mechanism_detail = self.mechanisms.score_ban(
+            my_picks=my_picks,
+            enemy_picks=enemy_picks,
+            target=target,
+        )
+        evidence = []
+        record = self._solo_record(target_slug)
+        target_solo_score, target_solo_coverage, _ = self._solo_score(target_slug)
+        target_contest_score, target_contest_coverage = self._solo_contest_score(target_slug)
+        own_slugs = [self.resolve_slug(value) for value in (my_picks or [])]
+        own_slugs = [slug for slug in own_slugs if slug]
+        target_matchup_score, target_matchup_coverage, target_matchup_evidence = (
+            self._swrt_matchup_score([target_slug], own_slugs)
+        )
+        for item in target_matchup_evidence:
+            ban_matchup_evidence = {
+                "kind": "swrt_ban_matchup",
+                "target": target_slug,
+                "played": item.get("played"),
+                "win_rate": item.get("win_rate"),
+            }
+            if item.get("opponent_slug"):
+                ban_matchup_evidence["opponent_slug"] = item["opponent_slug"]
+            if item.get("opponent_slugs"):
+                ban_matchup_evidence["opponent_slugs"] = list(item["opponent_slugs"])
+            evidence.append(ban_matchup_evidence)
+        if record:
+            evidence.append(
+                {
+                    "kind": "target_solo",
+                    "slug": target_slug,
+                    "played": _as_int(record.get("played_count")),
+                    "win_rate": round(_as_float(record.get("win_rate"), 0.5), 6),
+                    "pick_win_rate": round(_as_float(record.get("pick_win_rate"), 0.5), 6),
+                    "pick_rate": round(_as_float(record.get("played_rate"), 0.0), 6),
+                    "ban_rate": round(_as_float(record.get("ban_rate"), 0.0), 6),
+                    "lead_rate": round(_as_float(record.get("lead_rate"), 0.0), 6),
+                }
+            )
+        for threat in mechanism_detail.get("threats", [])[:6]:
+            if _as_float(threat.get("reduction")) <= 0:
+                continue
+            evidence.append(
+                {
+                    "kind": "ban_mechanism_reduction",
+                    "target": target_slug,
+                    "threat": threat.get("threat"),
+                    "label": threat.get("label"),
+                    "reduction": round(_as_float(threat.get("reduction")), 6),
+                    "enemy_sources": list(threat.get("enemy_sources") or []),
+                }
+            )
+        return {
+            "score": float(mechanism_detail.get("score", 0.5)),
+            "mechanism_score": float(mechanism_detail.get("score", 0.5)),
+            "mechanism_available": bool(mechanism_detail.get("available")),
+            "mechanism_threat_reduction": float(mechanism_detail.get("threat_reduction", 0.0)),
+            "mechanism_threats": mechanism_detail.get("threats", []),
+            "mechanism_reasons": list(mechanism_detail.get("reasons", [])),
+            "target_solo_score": float(target_solo_score),
+            "target_solo_coverage": float(target_solo_coverage),
+            "target_contest_score": float(target_contest_score),
+            "target_contest_coverage": float(target_contest_coverage),
+            "ban_priority_score": float(
+                (
+                    0.55 * target_solo_score
+                    + 0.30 * target_contest_score
+                    + 0.15 * target_matchup_score
+                )
+                if target_matchup_coverage > 0
+                else 0.65 * target_solo_score + 0.35 * target_contest_score
+            ),
+            "target_matchup_score": float(target_matchup_score),
+            "target_matchup_coverage": float(target_matchup_coverage),
+            "target_solo_played": _as_int((record or {}).get("played_count")),
+            "target_solo_win_rate": _as_float((record or {}).get("win_rate"), 0.5),
+            "target_solo_ban_rate": _as_float((record or {}).get("ban_rate"), 0.0),
+            "summary_most_banned": self._summary.get("most_banned") or {},
+            "source": self.source_label,
+            "evidence": evidence[:12],
+        }

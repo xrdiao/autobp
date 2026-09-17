@@ -1,5 +1,29 @@
+# Python and local runtime artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.playwright_profile/
 
-# generated model/cache files
-models/bp_relation_split_manifest.json
-models/bp_relation_preprocessed_cache.pt
-models/bp_relation_feature_cache.sqlite
+# Local datasets, crawler state, and databases
+data/
+dataset/
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+
+# Generated data snapshots
+json/
+
+# Generated UI capture artifacts
+sw_ui_detection/input/
+sw_ui_detection/debug_crops/
+sw_ui_detection/output/
+
+# Generated model caches and manifests
+models/*cache*
+models/*manifest*
+
+# Model weights are intentionally tracked.

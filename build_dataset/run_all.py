@@ -9,12 +9,20 @@ from generate_alias_and_images import generate_alias_and_images
 from normalize_training_samples import normalize_training_samples
 from rebuild_monster_images import rebuild_monster_images
 from sync_images import sync_images
+from sync_lucksack_data import sync_lucksack_data
+from sync_swarfarm_mechanisms import sync_swarfarm_mechanisms
+from sync_swrt_data import sync_swrt_data
+from sync_swkit_data import sync_swkit_data
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run the BP dataset build pipeline.")
     parser.add_argument("--download", action="store_true", help="Download player pages before extraction.")
     parser.add_argument("--skip-images", action="store_true", help="Skip image sync and rebuild steps.")
+    parser.add_argument("--skip-lucksack", action="store_true", help="Skip syncing the live Lucksack catalog and statistics.")
+    parser.add_argument("--skip-mechanisms", action="store_true", help="Skip syncing SWARFARM skill mechanism data.")
+    parser.add_argument("--skip-swkit", action="store_true", help="Skip syncing SWKit aliases and RTA tiers.")
+    parser.add_argument("--skip-swrt", action="store_true", help="Skip syncing public SWRT RTA statistics.")
     parser.add_argument("--force-rebuild", action="store_true", help="Rebuild expanded samples instead of incremental append.")
     parser.add_argument("--skip-normalize", action="store_true", help="Skip normalized me-only sample export.")
     parser.add_argument("--use-existing-version-csv", action="store_true", help="Reuse the current version CSV when downloading.")
@@ -31,6 +39,15 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if not args.skip_swkit:
+        asyncio.run(sync_swkit_data())
+    if not args.skip_lucksack:
+        asyncio.run(sync_lucksack_data())
+    if not args.skip_swrt:
+        sync_swrt_data()
+    if not args.skip_mechanisms:
+        sync_swarfarm_mechanisms()
+
     if args.download:
         asyncio.run(
             download_players_by_rank(

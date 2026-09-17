@@ -1,0 +1,17 @@
+name: autobp
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - aiofiles
+  - beautifulsoup4
+  - lxml
+  - numpy
+  - opencv
+  - pillow
+  - playwright-python
+  - pyarrow
+  - streamlit
+  - tk
+  - tqdm

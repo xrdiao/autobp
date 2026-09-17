@@ -60,6 +60,8 @@ def sync_images():
     scanned_files = 0
     skipped_non_unit_icon = 0
     detail_records = []
+    source_hash_cache = {}
+    destination_hash_cache = {}
 
     for resource_dir in resource_dirs:
         for filename in os.listdir(resource_dir):
@@ -88,8 +90,14 @@ def sync_images():
                 copied += 1
                 record["status"] = "copied"
             else:
-                src_hash = file_hash(src_path)
-                dst_hash = file_hash(dst_path)
+                src_hash = source_hash_cache.get(src_path)
+                if src_hash is None:
+                    src_hash = file_hash(src_path)
+                    source_hash_cache[src_path] = src_hash
+                dst_hash = destination_hash_cache.get(dst_path)
+                if dst_hash is None:
+                    dst_hash = file_hash(dst_path)
+                    destination_hash_cache[dst_path] = dst_hash
 
                 if src_hash == dst_hash:
                     skipped_same += 1

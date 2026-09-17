@@ -8,13 +8,11 @@ import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
-import torch
-
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from bp_data_common import count_record_rows, upsert_record_rows
+from bp_data_common import count_record_rows, find_existing_record_keys, upsert_record_rows
 from dataset_versions import (
     build_version_weight_map,
     describe_dataset_versions,
@@ -41,6 +39,7 @@ DATASET_INDEX_COLUMNS = [
     "rank_tier",
     "dataset_version",
 ]
+DEFAULT_EXTRACT_WORKERS = min(8, os.cpu_count() or 1)
 
 
 def parse_args():
@@ -91,6 +90,8 @@ def load_json_if_exists(path, default):
 def load_pt_if_exists(path, default):
     if not os.path.exists(path):
         return default
+    import torch
+
     try:
         return torch.load(path, map_location="cpu", weights_only=False)
     except TypeError:
@@ -98,6 +99,8 @@ def load_pt_if_exists(path, default):
 
 
 def save_pt_atomic(data, path):
+    import torch
+
     output_dir = os.path.dirname(path)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
@@ -179,24 +182,18 @@ def upsert_raw_matches(path, updates):
     if not updates:
         return 0, 0, 0
     conn = open_raw_match_db(path)
-    appended = 0
-    replaced = 0
-    skipped = 0
     try:
-        with conn:
-            for item in updates:
-                key_parts = match_key(item)
-                if not key_parts[0] or not key_parts[2]:
-                    skipped += 1
-                    continue
-                key = "\u001f".join(key_parts)
-                existed = conn.execute("SELECT 1 FROM raw_matches WHERE key = ?", (key,)).fetchone() is not None
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO raw_matches
-                        (key, source_html, page_player_id, match_index, record)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
+        skipped = 0
+        prepared = []
+        for item in updates:
+            key_parts = match_key(item)
+            if not key_parts[0] or not key_parts[2]:
+                skipped += 1
+                continue
+            key = "\u001f".join(key_parts)
+            prepared.append(
+                (
+                    key,
                     (
                         key,
                         key_parts[0],
@@ -205,10 +202,33 @@ def upsert_raw_matches(path, updates):
                         sqlite3.Binary(pickle.dumps(item, protocol=pickle.HIGHEST_PROTOCOL)),
                     ),
                 )
-                if existed:
-                    replaced += 1
-                else:
-                    appended += 1
+            )
+
+        if not prepared:
+            return 0, 0, skipped
+
+        existing_keys = find_existing_record_keys(conn, "raw_matches", [key for key, _values in prepared])
+        seen_keys = set()
+        appended = 0
+        replaced = 0
+        values = []
+        for key, row_values in prepared:
+            if key in existing_keys or key in seen_keys:
+                replaced += 1
+            else:
+                appended += 1
+            seen_keys.add(key)
+            values.append(row_values)
+
+        with conn:
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO raw_matches
+                    (key, source_html, page_player_id, match_index, record)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                values,
+            )
     finally:
         conn.close()
     return appended, replaced, skipped
@@ -280,7 +300,7 @@ def batch_extract_match_bp(
     version_summary = describe_dataset_versions(discovered_versions, version_weights)
     print(f"[INFO] discovered dataset versions: {version_summary}")
 
-    worker_count = int(max_workers or min(4, os.cpu_count() or 1))
+    worker_count = int(max_workers or DEFAULT_EXTRACT_WORKERS)
     worker_count = max(1, min(len(html_files), worker_count))
 
     def consume_result(path_str, raw_matches, dataset_matches):

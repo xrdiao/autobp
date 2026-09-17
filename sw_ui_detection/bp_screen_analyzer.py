@@ -9,7 +9,6 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from bp_transformer_common import PROJECT_ROOT
 from sw_ui_detection.detector import BoundingBox, SlotDetection, SummonersWarUIDetector, _clip_box, _iou
 from sw_ui_detection.monster_bank import MonsterTemplateBank
 
@@ -420,7 +419,7 @@ class BPDraftScreenAnalyzer:
             "</head>",
             "<body>",
             "<div class=\"header\">",
-            f"<h1>BP 识别报告</h1>",
+            "<h1>BP 识别报告</h1>",
             f"<span class=\"pill {'ok' if analysis.is_bp_screen else 'bad'}\">BP界面: {escape(str(analysis.is_bp_screen))}</span>",
             f"<span class=\"pill\">置信度: {analysis.confidence:.3f}</span>",
             f"<span class=\"pill\">先手: {escape(analysis.first_pick_side)}</span>",

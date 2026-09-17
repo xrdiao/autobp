@@ -9,6 +9,7 @@ import sqlite3
 import time
 from concurrent.futures import ProcessPoolExecutor
 from collections import Counter
+from itertools import combinations
 
 import torch
 import torch.nn.functional as F
@@ -17,7 +18,7 @@ from tqdm import tqdm
 
 from bp_data_common import NameResolver, build_name_resolution_resources, normalize_relation_sample
 from bp_relation_common import (
-    BPDraftRelationNet,
+    BPDraftRelationNetV2,
     MonsterVocab,
     infer_pick_count,
     normalize_slug_list,
@@ -27,9 +28,9 @@ from bp_transformer_common import PAD_TOKEN, PROJECT_ROOT, UNK_TOKEN, normalize_
 
 DATA_PATH = str(PROJECT_ROOT / "data" / "bp_samples.sqlite")
 SAVE_DIR = str(PROJECT_ROOT / "models")
-MODEL_PATH = os.path.join(SAVE_DIR, "bp_relation_net.pt")
-META_PATH = os.path.join(SAVE_DIR, "bp_relation_meta.json")
-VOCAB_PATH = os.path.join(SAVE_DIR, "bp_relation_vocab.json")
+MODEL_PATH = os.path.join(SAVE_DIR, "bp_relation_net_v2.pt")
+META_PATH = os.path.join(SAVE_DIR, "bp_relation_meta_v2.json")
+VOCAB_PATH = os.path.join(SAVE_DIR, "bp_relation_vocab_v2.json")
 SPLIT_MANIFEST_PATH = os.path.join(SAVE_DIR, "bp_relation_split_manifest.json")
 PREPROCESSED_CACHE_PATH = os.path.join(SAVE_DIR, "bp_relation_preprocessed_cache.pt")
 FEATURE_CACHE_PATH = os.path.join(SAVE_DIR, "bp_relation_feature_cache.sqlite")
@@ -50,11 +51,15 @@ BAN_LOSS_WEIGHT = 0.8
 VAL_RATIO = 0.1
 SEED = 42
 SPLIT_MANIFEST_VERSION = 1
-PREPROCESS_VERSION = 4
-FEATURE_CACHE_SCHEMA_VERSION = 1
+PREPROCESS_VERSION = 6
+FEATURE_CACHE_SCHEMA_VERSION = 3
 FEATURE_FETCH_SIZE = 2048
 FEATURE_CACHE_COMMIT_GROUPS = 512
 FEATURE_CACHE_WORKERS = max(1, min(4, (os.cpu_count() or 1)))
+RELATION_ARCHITECTURE_VERSION = 3
+HIGH_FREQ_NEGATIVE_RATIO = 0.20
+NEAR_FREQ_NEGATIVE_RATIO = 0.20
+OUTCOME_LOSS_WEIGHT = 0.35
 
 
 def parse_args():
@@ -74,7 +79,12 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--negatives-per-positive", type=int, default=NEGATIVES_PER_POSITIVE)
+    parser.add_argument("--hard-negative-ratio", type=float, default=0.25)
+    parser.add_argument("--hard-negative-candidate-pool", type=int, default=64)
+    parser.add_argument("--pick-eval-candidate-cap", type=int, default=96)
+    parser.add_argument("--pick-eval-max-samples", type=int, default=2048)
     parser.add_argument("--ban-loss-weight", type=float, default=BAN_LOSS_WEIGHT)
+    parser.add_argument("--outcome-loss-weight", type=float, default=OUTCOME_LOSS_WEIGHT)
     parser.add_argument("--val-ratio", type=float, default=VAL_RATIO)
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--new-data-weight", type=float, default=4.0)
@@ -141,17 +151,6 @@ def load_samples(path):
         return samples
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
-
-
-def file_signature(path):
-    if not path or not os.path.exists(path):
-        return None
-    stat = os.stat(path)
-    return {
-        "path": os.path.abspath(path),
-        "size": int(stat.st_size),
-        "mtime_ns": int(stat.st_mtime_ns),
-    }
 
 
 def _torch_load_cache(path):
@@ -983,19 +982,21 @@ def normalize_final_pick_slugs(sample, my_side=True, alias_map=None):
     return normalize_slug_list(sample.get(slug_key) or sample.get(fallback_key) or [], alias_map=alias_map)
 
 
-def extract_current_turn_my_pick_slugs(sample, pick_count, alias_map=None):
+def extract_current_turn_pick_slugs(sample, side, pick_count, alias_map=None):
     pick_count = int(pick_count or 0)
     if pick_count <= 0:
         return []
     next_pick_slug = resolve_monster_slug(sample.get("next_pick_slug"), alias_map=alias_map)
     if not next_pick_slug:
         next_pick_slug = resolve_monster_slug(sample.get("next_pick"), alias_map=alias_map)
-    remaining_my_picks = normalize_slug_list(
-        sample.get("remaining_my_pick_slugs") or sample.get("remaining_my_picks") or [],
+    remaining_key = "remaining_my_pick_slugs" if side == "me" else "remaining_enemy_pick_slugs"
+    fallback_key = "remaining_my_picks" if side == "me" else "remaining_enemy_picks"
+    remaining_picks = normalize_slug_list(
+        sample.get(remaining_key) or sample.get(fallback_key) or [],
         alias_map=alias_map,
     )
     targets = [next_pick_slug] if next_pick_slug else []
-    for slug in remaining_my_picks:
+    for slug in remaining_picks:
         if slug not in targets:
             targets.append(slug)
         if len(targets) >= pick_count:
@@ -1007,6 +1008,21 @@ def set_seed(seed):
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def parse_result_label(sample):
+    value = normalize_name(sample.get("result"))
+    if value in {"win", "victory", "winner"}:
+        return 1.0
+    if value in {"lose", "loss", "defeat"}:
+        return 0.0
+
+    value = sample.get("won")
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    if isinstance(value, (int, float)):
+        return 1.0 if float(value) > 0 else 0.0
+    return None
 
 
 def canonical_pair(a, b):
@@ -1046,9 +1062,9 @@ def collect_frequency_stats(samples, vocab, alias_map, show_progress=True):
 
 def build_positive_actions(samples, vocab, alias_map):
     positives = []
-    seen_leaveout = set()
     for sample in samples:
-        if normalize_name(sample.get("current_side")) != "me":
+        current_side = normalize_name(sample.get("current_side"))
+        if current_side not in {"me", "enemy"}:
             continue
 
         common_meta = {
@@ -1056,31 +1072,53 @@ def build_positive_actions(samples, vocab, alias_map):
             "is_new_group": bool(sample.get("_is_new_group", False)),
             "sample_weight": float(sample.get("sample_weight", 1.0) or 1.0),
         }
-        my_picks = normalize_slug_list(sample.get("my_picks_slugs") or sample.get("my_picks") or [], alias_map=alias_map)
-        enemy_picks = normalize_slug_list(sample.get("enemy_picks_slugs") or sample.get("enemy_picks") or [], alias_map=alias_map)
-        final_my = normalize_final_pick_slugs(sample, my_side=True, alias_map=alias_map)
-        final_enemy = normalize_final_pick_slugs(sample, my_side=False, alias_map=alias_map)
-        if not final_my:
-            continue
+        my_picks = normalize_slug_list(
+            sample.get("my_picks_slugs") or sample.get("my_picks") or [],
+            alias_map=alias_map,
+        )
+        enemy_picks = normalize_slug_list(
+            sample.get("enemy_picks_slugs") or sample.get("enemy_picks") or [],
+            alias_map=alias_map,
+        )
+        own_picks = my_picks if current_side == "me" else enemy_picks
+        opponent_picks = enemy_picks if current_side == "me" else my_picks
 
         turn = int(sample.get("turn", len(my_picks) + len(enemy_picks) + 1) or 0)
-        first_pick_side = 1.0 if normalize_name(sample.get("first_pick_side")) == "me" else 0.0
-        pick_count = infer_pick_count(my_picks, enemy_picks, sample.get("first_pick_side"))
-        current_turn = extract_current_turn_my_pick_slugs(sample, pick_count, alias_map=alias_map)
-        full_block = {vocab.get_id(x) for x in final_my + final_enemy if vocab.get_id(x) > 1}
+        global_first_pick_side = normalize_name(sample.get("first_pick_side"))
+        first_pick_side = 1.0 if global_first_pick_side == current_side else 0.0
+        relative_first_pick_side = "me" if first_pick_side > 0.5 else "enemy"
+        pick_count = infer_pick_count(own_picks, opponent_picks, relative_first_pick_side)
+        current_turn = extract_current_turn_pick_slugs(
+            sample,
+            current_side,
+            pick_count,
+            alias_map=alias_map,
+        )
+        prefix_block = {
+            vocab.get_id(x)
+            for x in own_picks + opponent_picks
+            if vocab.get_id(x) > 1
+        }
+        result_label = parse_result_label(sample)
+        outcome = None if result_label is None else (
+            result_label if current_side == "me" else 1.0 - result_label
+        )
 
         if current_turn:
             first_id = vocab.get_id(current_turn[0])
             if first_id > 1:
                 positives.append(
                     {
-                        "my_picks": my_picks,
-                        "enemy_picks": enemy_picks,
+                        "my_picks": own_picks,
+                        "enemy_picks": opponent_picks,
                         "candidate": (first_id, vocab.get_id(PAD_TOKEN)),
                         "is_pair": False,
                         "turn": turn,
                         "first_pick_side": first_pick_side,
-                        "blocked": full_block,
+                        "current_side": 1.0,
+                        "outcome": outcome,
+                        "blocked": prefix_block,
+                        "source": "chronological_prefix_perspective",
                         **common_meta,
                     }
                 )
@@ -1091,56 +1129,16 @@ def build_positive_actions(samples, vocab, alias_map):
             if first_id > 1 and second_id > 1 and first_id != second_id:
                 positives.append(
                     {
-                        "my_picks": my_picks,
-                        "enemy_picks": enemy_picks,
+                        "my_picks": own_picks,
+                        "enemy_picks": opponent_picks,
                         "candidate": canonical_pair(first_id, second_id),
                         "is_pair": True,
                         "turn": turn,
                         "first_pick_side": first_pick_side,
-                        "blocked": full_block,
-                        **common_meta,
-                    }
-                )
-
-        match_id = str(sample.get("match_id") or "")
-        final_ids = [vocab.get_id(x) for x in final_my if vocab.get_id(x) > 1]
-        enemy_ids = {vocab.get_id(x) for x in final_enemy if vocab.get_id(x) > 1}
-        for pos, monster_id in enumerate(final_ids):
-            key = (match_id, "single", tuple(sorted(final_ids)), monster_id)
-            if key in seen_leaveout:
-                continue
-            seen_leaveout.add(key)
-            context = [x for i, x in enumerate(final_my) if i != pos]
-            positives.append(
-                {
-                    "my_picks": context[:5],
-                    "enemy_picks": final_enemy[:5],
-                    "candidate": (monster_id, vocab.get_id(PAD_TOKEN)),
-                    "is_pair": False,
-                    "turn": max(1, len(context) + len(final_enemy) + 1),
-                    "first_pick_side": first_pick_side,
-                    "blocked": set(final_ids) | enemy_ids,
-                    **common_meta,
-                }
-            )
-        for i in range(len(final_ids)):
-            for j in range(i + 1, len(final_ids)):
-                pair = canonical_pair(final_ids[i], final_ids[j])
-                key = (match_id, "pair", tuple(sorted(final_ids)), pair)
-                if key in seen_leaveout:
-                    continue
-                seen_leaveout.add(key)
-                removed = {final_ids[i], final_ids[j]}
-                context = [slug for slug in final_my if vocab.get_id(slug) not in removed]
-                positives.append(
-                    {
-                        "my_picks": context[:5],
-                        "enemy_picks": final_enemy[:5],
-                        "candidate": pair,
-                        "is_pair": True,
-                        "turn": max(1, len(context) + len(final_enemy) + 1),
-                        "first_pick_side": first_pick_side,
-                        "blocked": set(final_ids) | enemy_ids,
+                        "current_side": 1.0,
+                        "outcome": outcome,
+                        "blocked": prefix_block,
+                        "source": "chronological_prefix_perspective",
                         **common_meta,
                     }
                 )
@@ -1182,6 +1180,7 @@ def build_ban_positive_actions(samples, vocab, alias_map):
                 "enemy_candidate_ids": enemy_ids,
                 "turn": 10,
                 "first_pick_side": 1.0 if normalize_name(sample.get("first_pick_side")) == "me" else 0.0,
+                "outcome": parse_result_label(sample),
                 "split_group_key": sample.get("_split_group_key"),
                 "is_new_group": bool(sample.get("_is_new_group", False)),
                 "sample_weight": float(sample.get("sample_weight", 1.0) or 1.0),
@@ -1224,8 +1223,11 @@ class RelationPairwiseDataset(Dataset):
         row["enemy_mask"] = enemy_mask
         row["turn_value"] = float(row["turn"])
         row["first_pick_side_value"] = float(row["first_pick_side"])
+        row["current_side_value"] = float(row.get("current_side", 1.0))
         row["is_new_group"] = bool(row.get("is_new_group", False))
         row["sample_weight"] = max(1e-6, float(row.get("sample_weight", 1.0) or 1.0))
+        row["outcome_value"] = float(row["outcome"]) if row.get("outcome") is not None else 0.5
+        row["outcome_mask"] = 1.0 if row.get("outcome") is not None else 0.0
         row["candidate"] = (int(row["candidate"][0]), int(row["candidate"][1]))
         row["blocked_ids"] = {int(idx) for idx in row.get("blocked", set())}
         row["legal_ids"] = [idx for idx in self.valid_ids if idx not in row["blocked_ids"]]
@@ -1247,7 +1249,10 @@ class RelationPairwiseDataset(Dataset):
             self.action_type_tensor = empty_long.clone()
             self.turn_tensor = empty_float.clone()
             self.first_pick_side_tensor = empty_float.clone()
+            self.current_side_tensor = empty_float.clone()
             self.loss_weight_tensor = empty_float.clone()
+            self.outcome_tensor = empty_float.clone()
+            self.outcome_mask_tensor = empty_float.clone()
             self.is_pair_tensor = empty_long.clone()
             self.is_new_group_tensor = empty_long.clone()
             return
@@ -1292,6 +1297,10 @@ class RelationPairwiseDataset(Dataset):
             [self.base_rows[idx]["first_pick_side_value"] for idx in self.row_base_indices],
             dtype=torch.float32,
         )
+        self.current_side_tensor = torch.tensor(
+            [self.base_rows[idx]["current_side_value"] for idx in self.row_base_indices],
+            dtype=torch.float32,
+        )
         self.is_pair_tensor = torch.tensor(
             [1 if self.base_rows[idx]["is_pair"] else 0 for idx in self.row_base_indices],
             dtype=torch.long,
@@ -1300,6 +1309,14 @@ class RelationPairwiseDataset(Dataset):
         self.neg_c1_tensor = torch.empty((self.row_count,), dtype=torch.long)
         self.neg_c2_tensor = torch.empty((self.row_count,), dtype=torch.long)
         self.loss_weight_tensor = torch.empty((self.row_count,), dtype=torch.float32)
+        self.outcome_tensor = torch.tensor(
+            [self.base_rows[idx]["outcome_value"] for idx in self.row_base_indices],
+            dtype=torch.float32,
+        )
+        self.outcome_mask_tensor = torch.tensor(
+            [self.base_rows[idx]["outcome_mask"] for idx in self.row_base_indices],
+            dtype=torch.float32,
+        )
 
     def __len__(self):
         return self.row_count
@@ -1324,12 +1341,12 @@ class RelationPairwiseDataset(Dataset):
             return positive_id
 
         roll = rng.random()
-        if roll < 0.60:
+        if roll < HIGH_FREQ_NEGATIVE_RATIO:
             pool = [idx for idx in self.high_freq_ids if idx in legal]
-            return rng.choice(pool or list(legal))
-        if roll < 0.90:
+            return rng.choice(pool or sorted(legal))
+        if roll < HIGH_FREQ_NEGATIVE_RATIO + NEAR_FREQ_NEGATIVE_RATIO:
             return self._near_frequency_id(positive_id, legal, rng)
-        return rng.choice(list(legal))
+        return rng.choice(sorted(legal))
 
     def _sample_pair_negative(self, positive, rng):
         pos_pair = canonical_pair(*positive["candidate"])
@@ -1342,21 +1359,21 @@ class RelationPairwiseDataset(Dataset):
 
         roll = rng.random()
         for _ in range(64):
-            if roll < 0.60:
+            if roll < HIGH_FREQ_NEGATIVE_RATIO:
                 pool = [idx for idx in self.high_freq_ids if idx in legal]
                 if len(pool) < 2:
-                    pool = list(legal)
+                    pool = sorted(legal)
                 pair = canonical_pair(*rng.sample(pool, 2))
-            elif roll < 0.90:
+            elif roll < HIGH_FREQ_NEGATIVE_RATIO + NEAR_FREQ_NEGATIVE_RATIO:
                 keep = rng.choice(pos_pair)
                 other_pos = pos_pair[0] if keep == pos_pair[1] else pos_pair[1]
                 replacement = self._near_frequency_id(other_pos, legal - {keep}, rng)
                 pair = canonical_pair(keep, replacement)
             else:
-                pair = canonical_pair(*rng.sample(list(legal), 2))
+                pair = canonical_pair(*rng.sample(sorted(legal), 2))
             if valid_pair(pair):
                 return pair
-        return canonical_pair(*rng.sample(list(legal), 2))
+        return canonical_pair(*rng.sample(sorted(legal), 2))
 
     def _action_freq(self, candidate, is_pair):
         if is_pair:
@@ -1366,25 +1383,148 @@ class RelationPairwiseDataset(Dataset):
             return math.sqrt(float(self.monster_freq.get(pair[0], 0) * self.monster_freq.get(pair[1], 0)))
         return float(self.monster_freq.get(int(candidate[0]), 0))
 
-    def refresh_negative_pairs(self, epoch_seed: int):
+    def _hard_candidate_pool(self, positive, rng, candidate_cap):
+        legal = set(positive["legal_ids"])
+        cap = max(4, int(candidate_cap))
+        if positive["is_pair"]:
+            pos_pair = canonical_pair(*positive["candidate"])
+            pool_size = max(8, min(32, int(math.sqrt(cap * 2)) + 4))
+            pool = [idx for idx in self.high_freq_ids if idx in legal][:pool_size]
+            remainder = sorted(legal - set(pool))
+            if len(pool) < pool_size and remainder:
+                pool.extend(rng.sample(remainder, min(pool_size - len(pool), len(remainder))))
+            for idx in pos_pair:
+                if idx in legal and idx not in pool:
+                    pool.append(idx)
+            pairs = [
+                pair
+                for pair in combinations(sorted(set(pool)), 2)
+                if pair != pos_pair and pair[0] in legal and pair[1] in legal
+            ]
+            if len(pairs) > cap:
+                pairs = rng.sample(pairs, cap)
+            return pairs
+
+        positive_id = int(positive["candidate"][0])
+        high = [idx for idx in self.high_freq_ids if idx in legal and idx != positive_id]
+        pool = high[:cap]
+        remainder = sorted(legal - set(pool) - {positive_id})
+        if len(pool) < cap and remainder:
+            pool.extend(rng.sample(remainder, min(cap - len(pool), len(remainder))))
+        return [(idx, self.pad_id) for idx in pool if idx != positive_id]
+
+    @torch.no_grad()
+    def _mine_hard_negatives(self, model, device, base_indices, rng, candidate_cap, batch_size=1024):
+        if model is None or not base_indices:
+            return {}
+        tasks = []
+        for base_idx in base_indices:
+            positive = self.base_rows[base_idx]
+            tasks.extend(
+                (base_idx, positive, candidate)
+                for candidate in self._hard_candidate_pool(positive, rng, candidate_cap)
+            )
+        if not tasks:
+            return {}
+
+        model_was_training = model.training
+        model.eval()
+        best_scores = {}
+        best_candidates = {}
+        for start in range(0, len(tasks), max(1, int(batch_size))):
+            chunk = tasks[start : start + max(1, int(batch_size))]
+            scores = model(
+                torch.tensor([item[1]["my_ids"] for item in chunk], dtype=torch.long, device=device),
+                torch.tensor([item[1]["my_mask"] for item in chunk], dtype=torch.float32, device=device),
+                torch.tensor([item[1]["enemy_ids"] for item in chunk], dtype=torch.long, device=device),
+                torch.tensor([item[1]["enemy_mask"] for item in chunk], dtype=torch.float32, device=device),
+                torch.tensor([item[2][0] for item in chunk], dtype=torch.long, device=device),
+                torch.tensor([item[2][1] for item in chunk], dtype=torch.long, device=device),
+                torch.tensor(
+                    [[1.0, 1.0 if item[1]["is_pair"] else 0.0] for item in chunk],
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                torch.tensor([item[1]["turn_value"] for item in chunk], dtype=torch.float32, device=device),
+                torch.tensor(
+                    [item[1]["first_pick_side_value"] for item in chunk],
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                action_type=torch.tensor(
+                    [1 if item[1]["is_pair"] else 0 for item in chunk],
+                    dtype=torch.long,
+                    device=device,
+                ),
+                current_side=torch.tensor(
+                    [item[1]["current_side_value"] for item in chunk],
+                    dtype=torch.float32,
+                    device=device,
+                ),
+            )
+            for task, score in zip(chunk, scores.detach().cpu().tolist()):
+                base_idx, _positive, candidate = task
+                if base_idx not in best_scores or float(score) > best_scores[base_idx]:
+                    best_scores[base_idx] = float(score)
+                    best_candidates[base_idx] = candidate
+        if model_was_training:
+            model.train()
+        return best_candidates
+
+    def _debiased_frequency_weight(self, frequency):
+        propensity = (float(frequency) + 1.0) / (float(self.max_action_freq) + 1.0)
+        return min(2.0, max(0.5, propensity ** -0.25))
+
+    def refresh_negative_pairs(
+        self,
+        epoch_seed: int,
+        model=None,
+        device=None,
+        hard_negative_ratio=0.0,
+        hard_negative_candidate_pool=64,
+        hard_negative_max_rows=4096,
+    ):
         start = time.perf_counter()
         if self.row_count == 0:
             self.last_refresh_seconds = time.perf_counter() - start
             return
 
         rng = random.Random(int(epoch_seed))
+        hard_negatives = {}
+        hard_ratio = min(1.0, max(0.0, float(hard_negative_ratio)))
+        if model is not None and device is not None and hard_ratio > 0.0:
+            hard_count = min(
+                self.base_count,
+                max(1, min(int(hard_negative_max_rows), int(self.base_count * hard_ratio))),
+            )
+            hard_indices = rng.sample(range(self.base_count), hard_count)
+            hard_negatives = self._mine_hard_negatives(
+                model=model,
+                device=device,
+                base_indices=hard_indices,
+                rng=rng,
+                candidate_cap=hard_negative_candidate_pool,
+            )
+
         neg_c1 = []
         neg_c2 = []
         loss_weight = []
         for base_idx in self.row_base_indices:
             positive = self.base_rows[base_idx]
             is_pair = bool(positive["is_pair"])
-            negative = self._sample_pair_negative(positive, rng) if is_pair else (self._sample_single_negative(positive, rng), self.pad_id)
+            if base_idx in hard_negatives:
+                negative = hard_negatives[base_idx]
+            else:
+                negative = (
+                    self._sample_pair_negative(positive, rng)
+                    if is_pair
+                    else (self._sample_single_negative(positive, rng), self.pad_id)
+                )
             pos = positive["candidate"]
             pos_freq = self._action_freq(pos, is_pair)
             neg_freq = self._action_freq(negative, is_pair)
-            weight = positive["sample_weight"] * (1.0 / math.sqrt(pos_freq + 1.0)) * (
-                1.0 + math.sqrt(neg_freq + 1.0) / math.sqrt(self.max_action_freq + 1.0)
+            weight = positive["sample_weight"] * (
+                self._debiased_frequency_weight(pos_freq) * self._debiased_frequency_weight(neg_freq)
             )
             neg_c1.append(int(negative[0]))
             neg_c2.append(int(negative[1]))
@@ -1409,7 +1549,10 @@ class RelationPairwiseDataset(Dataset):
             "action_type": self.action_type_tensor[idx],
             "turn": self.turn_tensor[idx],
             "first_pick_side": self.first_pick_side_tensor[idx],
+            "current_side": self.current_side_tensor[idx],
             "loss_weight": self.loss_weight_tensor[idx],
+            "outcome": self.outcome_tensor[idx],
+            "outcome_mask": self.outcome_mask_tensor[idx],
             "is_pair": self.is_pair_tensor[idx],
             "is_new_group": self.is_new_group_tensor[idx],
         }
@@ -1460,8 +1603,11 @@ class BanPairwiseDataset(Dataset):
         row["enemy_mask"] = enemy_mask
         row["turn_value"] = float(row["turn"])
         row["first_pick_side_value"] = float(row["first_pick_side"])
+        row["current_side_value"] = 1.0
         row["is_new_group"] = bool(row.get("is_new_group", False))
         row["sample_weight"] = max(1e-6, float(row.get("sample_weight", 1.0) or 1.0))
+        row["outcome_value"] = float(row["outcome"]) if row.get("outcome") is not None else 0.5
+        row["outcome_mask"] = 1.0 if row.get("outcome") is not None else 0.0
         row["candidate"] = int(row["candidate"])
         row["legal_enemy_ids"] = [int(idx) for idx in row["enemy_candidate_ids"]]
         return row
@@ -1482,7 +1628,10 @@ class BanPairwiseDataset(Dataset):
             self.action_type_tensor = empty_long.clone()
             self.turn_tensor = empty_float.clone()
             self.first_pick_side_tensor = empty_float.clone()
+            self.current_side_tensor = empty_float.clone()
             self.loss_weight_tensor = empty_float.clone()
+            self.outcome_tensor = empty_float.clone()
+            self.outcome_mask_tensor = empty_float.clone()
             self.is_pair_tensor = empty_long.clone()
             self.is_new_group_tensor = empty_long.clone()
             return
@@ -1518,8 +1667,20 @@ class BanPairwiseDataset(Dataset):
             [self.base_rows[idx]["first_pick_side_value"] for idx in self.row_base_indices],
             dtype=torch.float32,
         )
+        self.current_side_tensor = torch.tensor(
+            [self.base_rows[idx]["current_side_value"] for idx in self.row_base_indices],
+            dtype=torch.float32,
+        )
         self.loss_weight_tensor = torch.tensor(
             [self.base_rows[idx]["sample_weight"] for idx in self.row_base_indices],
+            dtype=torch.float32,
+        )
+        self.outcome_tensor = torch.tensor(
+            [self.base_rows[idx]["outcome_value"] for idx in self.row_base_indices],
+            dtype=torch.float32,
+        )
+        self.outcome_mask_tensor = torch.tensor(
+            [self.base_rows[idx]["outcome_mask"] for idx in self.row_base_indices],
             dtype=torch.float32,
         )
         self.is_pair_tensor = torch.zeros((self.row_count,), dtype=torch.long)
@@ -1558,7 +1719,10 @@ class BanPairwiseDataset(Dataset):
             "action_type": self.action_type_tensor[idx],
             "turn": self.turn_tensor[idx],
             "first_pick_side": self.first_pick_side_tensor[idx],
+            "current_side": self.current_side_tensor[idx],
             "loss_weight": self.loss_weight_tensor[idx],
+            "outcome": self.outcome_tensor[idx],
+            "outcome_mask": self.outcome_mask_tensor[idx],
             "is_pair": self.is_pair_tensor[idx],
             "is_new_group": self.is_new_group_tensor[idx],
         }
@@ -1603,6 +1767,7 @@ def run_epoch(
     scaler=None,
     use_amp=False,
     loss_scale=1.0,
+    outcome_loss_weight=OUTCOME_LOSS_WEIGHT,
     desc_prefix="",
     grad_accum_steps=1,
     log_interval=50,
@@ -1618,6 +1783,7 @@ def run_epoch(
     is_train = optimizer is not None
     model.train(is_train)
     total_loss = 0.0
+    total_outcome_loss = 0.0
     total = 0
     correct = 0
     single_correct = 0
@@ -1643,6 +1809,7 @@ def run_epoch(
                 batch["turn"],
                 batch["first_pick_side"],
                 action_type=batch.get("action_type"),
+                current_side=batch.get("current_side"),
             )
             neg_score = model(
                 batch["my_picks"],
@@ -1655,10 +1822,25 @@ def run_epoch(
                 batch["turn"],
                 batch["first_pick_side"],
                 action_type=batch.get("action_type"),
+                current_side=batch.get("current_side"),
             )
             per_sample = F.softplus(-(pos_score - neg_score))
             metric_loss = (per_sample * batch["loss_weight"]).mean()
-            loss = metric_loss * float(loss_scale)
+            outcome_mask = batch.get("outcome_mask")
+            if outcome_mask is not None and bool(torch.any(outcome_mask > 0)):
+                outcome_loss_values = F.binary_cross_entropy_with_logits(
+                    pos_score,
+                    batch["outcome"],
+                    reduction="none",
+                )
+                outcome_loss = (
+                    (outcome_loss_values * outcome_mask * batch["loss_weight"]).sum()
+                    / (outcome_mask * batch["loss_weight"]).sum().clamp_min(1e-6)
+                )
+            else:
+                outcome_loss = torch.zeros((), dtype=metric_loss.dtype, device=metric_loss.device)
+            combined_loss = metric_loss + float(outcome_loss_weight) * outcome_loss
+            loss = combined_loss * float(loss_scale)
 
         if is_train:
             scaled_loss = loss / max(1, int(grad_accum_steps))
@@ -1681,7 +1863,9 @@ def run_epoch(
 
         batch_size = int(batch["is_pair"].numel())
         loss_value = float(metric_loss.detach().item())
+        outcome_loss_value = float(outcome_loss.detach().item())
         total_loss += loss_value * batch_size
+        total_outcome_loss += outcome_loss_value * batch_size
         total += batch_size
         running_loss += loss_value
         batch_correct = pos_score > neg_score
@@ -1700,6 +1884,7 @@ def run_epoch(
 
     return {
         "loss": total_loss / max(1, total),
+        "outcome_loss": total_outcome_loss / max(1, total),
         "overall_acc": correct / max(1, total),
         "single_acc": single_correct / max(1, single_total),
         "pair_acc": pair_correct / max(1, pair_total),
@@ -1748,6 +1933,7 @@ def evaluate_ban_topk(model, positives, vocab, device, batch_size=512):
             torch.tensor([10.0] * len(expanded), dtype=torch.float32, device=device),
             torch.tensor([float(item[1]["first_pick_side"]) for item in expanded], dtype=torch.float32, device=device),
             action_type=torch.full((len(expanded),), 2, dtype=torch.long, device=device),
+            current_side=torch.ones((len(expanded),), dtype=torch.float32, device=device),
         )
         grouped = {}
         for (row_idx, positive, candidate_id), score in zip(expanded, scores.detach().cpu().tolist()):
@@ -1764,6 +1950,199 @@ def evaluate_ban_topk(model, positives, vocab, device, batch_size=512):
     return {
         "top1_acc": top1 / max(1, total),
         "top3_acc": top3 / max(1, total),
+    }
+
+
+@torch.no_grad()
+def evaluate_pick_topk(
+    model,
+    positives,
+    vocab,
+    device,
+    candidate_cap=96,
+    max_samples=2048,
+    batch_size=1024,
+):
+    if not positives:
+        return {
+            "single_top1_acc": 0.0,
+            "single_top3_acc": 0.0,
+            "pair_top1_acc": 0.0,
+            "pair_top3_acc": 0.0,
+            "single_total": 0,
+            "pair_total": 0,
+        }
+
+    model.eval()
+    valid_ids = [idx for idx in range(len(vocab)) if idx > 1]
+    pad_id = vocab.get_id(PAD_TOKEN)
+    if max_samples > 0 and len(positives) > int(max_samples):
+        sample_rng = random.Random(0)
+        selected_indices = sorted(sample_rng.sample(range(len(positives)), int(max_samples)))
+        positives = [positives[idx] for idx in selected_indices]
+
+    eval_rows = []
+    for positive in positives:
+        is_pair = bool(positive.get("is_pair"))
+        positive_action = (
+            canonical_pair(*positive["candidate"])
+            if is_pair
+            else (int(positive["candidate"][0]), pad_id)
+        )
+        blocked = {int(idx) for idx in positive.get("blocked", set())}
+        legal = [idx for idx in valid_ids if idx not in blocked]
+        if is_pair:
+            positive_ids = set(positive_action)
+            candidate_ids = list(dict.fromkeys(
+                list(positive_ids) + [idx for idx in legal if idx not in positive_ids]
+            ))
+            if candidate_cap > 0:
+                pool_limit = max(4, int(math.sqrt(max(4, int(candidate_cap)) * 2)) + 1)
+                candidate_ids = candidate_ids[:pool_limit]
+            actions = [
+                canonical_pair(first_id, second_id)
+                for first_id, second_id in combinations(candidate_ids, 2)
+                if canonical_pair(first_id, second_id) != positive_action
+            ]
+            if candidate_cap > 0 and len(actions) > int(candidate_cap) - 1:
+                actions = actions[: max(1, int(candidate_cap) - 1)]
+            actions.insert(0, positive_action)
+        else:
+            candidate_ids = [int(positive_action[0])] + [
+                idx for idx in legal if idx != positive_action[0]
+            ]
+            if candidate_cap > 0:
+                candidate_ids = candidate_ids[: max(1, int(candidate_cap))]
+            actions = [(idx, pad_id) for idx in candidate_ids]
+            if positive_action not in actions:
+                actions.insert(0, positive_action)
+
+        if actions:
+            eval_rows.append((positive, actions, positive_action))
+
+    expanded = []
+    for row_idx, (positive, actions, positive_action) in enumerate(eval_rows):
+        my_ids, my_mask = encode_list(positive["my_picks"], vocab)
+        enemy_ids, enemy_mask = encode_list(positive["enemy_picks"], vocab)
+        for action in actions:
+            expanded.append(
+                {
+                    "row_idx": row_idx,
+                    "my_ids": my_ids,
+                    "my_mask": my_mask,
+                    "enemy_ids": enemy_ids,
+                    "enemy_mask": enemy_mask,
+                    "candidate": action,
+                    "is_pair": bool(positive.get("is_pair")),
+                    "turn": float(positive["turn"]),
+                    "first_pick_side": float(positive["first_pick_side"]),
+                    "current_side": float(positive.get("current_side", 1.0)),
+                }
+            )
+
+    grouped_scores = {}
+    for start in range(0, len(expanded), max(1, int(batch_size))):
+        chunk = expanded[start : start + max(1, int(batch_size))]
+        scores = model(
+            torch.tensor([row["my_ids"] for row in chunk], dtype=torch.long, device=device),
+            torch.tensor([row["my_mask"] for row in chunk], dtype=torch.float32, device=device),
+            torch.tensor([row["enemy_ids"] for row in chunk], dtype=torch.long, device=device),
+            torch.tensor([row["enemy_mask"] for row in chunk], dtype=torch.float32, device=device),
+            torch.tensor([row["candidate"][0] for row in chunk], dtype=torch.long, device=device),
+            torch.tensor([row["candidate"][1] for row in chunk], dtype=torch.long, device=device),
+            torch.tensor(
+                [[1.0, 1.0 if row["is_pair"] else 0.0] for row in chunk],
+                dtype=torch.float32,
+                device=device,
+            ),
+            torch.tensor([row["turn"] for row in chunk], dtype=torch.float32, device=device),
+            torch.tensor(
+                [row["first_pick_side"] for row in chunk],
+                dtype=torch.float32,
+                device=device,
+            ),
+            action_type=torch.tensor(
+                [1 if row["is_pair"] else 0 for row in chunk],
+                dtype=torch.long,
+                device=device,
+            ),
+            current_side=torch.tensor(
+                [row["current_side"] for row in chunk],
+                dtype=torch.float32,
+                device=device,
+            ),
+        )
+        for row, score in zip(chunk, scores.detach().cpu().tolist()):
+            grouped_scores.setdefault(row["row_idx"], []).append((float(score), row["candidate"]))
+
+    metrics = {
+        "single_top1_acc": 0.0,
+        "single_top3_acc": 0.0,
+        "pair_top1_acc": 0.0,
+        "pair_top3_acc": 0.0,
+        "single_total": 0,
+        "pair_total": 0,
+    }
+    for row_idx, rows in grouped_scores.items():
+        rows.sort(key=lambda item: item[0], reverse=True)
+        positive_action = eval_rows[row_idx][2]
+        is_pair = bool(eval_rows[row_idx][0].get("is_pair"))
+        prefix = "pair" if is_pair else "single"
+        metrics[f"{prefix}_total"] += 1
+        if rows and rows[0][1] == positive_action:
+            metrics[f"{prefix}_top1_acc"] += 1.0
+        if positive_action in {candidate for _score, candidate in rows[:3]}:
+            metrics[f"{prefix}_top3_acc"] += 1.0
+
+    for prefix in ("single", "pair"):
+        total = max(1, int(metrics[f"{prefix}_total"]))
+        metrics[f"{prefix}_top1_acc"] /= total
+        metrics[f"{prefix}_top3_acc"] /= total
+    return metrics
+
+
+@torch.no_grad()
+def fit_relation_score_calibration(model, loader, device, max_values=200000):
+    model.eval()
+    values = []
+    for batch in loader:
+        batch = move_batch_to_device(batch, device)
+        pos_score = model(
+            batch["my_picks"],
+            batch["my_mask"],
+            batch["enemy_picks"],
+            batch["enemy_mask"],
+            batch["pos_c1"],
+            batch["pos_c2"],
+            batch["action_mask"],
+            batch["turn"],
+            batch["first_pick_side"],
+            action_type=batch.get("action_type"),
+            current_side=batch.get("current_side"),
+        )
+        neg_score = model(
+            batch["my_picks"],
+            batch["my_mask"],
+            batch["enemy_picks"],
+            batch["enemy_mask"],
+            batch["neg_c1"],
+            batch["neg_c2"],
+            batch["action_mask"],
+            batch["turn"],
+            batch["first_pick_side"],
+            action_type=batch.get("action_type"),
+            current_side=batch.get("current_side"),
+        )
+        values.extend(pos_score.detach().cpu().tolist())
+        values.extend(neg_score.detach().cpu().tolist())
+        if len(values) >= int(max_values):
+            break
+    if not values:
+        return {"center": 0.0, "scale": 1.0}
+    scores = torch.tensor(values[: int(max_values)], dtype=torch.float32)
+    return {
+        "center": float(scores.mean().item()),
+        "scale": max(0.5, float(scores.std(unbiased=False).item())),
     }
 
 
@@ -1883,7 +2262,7 @@ def main():
     ]
 
     log_progress("Step 4/8: split train/val and detect changed groups")
-    train_samples, val_samples, split_info = split_train_val_incremental(
+    train_samples, _, split_info = split_train_val_incremental(
         samples=samples,
         val_ratio=args.val_ratio,
         seed=args.seed,
@@ -2024,7 +2403,7 @@ def main():
         num_workers=args.num_workers,
         pin_memory=pin_memory,
         prefetch_factor=args.prefetch_factor,
-        persistent_workers=args.num_workers > 0 and args.persistent_workers,
+        persistent_workers=args.num_workers > 0 and args.persistent_workers and args.hard_negative_ratio <= 0.0,
     )
     val_loader = make_loader(
         val_ds,
@@ -2034,7 +2413,7 @@ def main():
         num_workers=args.num_workers,
         pin_memory=pin_memory,
         prefetch_factor=args.prefetch_factor,
-        persistent_workers=args.num_workers > 0 and args.persistent_workers,
+        persistent_workers=args.num_workers > 0 and args.persistent_workers and args.hard_negative_ratio <= 0.0,
     )
     train_ban_loader = make_loader(
         train_ban_ds,
@@ -2044,7 +2423,7 @@ def main():
         num_workers=args.num_workers,
         pin_memory=pin_memory,
         prefetch_factor=args.prefetch_factor,
-        persistent_workers=args.num_workers > 0 and args.persistent_workers,
+        persistent_workers=args.num_workers > 0 and args.persistent_workers and args.hard_negative_ratio <= 0.0,
     )
     val_ban_loader = make_loader(
         val_ban_ds,
@@ -2054,10 +2433,10 @@ def main():
         num_workers=args.num_workers,
         pin_memory=pin_memory,
         prefetch_factor=args.prefetch_factor,
-        persistent_workers=args.num_workers > 0 and args.persistent_workers,
+        persistent_workers=args.num_workers > 0 and args.persistent_workers and args.hard_negative_ratio <= 0.0,
     )
 
-    model = BPDraftRelationNet(
+    model = BPDraftRelationNetV2(
         vocab_size=len(vocab),
         embed_dim=EMBED_DIM,
         state_dim=STATE_DIM,
@@ -2065,6 +2444,9 @@ def main():
         hidden_dim=HIDDEN_DIM,
         dropout=DROPOUT,
         pad_idx=vocab.get_id(PAD_TOKEN),
+        num_heads=4,
+        num_layers=2,
+        ffn_dim=512,
     ).to(device)
     if can_resume:
         load_relation_checkpoint_for_finetune(model, args.model_path)
@@ -2092,7 +2474,10 @@ def main():
     print(f"effective_batch_size: {int(args.batch_size) * max(1, int(args.grad_accum_steps))}")
     print(f"num_workers: {int(args.num_workers)}")
     print(f"pin_memory: {bool(pin_memory)}")
-    print(f"persistent_workers: {bool(args.num_workers > 0 and args.persistent_workers)}")
+    print(
+        "persistent_workers: "
+        f"{bool(args.num_workers > 0 and args.persistent_workers and args.hard_negative_ratio <= 0.0)}"
+    )
     print(f"prefetch_factor: {args.prefetch_factor if args.num_workers > 0 else None}")
     print(f"train dataset size: {len(train_ds) + len(train_ban_ds)}")
     print(f"val dataset size: {len(val_ds) + len(val_ban_ds)}")
@@ -2110,7 +2495,13 @@ def main():
 
         negative_refresh_start = time.perf_counter()
         if hasattr(train_ds, "refresh_negative_pairs"):
-            train_ds.refresh_negative_pairs(args.seed + epoch)
+            train_ds.refresh_negative_pairs(
+                args.seed + epoch,
+                model=unwrap_model(model),
+                device=device,
+                hard_negative_ratio=args.hard_negative_ratio,
+                hard_negative_candidate_pool=args.hard_negative_candidate_pool,
+            )
         if hasattr(train_ban_ds, "refresh_negative_pairs"):
             train_ban_ds.refresh_negative_pairs(args.seed + 10000 + epoch)
         negative_refresh_time = time.perf_counter() - negative_refresh_start
@@ -2123,6 +2514,7 @@ def main():
             optimizer=optimizer,
             scaler=scaler,
             use_amp=use_amp,
+            outcome_loss_weight=args.outcome_loss_weight,
             desc_prefix="pick ",
             grad_accum_steps=args.grad_accum_steps,
             log_interval=args.log_interval,
@@ -2135,6 +2527,7 @@ def main():
             scaler=scaler,
             use_amp=use_amp,
             loss_scale=float(args.ban_loss_weight),
+            outcome_loss_weight=args.outcome_loss_weight,
             desc_prefix="ban ",
             grad_accum_steps=args.grad_accum_steps,
             log_interval=args.log_interval,
@@ -2144,6 +2537,14 @@ def main():
             val_metrics = run_epoch(model, val_loader, device=device, desc_prefix="pick ", log_interval=args.log_interval)
             val_ban_metrics = run_epoch(model, val_ban_loader, device=device, desc_prefix="ban ", log_interval=args.log_interval)
             ban_topk_metrics = evaluate_ban_topk(model, val_ban_pos, vocab, device=device)
+            pick_topk_metrics = evaluate_pick_topk(
+                model,
+                val_pos,
+                vocab,
+                device=device,
+                candidate_cap=args.pick_eval_candidate_cap,
+                max_samples=args.pick_eval_max_samples,
+            )
 
         combined_val = val_metrics["loss"] + float(args.ban_loss_weight) * val_ban_metrics["loss"]
         epoch_time = time.perf_counter() - epoch_start
@@ -2162,7 +2563,11 @@ def main():
             f"ban top-1 accuracy={ban_topk_metrics['top1_acc']:.4f} "
             f"ban top-3 accuracy={ban_topk_metrics['top3_acc']:.4f} "
             f"single-action pairwise accuracy={val_metrics['single_acc']:.4f} "
-            f"pair-action pairwise accuracy={val_metrics['pair_acc']:.4f}"
+            f"pair-action pairwise accuracy={val_metrics['pair_acc']:.4f} "
+            f"single top-1={pick_topk_metrics['single_top1_acc']:.4f} "
+            f"single top-3={pick_topk_metrics['single_top3_acc']:.4f} "
+            f"pair top-1={pick_topk_metrics['pair_top1_acc']:.4f} "
+            f"pair top-3={pick_topk_metrics['pair_top3_acc']:.4f}"
         )
         print(
             f"epoch {epoch:02d} negative refresh time={negative_refresh_time:.2f}s "
@@ -2177,10 +2582,17 @@ def main():
     if best_state is not None:
         unwrap_model(model).load_state_dict(best_state)
 
+    score_calibration = fit_relation_score_calibration(
+        unwrap_model(model),
+        val_loader,
+        device=device,
+    )
     torch.save(unwrap_model(model).state_dict(), args.model_path)
     save_vocab(vocab, args.vocab_path)
     meta = {
-        "model_type": "bp_draft_relation_net",
+        "model_type": "bp_draft_relation_net_v2",
+        "architecture_version": RELATION_ARCHITECTURE_VERSION,
+        "architecture": "chronological_sequence_transformer_with_action_state_cross_attention",
         "data_path": args.data_path,
         "training_mode": "fine_tune" if can_resume else "from_scratch",
         "epochs": int(epochs),
@@ -2190,18 +2602,28 @@ def main():
         "action_dim": ACTION_DIM,
         "hidden_dim": HIDDEN_DIM,
         "dropout": DROPOUT,
+        "num_heads": 4,
+        "num_layers": 2,
+        "ffn_dim": 512,
         "pad_token": PAD_TOKEN,
         "unk_token": UNK_TOKEN,
         "vocab_size": len(vocab),
         "negatives_per_positive": args.negatives_per_positive,
         "ban_loss_weight": float(args.ban_loss_weight),
+        "outcome_loss_weight": float(args.outcome_loss_weight),
         "has_ban_head": True,
         "action_types": {
             "single_pick": 0,
             "pair_pick": 1,
             "ban": 2,
         },
-        "loss": "pairwise_softplus_with_frequency_debias",
+        "loss": "pairwise_softplus_with_inverse_propensity_frequency_debias",
+        "hard_negative_ratio": float(args.hard_negative_ratio),
+        "hard_negative_candidate_pool": int(args.hard_negative_candidate_pool),
+        "pick_eval_candidate_cap": int(args.pick_eval_candidate_cap),
+        "pick_eval_max_samples": int(args.pick_eval_max_samples),
+        "relation_score_center": score_calibration["center"],
+        "relation_score_scale": score_calibration["scale"],
         "name_slug_aliases": alias_map,
         "display_name_map": name_resources["display_name_map"],
         "image_name_map": name_resources["image_name_map"],
@@ -2217,7 +2639,11 @@ def main():
             "Single actions use candidate_2=PAD and action_mask=[1,0].",
             "Pair actions are scored by the relation model as unordered pair actions.",
             "Ban actions use candidate_1=enemy candidate, candidate_2=PAD, action_mask=[1,0], action_type=2.",
-            "High-frequency monsters are used only for hard negative sampling and frequency debias weighting.",
+            "Negative sampling uses balanced high-frequency, near-frequency, random, and model-mined candidates.",
+            "Frequency correction is bounded inverse-propensity weighting rather than a positive frequency boost.",
+            "Pick positives include both player perspectives and preserve the chronological interleaving inside the state encoder.",
+            "Observed match outcome is an auxiliary action-value target for pick and ban positives.",
+            "Top-k pick metrics evaluate the candidate set instead of only sampled pairwise negatives.",
             "Stable split manifest preserves prior group assignments across incremental fine-tunes.",
         ],
     }

@@ -8,6 +8,13 @@ from pathlib import Path
 
 ATTRS = {"Fire", "Water", "Wind", "Light", "Dark"}
 
+try:
+    __import__("lxml")
+    HTML_PARSER = "lxml"
+except Exception:
+    HTML_PARSER = "html.parser"
+
+
 def clean_text(text: str) -> str:
     if not text:
         return ""
@@ -68,7 +75,7 @@ def parse_monsters_from_html(html_path: str, source_html: str = ""):
     with open(html_path, "r", encoding="utf-8") as f:
         html = f.read()
 
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, HTML_PARSER)
     results = []
 
     for a in soup.find_all("a", href=True):
