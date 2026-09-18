@@ -10,8 +10,8 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from bp_data_common import load_record_rows
-from bp_transformer_common import (
+from bp_core.data_common import load_record_rows
+from bp_core.transformer_common import (
     PAD_TOKEN,
     PROJECT_ROOT,
     SequenceFeatureTransformer,
@@ -19,8 +19,8 @@ from bp_transformer_common import (
     normalize_name,
     slugify_fallback,
 )
-from dataset_versions import summarize_dataset_version_counts
-from rank_tiers import RANK_TIER_WEIGHTS, get_rank_context_from_record, summarize_rank_tier_counts
+from bp_core.dataset_versions import summarize_dataset_version_counts
+from bp_core.rank_tiers import RANK_TIER_WEIGHTS, get_rank_context_from_record, summarize_rank_tier_counts
 
 DATA_PATH = str(PROJECT_ROOT / "data" / "bp_samples.sqlite")
 SAVE_DIR = str(PROJECT_ROOT / "models")

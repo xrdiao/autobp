@@ -11,6 +11,8 @@ from urllib.parse import urlencode
 import urllib.request
 import ssl
 
+from tqdm import tqdm
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -111,11 +113,16 @@ def collect_swrt_snapshot(
             )
             for item in highdata_targets
         ]
-        for index, future in enumerate(as_completed(futures), start=1):
-            monster_id, data = future.result()
-            highdata_by_id[monster_id] = data
-            if index % 50 == 0 or index == len(futures):
-                print(f"[INFO] synced SWRT highdata {index}/{len(futures)}")
+        with tqdm(
+            total=len(futures),
+            desc="SWRT highdata",
+            unit="monster",
+            dynamic_ncols=True,
+        ) as progress:
+            for future in as_completed(futures):
+                monster_id, data = future.result()
+                highdata_by_id[monster_id] = data
+                progress.update(1)
 
     return {
         "schema_version": 1,

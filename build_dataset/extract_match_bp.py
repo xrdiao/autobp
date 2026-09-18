@@ -10,8 +10,8 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from dataset_versions import extract_dataset_version_from_path, get_dataset_version_weight  # noqa: E402
-from rank_tiers import enrich_rank_context, get_rank_tier_spec  # noqa: E402
+from bp_core.dataset_versions import extract_dataset_version_from_path, get_dataset_version_weight  # noqa: E402
+from bp_core.rank_tiers import enrich_rank_context, get_rank_tier_spec  # noqa: E402
 
 try:
     __import__("lxml")

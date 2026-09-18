@@ -49,6 +49,8 @@ python sw_ui_detection/run_bp_screen.py
 - `xxx_bp.json`
 - `xxx_bp_preview.png`
 
+桌面版里的 `Capture Current Screen` 使用的是用户点击后触发的系统截图，再由图像内容定位游戏画布。它不会枚举 Steam / 游戏进程，不读取窗口句柄，不访问游戏内存，也不做图形 API Hook。识别失败时仍可以继续用剪贴板截图方式。
+
 ## 放图方式
 
 把你的 BP 截图放进：
@@ -90,6 +92,6 @@ print(result.to_dict())
 
 ## 下一步适合做什么
 
-- 只对 `enemy_slots` 里的已填充框做魔灵头像识别
+- 继续收集不同分辨率、缩放和模拟器边框样本，用回归报告微调画布定位
 - 对 `my_box_region` 里的 box 图标做网格切分
-- 接入窗口截图，让它从实时画面自动抓图
+- 只在用户主动触发时抓取当前屏幕，避免引入进程枚举、窗口句柄读取或 Hook 类截图路径

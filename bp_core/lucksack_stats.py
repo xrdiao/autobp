@@ -4,10 +4,11 @@ import json
 import math
 import os
 from functools import lru_cache
+from itertools import combinations
 from pathlib import Path
 
-from bp_mechanism import BPMechanismLayer, DEFAULT_MECHANISM_PATH
-from bp_transformer_common import PROJECT_ROOT, normalize_name, slugify_fallback
+from bp_core.mechanism import BPMechanismLayer, DEFAULT_MECHANISM_PATH
+from bp_core.transformer_common import PROJECT_ROOT, normalize_name, slugify_fallback
 
 DEFAULT_STATS_PATH = PROJECT_ROOT / "json" / "lucksack_stats.json"
 DEFAULT_CATALOG_PATH = PROJECT_ROOT / "json" / "lucksack_monster_catalog.json"
@@ -497,6 +498,43 @@ class BPLucksackStats:
             self._candidate_slug_cache = tuple(sorted(slugs))
         return list(self._candidate_slug_cache)
 
+    def candidate_synergy_pairs(self, allowed, limit=32):
+        """Return high-confidence duo records that should survive pair pruning."""
+        allowed = {normalize_name(value) for value in (allowed or []) if value}
+        if len(allowed) < 2 or not self._duo:
+            return []
+
+        candidates = []
+        for key, record in self._duo.items():
+            slugs = tuple(value for value in str(key).split("|") if value)
+            if len(slugs) != 2 or not all(slug in allowed for slug in slugs):
+                continue
+            score, confidence, _record = self._combo_score("duo", slugs)
+            if confidence <= 0.0:
+                continue
+            solo_scores = [self._solo_score(slug)[0] for slug in slugs]
+            lift = score - sum(solo_scores) / len(solo_scores)
+            priority = lift * confidence
+            if priority <= 0.0:
+                continue
+            candidates.append(
+                {
+                    "slugs": slugs,
+                    "score": round(score, 6),
+                    "confidence": round(confidence, 6),
+                    "lift": round(lift, 6),
+                    "priority": round(priority, 6),
+                    "played": _as_int(
+                        record.get("played_count", record.get("appearances"))
+                    ),
+                }
+            )
+        candidates.sort(
+            key=lambda row: (row["priority"], row["confidence"], row["played"]),
+            reverse=True,
+        )
+        return candidates[: max(0, int(limit))]
+
     def pick_frequency(self, slug):
         record = self._solo_record(slug)
         return _as_int((record or {}).get("played_count"))
@@ -542,10 +580,14 @@ class BPLucksackStats:
                 "mechanism_coverage": float(mechanism_detail.get("coverage", 0.0)),
                 "mechanism_coverage_gain": float(mechanism_detail.get("coverage_gain", 0.0)),
                 "mechanism_reasons": list(mechanism_detail.get("reasons", [])),
+                "sample_count": 0,
+                "evidence_confidence": 0.0,
+                "evidence_uncertainty": 1.0,
             }
 
         solo_scores = []
         coverage = []
+        sample_counts = []
         evidence = []
         enemy_slugs = [self.resolve_slug(value) for value in (enemy_picks or [])]
         enemy_slugs = [slug for slug in enemy_slugs if slug]
@@ -554,6 +596,7 @@ class BPLucksackStats:
             solo_scores.append(score)
             if record:
                 coverage.append(confidence)
+                sample_counts.append(_as_int(record.get("played_count")))
                 evidence.append(
                     {
                         "kind": "solo",
@@ -574,6 +617,7 @@ class BPLucksackStats:
             if record:
                 swrt_solo_scores.append(score)
                 swrt_solo_coverage.append(confidence)
+                sample_counts.append(_as_int(record.get("pickTotal")))
                 evidence.append(
                     {
                         "kind": "swrt_solo",
@@ -587,25 +631,28 @@ class BPLucksackStats:
 
         synergy_scores = []
         synergy_coverage = []
-        for slug in action_slugs:
-            for other in all_own:
-                if slug == other:
-                    continue
-                score, confidence, record = self._combo_score("duo", [slug, other])
-                if record:
-                    solo_a, _, _ = self._solo_score(slug)
-                    solo_b, _, _ = self._solo_score(other)
-                    lift = (score - 0.5) - ((solo_a - 0.5) + (solo_b - 0.5)) / 2.0
-                    synergy_scores.append(0.5 + lift * confidence)
-                    synergy_coverage.append(confidence)
-                    evidence.append(
-                        {
-                            "kind": "duo",
-                            "slugs": sorted([slug, other]),
-                            "played": _as_int(record.get("played_count", record.get("appearances"))),
-                            "win_rate": round(_as_float(record.get("win_rate", record.get("winrate")), 0.5), 6),
-                        }
-                    )
+        action_set = set(action_slugs)
+        for duo in combinations(all_own, 2):
+            if not action_set.intersection(duo):
+                continue
+            score, confidence, record = self._combo_score("duo", duo)
+            if record:
+                solo_a, _, _ = self._solo_score(duo[0])
+                solo_b, _, _ = self._solo_score(duo[1])
+                lift = (score - 0.5) - ((solo_a - 0.5) + (solo_b - 0.5)) / 2.0
+                synergy_scores.append(0.5 + lift * confidence)
+                synergy_coverage.append(confidence)
+                sample_counts.append(
+                    _as_int(record.get("played_count", record.get("appearances")))
+                )
+                evidence.append(
+                    {
+                        "kind": "duo",
+                        "slugs": sorted(duo),
+                        "played": _as_int(record.get("played_count", record.get("appearances"))),
+                        "win_rate": round(_as_float(record.get("win_rate", record.get("winrate")), 0.5), 6),
+                    }
+                )
 
         rta_scores = []
         rta_coverage = []
@@ -626,23 +673,24 @@ class BPLucksackStats:
                 )
 
         if len(all_own) >= 3:
-            for slug in action_slugs:
-                others = [item for item in all_own if item != slug]
-                for index in range(len(others)):
-                    for next_index in range(index + 1, len(others)):
-                        trio = [slug, others[index], others[next_index]]
-                        score, confidence, record = self._combo_score("trio", trio)
-                        if record:
-                            synergy_scores.append(0.5 + (score - 0.5) * confidence)
-                            synergy_coverage.append(confidence)
-                            evidence.append(
-                                {
-                                    "kind": "trio",
-                                    "slugs": sorted(trio),
-                                    "played": _as_int(record.get("played_count", record.get("appearances"))),
-                                    "win_rate": round(_as_float(record.get("win_rate", record.get("winrate")), 0.5), 6),
-                                }
-                            )
+            for trio in combinations(all_own, 3):
+                if not action_set.intersection(trio):
+                    continue
+                score, confidence, record = self._combo_score("trio", trio)
+                if record:
+                    synergy_scores.append(0.5 + (score - 0.5) * confidence)
+                    synergy_coverage.append(confidence)
+                    sample_counts.append(
+                        _as_int(record.get("played_count", record.get("appearances")))
+                    )
+                    evidence.append(
+                        {
+                            "kind": "trio",
+                            "slugs": sorted(trio),
+                            "played": _as_int(record.get("played_count", record.get("appearances"))),
+                            "win_rate": round(_as_float(record.get("win_rate", record.get("winrate")), 0.5), 6),
+                        }
+                    )
 
         phase_scores = []
         phase_coverage = []
@@ -652,6 +700,7 @@ class BPLucksackStats:
                 if record:
                     phase_scores.append(score)
                     phase_coverage.append(confidence)
+                    sample_counts.append(_as_int(record.get("pick_count")))
                     evidence.append(
                         {
                             "kind": "draft_position",
@@ -736,6 +785,32 @@ class BPLucksackStats:
             0.2,
             0.8,
         )
+        data_coverage = round(
+            0.50
+            * max(
+                sum(coverage) / len(coverage) if coverage else 0.0,
+                sum(synergy_coverage) / len(synergy_coverage)
+                if synergy_coverage
+                else 0.0,
+                sum(swrt_solo_coverage) / len(swrt_solo_coverage)
+                if swrt_solo_coverage
+                else 0.0,
+                matchup_coverage,
+            )
+            + 0.25
+            * (
+                sum(phase_coverage) / len(phase_coverage)
+                if phase_coverage
+                else 0.0
+            )
+            + 0.25
+            * (
+                sum(rta_coverage) / len(rta_coverage)
+                if rta_coverage
+                else 0.0
+            ),
+            6,
+        )
         return {
             "score": round(score, 6),
             "solo_score": round(solo_score, 6),
@@ -783,32 +858,10 @@ class BPLucksackStats:
             "rank_group": self.rank_group,
             "season": self.data.get("season") or {},
             "patch": self.data.get("patch") or {},
-            "data_coverage": round(
-                0.50
-                * max(
-                    sum(coverage) / len(coverage) if coverage else 0.0,
-                    sum(synergy_coverage) / len(synergy_coverage)
-                    if synergy_coverage
-                    else 0.0,
-                    sum(swrt_solo_coverage) / len(swrt_solo_coverage)
-                    if swrt_solo_coverage
-                    else 0.0,
-                    matchup_coverage,
-                )
-                + 0.25
-                * (
-                    sum(phase_coverage) / len(phase_coverage)
-                    if phase_coverage
-                    else 0.0
-                )
-                + 0.25
-                * (
-                    sum(rta_coverage) / len(rta_coverage)
-                    if rta_coverage
-                    else 0.0
-                ),
-                6,
-            ),
+            "data_coverage": data_coverage,
+            "sample_count": max(sample_counts, default=0),
+            "evidence_confidence": data_coverage,
+            "evidence_uncertainty": round(1.0 - data_coverage, 6),
             "source": self.source_label,
             "evidence": evidence[:12],
         }

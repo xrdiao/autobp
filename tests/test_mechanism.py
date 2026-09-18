@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from bp_mechanism import BPMechanismLayer
+from bp_core.mechanism import BPMechanismLayer
 from build_dataset.sync_swarfarm_mechanisms import build_profile
 
 
@@ -51,6 +51,28 @@ class BPMechanismTests(unittest.TestCase):
         result = layer.score_action([], [], ["Haegang"])
         self.assertFalse(result["available"])
         self.assertEqual(result["score"], 0.5)
+
+    def test_missing_profile_name_uses_slug_in_threat_sources(self):
+        snapshot = {
+            "source": "test",
+            "profiles_by_slug": {
+                "giana": {
+                    "tags": ["control"],
+                    "threat_tags": ["control"],
+                },
+                "haegang": {
+                    "tags": ["cleanse"],
+                    "threat_tags": [],
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "mechanisms.json"
+            path.write_text(json.dumps(snapshot), encoding="utf-8")
+            layer = BPMechanismLayer(path)
+            result = layer.score_action([], ["giana"], ["haegang"])
+
+        self.assertEqual(result["threats"][0]["enemy_sources"], ["giana"])
 
     def test_profile_keeps_combat_metadata(self):
         profile = build_profile(

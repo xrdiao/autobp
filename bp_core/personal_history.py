@@ -4,8 +4,8 @@ import math
 from datetime import datetime, timezone
 from itertools import combinations
 
-from bp_data_common import NameResolver
-from bp_transformer_common import normalize_name, slugify_fallback
+from bp_core.data_common import NameResolver
+from bp_core.transformer_common import normalize_name, slugify_fallback
 
 
 class _WeightedStat:

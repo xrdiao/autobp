@@ -9,6 +9,8 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+from tqdm import tqdm
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -128,10 +130,23 @@ def fetch_json(url):
 def fetch_all(endpoint):
     url = f"{API_ROOT}/{endpoint}/?page_size=100"
     rows = []
-    while url:
-        payload = fetch_json(url)
-        rows.extend(payload.get("results") or [])
-        url = payload.get("next")
+    page_count = 0
+    with tqdm(
+        desc=f"SWARFARM {endpoint}",
+        unit="row",
+        dynamic_ncols=True,
+    ) as progress:
+        while url:
+            payload = fetch_json(url)
+            page_count += 1
+            page_rows = list(payload.get("results") or [])
+            rows.extend(page_rows)
+            if progress.total is None and payload.get("count") is not None:
+                progress.total = int(payload["count"])
+                progress.refresh()
+            progress.update(len(page_rows))
+            progress.set_postfix_str(f"pages={page_count}")
+            url = payload.get("next")
     return rows
 
 
@@ -260,7 +275,7 @@ def build_snapshot(monsters, skills, catalog):
     profiles_by_slug = {}
     aliases_by_slug = {}
     matched_slugs = set()
-    for item in catalog:
+    for item in tqdm(catalog, desc="构建机制画像", unit="monster", dynamic_ncols=True):
         slug = str(item.get("slug") or "").strip().lower()
         unit_id = str(item.get("com2us_id") or "")
         if not slug or not unit_id:

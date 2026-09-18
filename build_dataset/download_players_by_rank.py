@@ -14,13 +14,14 @@ from pathlib import Path
 import aiofiles
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
+from tqdm import tqdm
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from dataset_versions import resolve_target_dataset_version  # noqa: E402
-from rank_tiers import (  # noqa: E402
+from bp_core.dataset_versions import resolve_target_dataset_version  # noqa: E402
+from bp_core.rank_tiers import (  # noqa: E402
     MAX_DEFAULT_RANK_TO_SCAN,
     RANK_TIER_SPECS,
     RANK_TIER_TARGET_PLAYERS,
@@ -38,7 +39,10 @@ FETCH_STATE_PATH = Path("./data/player_fetch_state.json")
 
 PAGE_TIMEOUT = 30000
 DETAIL_WAIT_MS = 3000
-CONCURRENCY = 1
+DETAIL_READY_POLL_MS = 250
+LEADERBOARD_SETTLE_MS = 300
+LEADERBOARD_CLICK_SETTLE_MS = 150
+CONCURRENCY = 2
 MAX_PAGES = 160
 MAX_RANK_TO_SCAN = MAX_DEFAULT_RANK_TO_SCAN
 TARGET_PLAYERS_PER_TIER = dict(RANK_TIER_TARGET_PLAYERS)
@@ -68,8 +72,8 @@ MATCH_HISTORY_READY_PATTERNS = (
     "victory",
     "defeat",
 )
-DETAIL_MIN_INTERVAL_SECONDS = float(os.getenv("BP_DETAIL_MIN_INTERVAL_SECONDS", "3.0"))
-DETAIL_MAX_INTERVAL_SECONDS = float(os.getenv("BP_DETAIL_MAX_INTERVAL_SECONDS", "5.0"))
+DETAIL_MIN_INTERVAL_SECONDS = float(os.getenv("BP_DETAIL_MIN_INTERVAL_SECONDS", "1.5"))
+DETAIL_MAX_INTERVAL_SECONDS = float(os.getenv("BP_DETAIL_MAX_INTERVAL_SECONDS", "2.5"))
 MAX_DETAIL_FETCHES_PER_RUN = int(os.getenv("BP_MAX_DETAIL_FETCHES_PER_RUN", "180"))
 ACTIVE_REVISIT_HOURS = float(os.getenv("BP_ACTIVE_REVISIT_HOURS", "24"))
 DEFAULT_REVISIT_HOURS = float(os.getenv("BP_DEFAULT_REVISIT_HOURS", "72"))
@@ -259,7 +263,7 @@ async def ensure_challenge_cleared(page, context_label, auto_timeout_ms=None, ma
 
 async def wait_for_rows(page, timeout_ms=30000):
     elapsed = 0
-    step = 1000
+    step = 250
 
     while elapsed < timeout_ms:
         count = await page.locator(ROW_SELECTOR).count()
@@ -446,6 +450,20 @@ def saved_player_page_is_ready(path: Path) -> bool:
     except Exception:
         return False
     return html_has_ready_match_history(html)
+
+
+async def wait_for_match_history(page, timeout_ms=DETAIL_WAIT_MS):
+    """Return as soon as the rendered match history is present."""
+    timeout_ms = max(0, int(timeout_ms))
+    elapsed = 0
+    while elapsed < timeout_ms:
+        html = await page.content()
+        if html_has_ready_match_history(html):
+            return html
+        wait_ms = min(DETAIL_READY_POLL_MS, timeout_ms - elapsed)
+        await page.wait_for_timeout(wait_ms)
+        elapsed += wait_ms
+    return await page.content()
 
 
 def normalize_and_sort(players):
@@ -935,7 +953,13 @@ def player_html_path(item):
     return SAVE_DIR / rank_tier / f"{rank_str}_{player_id}.html"
 
 
-async def player_detail_worker(context, queue: asyncio.Queue, state, detail_delay_bounds):
+async def player_detail_worker(
+    context,
+    queue: asyncio.Queue,
+    state,
+    detail_delay_bounds,
+    progress=None,
+):
     page = await context.new_page()
     await setup_page(page)
     rng = random.Random(time.time())
@@ -948,6 +972,8 @@ async def player_detail_worker(context, queue: asyncio.Queue, state, detail_dela
                     return
                 await asyncio.sleep(rng.uniform(*detail_delay_bounds))
                 await save_player_page(page, item, state)
+                if progress is not None:
+                    progress.update(1)
             finally:
                 queue.task_done()
     finally:
@@ -956,7 +982,7 @@ async def player_detail_worker(context, queue: asyncio.Queue, state, detail_dela
 
 async def goto_ranking(page):
     await page.goto(RANKING_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
-    await page.wait_for_timeout(2000)
+    await page.wait_for_timeout(LEADERBOARD_SETTLE_MS)
 
     if await is_challenge_page(page):
         cleared = await ensure_challenge_cleared(page, "first_page", auto_timeout_ms=CHALLENGE_TIMEOUT_MS)
@@ -993,7 +1019,7 @@ async def click_next(page):
     before_first_id = before_players[0]["player_id"] if before_players else None
 
     await next_btn.scroll_into_view_if_needed()
-    await page.wait_for_timeout(500)
+    await page.wait_for_timeout(LEADERBOARD_CLICK_SETTLE_MS)
 
     try:
         await next_btn.click(timeout=5000)
@@ -1007,7 +1033,7 @@ async def click_next(page):
         except Exception:
             return False
 
-    await page.wait_for_timeout(2000)
+    await page.wait_for_timeout(LEADERBOARD_SETTLE_MS)
 
     if await is_challenge_page(page):
         cleared = await ensure_challenge_cleared(page, "next_page", auto_timeout_ms=min(45000, CHALLENGE_TIMEOUT_MS))
@@ -1019,7 +1045,7 @@ async def click_next(page):
         return False
 
     elapsed = 0
-    step = 1000
+    step = 250
     while elapsed < 15000:
         player_link_count = await page.locator(PLAYER_LINK_SELECTOR).count()
         if player_link_count > 0:
@@ -1087,8 +1113,7 @@ async def save_player_page(page, item, state):
             state[pid] = state_row
             return
 
-        await page.wait_for_timeout(DETAIL_WAIT_MS)
-        html = await page.content()
+        html = await wait_for_match_history(page, timeout_ms=DETAIL_WAIT_MS)
         signature = html_signature(html)
         old_hash = str(state_row.get("last_content_hash") or "")
         old_match_count = int(state_row.get("last_known_match_count", 0) or 0)
@@ -1212,22 +1237,28 @@ async def download_players_by_rank(
             for item in pending_players:
                 await queue.put(item)
 
-            workers = [
-                asyncio.create_task(
-                    player_detail_worker(
-                        context,
-                        queue,
-                        fetch_state,
-                        (detail_min_interval_seconds, detail_max_interval_seconds),
+            with tqdm(
+                total=len(pending_players),
+                desc="下载玩家详情",
+                unit="player",
+                dynamic_ncols=True,
+            ) as progress:
+                workers = [
+                    asyncio.create_task(
+                        player_detail_worker(
+                            context,
+                            queue,
+                            fetch_state,
+                            (detail_min_interval_seconds, detail_max_interval_seconds),
+                            progress,
+                        )
                     )
-                )
-                for _ in range(detail_concurrency)
-            ]
-            for _ in workers:
-                await queue.put(None)
-
-            await queue.join()
-            await asyncio.gather(*workers)
+                    for _ in range(detail_concurrency)
+                ]
+                for _ in workers:
+                    await queue.put(None)
+                await queue.join()
+                await asyncio.gather(*workers)
             save_fetch_state(fetch_state)
             csv_counts, ready_counts, missing_counts = dataset_completion_by_tier(merged_players)
             print(f"[INFO] dataset completion after fetch: {format_completion_counts(csv_counts, ready_counts, missing_counts)}")

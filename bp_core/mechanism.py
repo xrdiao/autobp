@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from bp_transformer_common import PROJECT_ROOT, normalize_name, slugify_fallback
+from bp_core.transformer_common import PROJECT_ROOT, normalize_name, slugify_fallback
 
 
 DEFAULT_MECHANISM_PATH = PROJECT_ROOT / "json" / "sw_mechanism_profiles.json"
@@ -139,7 +139,7 @@ class BPMechanismLayer:
                 if threat not in THREAT_WEIGHTS:
                     continue
                 threats[threat] = threats.get(threat, 0) + 1
-                sources.setdefault(threat, []).append(str(profile.get("name") or value))
+                sources.setdefault(threat, []).append(str(profile.get("name") or slug))
 
         weighted = {}
         for threat, count in threats.items():

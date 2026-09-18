@@ -5,7 +5,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from bp_data_common import NameResolver, load_json, load_record_rows, normalize_relation_sample, upsert_record_rows
+from bp_core.data_common import NameResolver, load_json, load_record_rows, normalize_relation_sample, upsert_record_rows
 
 DEFAULT_INPUT_PATH = PROJECT_ROOT / "data" / "bp_samples.sqlite"
 DEFAULT_OUTPUT_PATH = PROJECT_ROOT / "data" / "bp_samples_normalized.sqlite"

@@ -16,15 +16,15 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from tqdm import tqdm
 
-from bp_data_common import NameResolver, build_name_resolution_resources, normalize_relation_sample
-from bp_relation_common import (
+from bp_core.data_common import NameResolver, build_name_resolution_resources, normalize_relation_sample
+from bp_core.relation_common import (
     BPDraftRelationNetV2,
     MonsterVocab,
     infer_pick_count,
     normalize_slug_list,
     resolve_monster_slug,
 )
-from bp_transformer_common import PAD_TOKEN, PROJECT_ROOT, UNK_TOKEN, normalize_name, slugify_fallback
+from bp_core.transformer_common import PAD_TOKEN, PROJECT_ROOT, UNK_TOKEN, normalize_name, slugify_fallback
 
 DATA_PATH = str(PROJECT_ROOT / "data" / "bp_samples.sqlite")
 SAVE_DIR = str(PROJECT_ROOT / "models")

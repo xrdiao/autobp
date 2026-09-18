@@ -13,7 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from bp_data_common import count_record_rows, load_json, load_pt, save_json, save_pt, upsert_record_rows
+from bp_core.data_common import count_record_rows, load_json, load_pt, save_json, save_pt, upsert_record_rows
 
 DATA_DIR = PROJECT_ROOT / "data"
 DEFAULT_RAW_DB_PATH = DATA_DIR / "matches_raw.sqlite"

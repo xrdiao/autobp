@@ -15,3 +15,5 @@ dependencies:
   - streamlit
   - tk
   - tqdm
+  - pip:
+      - torch==2.14.0

@@ -5,8 +5,8 @@ from itertools import combinations
 
 import torch
 
-from bp_lucksack_stats import BPLucksackStats, DEFAULT_STATS_PATH
-from bp_relation_common import (
+from bp_core.lucksack_stats import BPLucksackStats, DEFAULT_STATS_PATH
+from bp_core.relation_common import (
     BPDraftRelationNet,
     BPDraftRelationNetV2,
     MonsterVocab,
@@ -14,8 +14,8 @@ from bp_relation_common import (
     infer_pick_count,
     valid_vocab_slugs,
 )
-from bp_transformer_common import PAD_TOKEN, PROJECT_ROOT, UNK_TOKEN, normalize_name, slugify_fallback
-from bp_personal_history_model import BPPersonalHistoryModel
+from bp_core.transformer_common import PAD_TOKEN, PROJECT_ROOT, UNK_TOKEN, normalize_name, slugify_fallback
+from bp_core.personal_history import BPPersonalHistoryModel
 
 LEGACY_MODEL_PATH = PROJECT_ROOT / "models" / "bp_relation_net.pt"
 LEGACY_META_PATH = PROJECT_ROOT / "models" / "bp_relation_meta.json"
@@ -234,40 +234,60 @@ class BPRelationRecommender:
             return [0.5 for _ in raw_scores]
         return [(score - lo) / (hi - lo) for score in raw_scores]
 
-    def _blend_relation_stats(self, relation_score, stats_detail):
+    def _blend_relation_stats(self, relation_score, stats_detail, relation_model_known=True):
+        relation_model_known = stats_detail.get(
+            "_relation_model_known",
+            relation_model_known,
+        )
         stats_score = float(stats_detail.get("score", 0.5))
         mechanism_score = float(stats_detail.get("mechanism_score", 0.5))
         mechanism_available = bool(stats_detail.get("mechanism_available"))
         matchup_score = float(stats_detail.get("matchup_score", 0.5))
         matchup_coverage = float(stats_detail.get("matchup_coverage", 0.0))
+        coverage_values = [
+            float(stats_detail[key] or 0.0)
+            for key in ("coverage", "data_coverage")
+            if key in stats_detail
+        ]
+        stats_coverage = min(coverage_values) if coverage_values else 0.0
+        stats_available = bool(getattr(self.lucksack_stats, "ready", False)) and stats_coverage > 0.0
+        mechanism_coverage = float(stats_detail.get("mechanism_coverage", 0.0) or 0.0)
+        mechanism_confidence = mechanism_coverage if mechanism_available else 0.0
         matchup_available = matchup_coverage > 0.0
-        if self.lucksack_stats.ready and mechanism_available:
-            if matchup_available:
-                combined_score = (
-                    0.65 * float(relation_score)
-                    + 0.10 * stats_score
-                    + 0.15 * mechanism_score
-                    + 0.10 * matchup_score
-                )
-            else:
-                combined_score = (
-                    0.70 * float(relation_score)
-                    + 0.10 * stats_score
-                    + 0.20 * mechanism_score
-                )
-        elif self.lucksack_stats.ready:
-            if matchup_available:
-                combined_score = (
-                    0.75 * float(relation_score)
-                    + 0.15 * stats_score
-                    + 0.10 * matchup_score
-                )
-            else:
-                combined_score = 0.85 * float(relation_score) + 0.15 * stats_score
+        relation_confidence = 1.0 if relation_model_known else 0.15
+        relation_value = 0.5 + (float(relation_score) - 0.5) * relation_confidence
+
+        if stats_available and mechanism_available and matchup_available:
+            base_weights = (0.65, 0.10, 0.15, 0.10)
+        elif stats_available and mechanism_available:
+            base_weights = (0.70, 0.10, 0.20, 0.0)
+        elif stats_available and matchup_available:
+            base_weights = (0.75, 0.15, 0.0, 0.10)
+        elif stats_available:
+            base_weights = (0.85, 0.15, 0.0, 0.0)
         elif mechanism_available:
-            combined_score = 0.80 * float(relation_score) + 0.20 * mechanism_score
+            base_weights = (0.80, 0.0, 0.20, 0.0)
         else:
-            combined_score = float(relation_score)
+            base_weights = (1.0, 0.0, 0.0, 0.0)
+
+        weights = (
+            base_weights[0] * relation_confidence,
+            base_weights[1] * stats_coverage,
+            base_weights[2] * mechanism_confidence,
+            base_weights[3] * matchup_coverage,
+        )
+        values = (
+            relation_value,
+            stats_score,
+            mechanism_score,
+            matchup_score,
+        )
+        weight_total = sum(weights)
+        combined_score = (
+            sum(value * weight for value, weight in zip(values, weights)) / weight_total
+            if weight_total > 0.0
+            else float(relation_score)
+        )
         return (
             combined_score,
             stats_score,
@@ -276,6 +296,153 @@ class BPRelationRecommender:
             matchup_score,
             matchup_available,
         )
+
+    @staticmethod
+    def _select_evidence_diverse_plans(plans, top_k):
+        """Keep high-value plans from independent evidence sources before reranking."""
+        plans = list(plans or [])
+        limit = max(0, int(top_k))
+        if limit <= 0 or len(plans) <= limit:
+            return plans
+
+        selected = []
+        selected_ids = set()
+        anchor_count = max(1, limit // 4)
+        component_keys = (
+            ("plan_score", lambda row: float(row.get("plan_score", 0.0))),
+            (
+                "mechanism_score",
+                lambda row: float((row.get("detail") or {}).get("mechanism_score", 0.5)),
+            ),
+            (
+                "draft_stats_score",
+                lambda row: float((row.get("detail") or {}).get("draft_stats_score", 0.5)),
+            ),
+            (
+                "matchup_score",
+                lambda row: float((row.get("detail") or {}).get("matchup_score", 0.5)),
+            ),
+        )
+
+        for key, score_fn in component_keys:
+            candidates = plans
+            if key == "mechanism_score":
+                candidates = [
+                    row
+                    for row in plans
+                    if bool((row.get("detail") or {}).get("mechanism_available"))
+                ]
+            elif key == "draft_stats_score":
+                candidates = [
+                    row
+                    for row in plans
+                    if float((row.get("detail") or {}).get("draft_stats_coverage", 0.0)) > 0.0
+                ]
+            elif key == "matchup_score":
+                candidates = [
+                    row
+                    for row in plans
+                    if float((row.get("detail") or {}).get("matchup_coverage", 0.0)) > 0.0
+                ]
+            for row in sorted(candidates, key=score_fn, reverse=True)[:anchor_count]:
+                row_id = id(row)
+                if row_id in selected_ids:
+                    continue
+                selected.append(row)
+                selected_ids.add(row_id)
+                if len(selected) >= limit:
+                    return selected
+
+        for row in sorted(plans, key=lambda item: float(item.get("plan_score", 0.0)), reverse=True):
+            if id(row) in selected_ids:
+                continue
+            selected.append(row)
+            selected_ids.add(id(row))
+            if len(selected) >= limit:
+                break
+        return selected
+
+    @staticmethod
+    def _select_candidate_diverse(
+        allowed,
+        quick_scores,
+        quick_details,
+        limit,
+        synergy_pairs=None,
+    ):
+        """Keep statistical, matchup, and mechanism anchors before pair expansion."""
+        limit = min(len(allowed), max(1, int(limit)))
+        if len(allowed) <= limit:
+            return list(allowed)
+        rows = [
+            {
+                "slug": slug,
+                "quick_score": float(score),
+                "detail": detail or {},
+            }
+            for slug, score, detail in zip(allowed, quick_scores, quick_details)
+        ]
+        selected = []
+        selected_slugs = set()
+        available_slugs = {row["slug"] for row in rows}
+        pair_anchor_limit = min(limit, max(2, limit // 4))
+        pair_anchor_count = 0
+        for pair in synergy_pairs or []:
+            pair_slugs = [
+                slug
+                for slug in pair.get("slugs", [])
+                if slug in available_slugs
+            ]
+            if len(pair_slugs) != 2 or pair_anchor_count + 2 > pair_anchor_limit:
+                continue
+            for slug in pair_slugs:
+                if slug in selected_slugs:
+                    continue
+                selected.append(slug)
+                selected_slugs.add(slug)
+            pair_anchor_count += len(pair_slugs)
+            if pair_anchor_count >= pair_anchor_limit:
+                break
+        anchors = (
+            ("quick_score", lambda row: row["quick_score"]),
+            ("mechanism", lambda row: float(row["detail"].get("mechanism_score", 0.5))),
+            ("matchup", lambda row: float(row["detail"].get("matchup_score", 0.5))),
+            ("draft_stats", lambda row: float(row["detail"].get("score", 0.5))),
+        )
+        anchor_count = max(1, limit // 8)
+        for key, score_fn in anchors:
+            candidates = rows
+            if key == "mechanism":
+                candidates = [row for row in rows if row["detail"].get("mechanism_available")]
+            elif key == "matchup":
+                candidates = [
+                    row for row in rows
+                    if float(row["detail"].get("matchup_coverage", 0.0) or 0.0) > 0.0
+                ]
+            elif key == "draft_stats":
+                candidates = [
+                    row for row in rows
+                    if float(row["detail"].get("coverage", 0.0) or 0.0) > 0.0
+                ]
+            for row in sorted(candidates, key=score_fn, reverse=True)[:anchor_count]:
+                if len(selected) >= limit:
+                    return selected[:limit]
+                if row["slug"] in selected_slugs:
+                    continue
+                selected.append(row["slug"])
+                selected_slugs.add(row["slug"])
+                if len(selected) >= limit:
+                    return selected
+        for row in sorted(rows, key=lambda item: item["quick_score"], reverse=True):
+            if len(selected) >= limit:
+                break
+            if row["slug"] in selected_slugs:
+                continue
+            selected.append(row["slug"])
+            selected_slugs.add(row["slug"])
+            if len(selected) >= limit:
+                break
+        return selected
 
     def _score_actions_with_unknowns(
         self,
@@ -315,7 +482,7 @@ class BPRelationRecommender:
                 scores[index] = score
         return scores
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def _score_actions(
         self,
         my_picks,
@@ -389,6 +556,7 @@ class BPRelationRecommender:
         use_my_box_for_reco=True,
         top_k=6,
         max_pair_candidates=400,
+        preserve_evidence=False,
     ):
         if turn is None:
             turn = len(my_picks or []) + len(enemy_picks or []) + 1
@@ -403,11 +571,17 @@ class BPRelationRecommender:
         if pick_count <= 0 or not allowed:
             return []
 
+        quick_score_by_slug = {}
+        synergy_pairs = []
         if pick_count == 1:
             actions = [(slug,) for slug in allowed]
         else:
             pair_candidate_limit = int(max_pair_candidates or 0)
-            if pair_candidate_limit > 0 and len(allowed) > pair_candidate_limit:
+            if pair_candidate_limit > 0:
+                synergy_pairs = self.lucksack_stats.candidate_synergy_pairs(
+                    allowed,
+                    limit=max(8, int(top_k) * 4),
+                )
                 quick_raw_scores = self._score_actions_with_unknowns(
                     my_picks,
                     enemy_picks,
@@ -417,6 +591,7 @@ class BPRelationRecommender:
                 )
                 quick_relation_scores = self._normalize_scores(quick_raw_scores)
                 quick_scores = []
+                quick_details = []
                 for slug, quick_relation in zip(allowed, quick_relation_scores):
                     stats_detail = self.lucksack_stats.score_action(
                         my_picks=my_picks,
@@ -425,11 +600,25 @@ class BPRelationRecommender:
                         turn=turn,
                     )
                     quick_score, _stats_score, _mechanism_score, _mechanism_available, _matchup_score, _matchup_available = (
-                        self._blend_relation_stats(quick_relation, stats_detail)
+                        self._blend_relation_stats(
+                            quick_relation,
+                            {
+                                **stats_detail,
+                                "_relation_model_known": slug in self._known_model_slugs,
+                            },
+                        )
                     )
                     quick_scores.append(quick_score)
-                ordered = [slug for _, slug in sorted(zip(quick_scores, allowed), reverse=True)]
-                allowed = ordered[:pair_candidate_limit]
+                    quick_details.append(stats_detail)
+                quick_score_by_slug = dict(zip(allowed, quick_scores))
+            if pair_candidate_limit > 0 and len(allowed) > pair_candidate_limit:
+                allowed = self._select_candidate_diverse(
+                    allowed,
+                    quick_scores,
+                    quick_details,
+                    pair_candidate_limit,
+                    synergy_pairs=synergy_pairs,
+                )
             actions = list(combinations(allowed, 2))
         if not actions:
             return []
@@ -443,10 +632,16 @@ class BPRelationRecommender:
         )
         normalized_relation = self._normalize_scores(relation_scores)
         if pick_count == 2 and len(actions) > max(64, int(top_k) * 8):
-            score_limit = min(len(actions), max(64, int(top_k) * 8))
+            score_limit = min(len(actions), max(96, int(top_k) * 16))
+            pruning_scores = []
+            for action, norm_score in zip(actions, normalized_relation):
+                singleton_score = sum(
+                    quick_score_by_slug.get(slug, 0.5) for slug in action
+                ) / len(action)
+                pruning_scores.append(0.75 * norm_score + 0.25 * singleton_score)
             selected_indices = sorted(
                 range(len(actions)),
-                key=lambda index: relation_scores[index],
+                key=lambda index: pruning_scores[index],
                 reverse=True,
             )[:score_limit]
             actions = [actions[index] for index in selected_indices]
@@ -455,6 +650,10 @@ class BPRelationRecommender:
 
         plans = []
         action_type = "pair" if pick_count == 2 else "single"
+        synergy_pair_keys = {
+            frozenset(pair.get("slugs", []))
+            for pair in synergy_pairs
+        }
         for action, raw_score, norm_score in zip(actions, relation_scores, normalized_relation):
             stats_detail = self.lucksack_stats.score_action(
                 my_picks=my_picks,
@@ -462,6 +661,7 @@ class BPRelationRecommender:
                 action=action,
                 turn=turn,
             )
+            relation_model_known = all(slug in self._known_model_slugs for slug in action)
             (
                 combined_score,
                 stats_score,
@@ -469,7 +669,13 @@ class BPRelationRecommender:
                 mechanism_available,
                 matchup_score,
                 matchup_available,
-            ) = self._blend_relation_stats(norm_score, stats_detail)
+            ) = self._blend_relation_stats(
+                norm_score,
+                {
+                    **stats_detail,
+                    "_relation_model_known": relation_model_known,
+                },
+            )
             personal = None
             personal_weight = 0.0
             exploration_bonus = 0.0
@@ -543,7 +749,15 @@ class BPRelationRecommender:
                         "mechanism_action_tags": stats_detail.get("mechanism_action_tags", []),
                         "mechanism_reasons": stats_detail.get("mechanism_reasons", []),
                         "combined_relation_stats_score": float(combined_score),
-                        "relation_model_known": all(slug in self._known_model_slugs for slug in action),
+                        "relation_model_known": relation_model_known,
+                        "relation_model_confidence": 1.0 if relation_model_known else 0.15,
+                        "evidence_confidence": float(
+                            stats_detail.get("evidence_confidence", stats_detail.get("data_coverage", 0.0))
+                        ),
+                        "evidence_uncertainty": float(
+                            stats_detail.get("evidence_uncertainty", 1.0)
+                        ),
+                        "sample_count": int(stats_detail.get("sample_count", 0)),
                         "personal_score": None if personal is None else float(personal.get("personal_score", 0.5)),
                         "personal_confidence": None if personal is None else float(personal.get("confidence", 0.0)),
                         "personal_sample_count": None if personal is None else float(personal.get("sample_count", 0.0)),
@@ -553,9 +767,17 @@ class BPRelationRecommender:
                         "personal_reasons": personal_reasons,
                         "final_score": float(final_score),
                         "action_type": action_type,
+                        "pair_candidate_anchor": (
+                            frozenset(action) in synergy_pair_keys
+                            if pick_count == 2
+                            else False
+                        ),
+                        "pair_candidate_anchor_count": len(synergy_pairs),
                     },
                 }
             )
+        if preserve_evidence:
+            plans = self._select_evidence_diverse_plans(plans, top_k)
         plans.sort(key=lambda row: row["plan_score"], reverse=True)
         return plans[: int(top_k)]
 
@@ -567,6 +789,7 @@ class BPRelationRecommender:
         top_k=5,
         candidate_pool=None,
         max_pair_candidates=400,
+        preserve_evidence=False,
         **_unused,
     ):
         turn = len(my_picks or []) + len(enemy_picks or []) + 1
@@ -583,6 +806,7 @@ class BPRelationRecommender:
             use_my_box_for_reco=False,
             top_k=top_k,
             max_pair_candidates=max_pair_candidates,
+            preserve_evidence=preserve_evidence,
         )
         predictions = []
         for plan in plans:
@@ -642,6 +866,10 @@ class BPRelationRecommender:
                         "mechanism_action_tags": detail.get("mechanism_action_tags", []),
                         "mechanism_reasons": detail.get("mechanism_reasons", []),
                         "relation_model_known": detail.get("relation_model_known"),
+                        "relation_model_confidence": detail.get("relation_model_confidence"),
+                        "evidence_confidence": detail.get("evidence_confidence"),
+                        "evidence_uncertainty": detail.get("evidence_uncertainty"),
+                        "sample_count": detail.get("sample_count"),
                         "action_type": detail.get("action_type", "single"),
                         "pick_count": int(pick_count),
                         "source": "relation",
@@ -764,7 +992,7 @@ def main():
     v2_ready = all(path.exists() for path in (DEFAULT_MODEL_PATH, DEFAULT_META_PATH, DEFAULT_VOCAB_PATH))
     legacy_ready = all(path.exists() for path in (LEGACY_MODEL_PATH, LEGACY_META_PATH, LEGACY_VOCAB_PATH))
     if not v2_ready and not legacy_ready:
-        print("relation model bundle is missing; run python train_bp_relation_net.py first")
+        print("relation model bundle is missing; run python -m training.relation first")
         for path in (DEFAULT_MODEL_PATH, DEFAULT_META_PATH, DEFAULT_VOCAB_PATH):
             if not path.exists():
                 print(f"missing: {path}")

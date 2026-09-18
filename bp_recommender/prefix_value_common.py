@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
 
-from bp_relation_common import MonsterVocab
-from bp_transformer_common import PAD_TOKEN, SequenceFeatureTransformer
+from bp_core.relation_common import MonsterVocab
+from bp_core.transformer_common import PAD_TOKEN, SequenceFeatureTransformer
 
 
 class BPPrefixValueNet(nn.Module):

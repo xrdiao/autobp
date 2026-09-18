@@ -1,18 +1,9 @@
 import argparse
 from collections import Counter
 
-from bp_data_common import load_record_rows
-from bp_transformer_common import PROJECT_ROOT, normalize_name
-
-
-def side_for_order(order, first_pick_side):
-    if order < 1 or order > 10:
-        return None
-    first = normalize_name(first_pick_side)
-    if first not in {"me", "enemy"}:
-        return None
-    other = "enemy" if first == "me" else "me"
-    return [first, other, other, first, first, other, other, first, first, other][order - 1]
+from bp_core.data_common import load_record_rows
+from bp_core.relation_common import side_for_order
+from bp_core.transformer_common import PROJECT_ROOT, normalize_name
 
 
 def audit_samples(samples):

@@ -9,6 +9,7 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 from playwright.async_api import async_playwright
+from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -21,6 +22,7 @@ DEFAULT_STATS_PATH = PROJECT_ROOT / "json" / "lucksack_stats.json"
 DEFAULT_CATALOG_PATH = PROJECT_ROOT / "json" / "lucksack_monster_catalog.json"
 DEFAULT_COMBO_LIMIT = 2000
 STATISTICS_LIMIT = 10000
+DEFAULT_GROUP_CONCURRENCY = 2
 
 
 def save_json(data, path):
@@ -123,7 +125,59 @@ async def fetch_statistics(page, kind, season_number, rank_group, patch_id, targ
     return records[:target_limit]
 
 
-async def collect_snapshot(combo_limit=DEFAULT_COMBO_LIMIT):
+async def fetch_rank_group(page, rank_group, season_number, patch_id, combo_limit, semaphore):
+    group_id = str(rank_group["group_id"])
+    async with semaphore:
+        print(f"[INFO] syncing rank group {group_id}: {rank_group.get('group_name')}")
+        solo = await fetch_statistics(
+            page,
+            "solo",
+            season_number,
+            group_id,
+            patch_id,
+            STATISTICS_LIMIT,
+        )
+        duo = await fetch_statistics(
+            page,
+            "duo",
+            season_number,
+            group_id,
+            patch_id,
+            combo_limit,
+        )
+        summary = await fetch_json(
+            page,
+            build_meta_dashboard_url(
+                "summary",
+                season_number,
+                group_id,
+                patch_id,
+            ),
+        )
+        draft_position = await fetch_json(
+            page,
+            build_meta_dashboard_url(
+                "draft-position",
+                season_number,
+                group_id,
+                patch_id,
+            ),
+        )
+        trio = await fetch_statistics(
+            page,
+            "trio",
+            season_number,
+            group_id,
+            patch_id,
+            combo_limit,
+        )
+    return group_id, solo, duo, summary, draft_position, trio
+
+
+async def collect_snapshot(
+    combo_limit=DEFAULT_COMBO_LIMIT,
+    group_concurrency=DEFAULT_GROUP_CONCURRENCY,
+):
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=True)
         page = await browser.new_page()
@@ -145,51 +199,36 @@ async def collect_snapshot(combo_limit=DEFAULT_COMBO_LIMIT):
         statistics = {"solo": {}, "duo": {}, "trio": {}}
         meta_summary = {}
         meta_draft_position = {}
-        for rank_group in rank_groups:
-            group_id = str(rank_group["group_id"])
-            print(f"[INFO] syncing rank group {group_id}: {rank_group.get('group_name')}")
-            statistics["solo"][group_id] = await fetch_statistics(
+        semaphore = asyncio.Semaphore(max(1, int(group_concurrency)))
+        tasks = [
+            fetch_rank_group(
                 page,
-                "solo",
+                rank_group,
                 season_number,
-                group_id,
-                patch_id,
-                STATISTICS_LIMIT,
-            )
-            statistics["duo"][group_id] = await fetch_statistics(
-                page,
-                "duo",
-                season_number,
-                group_id,
                 patch_id,
                 combo_limit,
+                semaphore,
             )
-            meta_summary[group_id] = await fetch_json(
-                page,
-                build_meta_dashboard_url(
-                    "summary",
-                    season_number,
-                    group_id,
-                    patch_id,
-                ),
-            )
-            meta_draft_position[group_id] = await fetch_json(
-                page,
-                build_meta_dashboard_url(
-                    "draft-position",
-                    season_number,
-                    group_id,
-                    patch_id,
-                ),
-            )
-            statistics["trio"][group_id] = await fetch_statistics(
-                page,
-                "trio",
-                season_number,
-                group_id,
-                patch_id,
-                combo_limit,
-            )
+            for rank_group in rank_groups
+        ]
+        results = []
+        with tqdm(
+            total=len(tasks),
+            desc="Lucksack rank groups",
+            unit="group",
+            dynamic_ncols=True,
+        ) as progress:
+            for task in asyncio.as_completed(tasks):
+                result = await task
+                results.append(result)
+                progress.update(1)
+                progress.set_postfix_str(f"group={result[0]}")
+        for group_id, solo, duo, summary, draft_position, trio in results:
+            statistics["solo"][group_id] = solo
+            statistics["duo"][group_id] = duo
+            meta_summary[group_id] = summary
+            meta_draft_position[group_id] = draft_position
+            statistics["trio"][group_id] = trio
 
         await browser.close()
 
@@ -217,8 +256,12 @@ async def sync_lucksack_data(
     stats_path=DEFAULT_STATS_PATH,
     catalog_path=DEFAULT_CATALOG_PATH,
     combo_limit=DEFAULT_COMBO_LIMIT,
+    group_concurrency=DEFAULT_GROUP_CONCURRENCY,
 ):
-    snapshot = await collect_snapshot(combo_limit=combo_limit)
+    snapshot = await collect_snapshot(
+        combo_limit=combo_limit,
+        group_concurrency=group_concurrency,
+    )
     save_json(snapshot, stats_path)
     save_json(snapshot["catalog"], catalog_path)
     print(f"[OK] saved stats: {stats_path}")
@@ -237,6 +280,7 @@ def parse_args():
     parser.add_argument("--stats-path", default=str(DEFAULT_STATS_PATH))
     parser.add_argument("--catalog-path", default=str(DEFAULT_CATALOG_PATH))
     parser.add_argument("--combo-limit", type=int, default=DEFAULT_COMBO_LIMIT)
+    parser.add_argument("--group-concurrency", type=int, default=DEFAULT_GROUP_CONCURRENCY)
     return parser.parse_args()
 
 
@@ -247,6 +291,7 @@ def main():
             stats_path=args.stats_path,
             catalog_path=args.catalog_path,
             combo_limit=args.combo_limit,
+            group_concurrency=args.group_concurrency,
         )
     )
 

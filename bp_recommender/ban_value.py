@@ -2,10 +2,10 @@ import json
 
 import torch
 
-from bp_lucksack_stats import BPLucksackStats, DEFAULT_STATS_PATH
-from bp_probability_calibration import apply_probability_calibration, resolve_probability_calibration
-from bp_transformer_common import PAD_TOKEN, PROJECT_ROOT, UNK_TOKEN, normalize_name, slugify_fallback
-from train_draft_value_net import BPDraftValueNet as TransformerDraftValueNet
+from bp_core.lucksack_stats import BPLucksackStats, DEFAULT_STATS_PATH
+from bp_core.probability_calibration import apply_probability_calibration, resolve_probability_calibration
+from bp_core.transformer_common import PAD_TOKEN, PROJECT_ROOT, UNK_TOKEN, normalize_name, slugify_fallback
+from training.draft_value import BPDraftValueNet as TransformerDraftValueNet
 
 DEFAULT_MODEL_PATH = PROJECT_ROOT / "models" / "bp_draft_value_net.pt"
 DEFAULT_META_PATH = PROJECT_ROOT / "models" / "bp_draft_value_meta.json"
@@ -13,6 +13,7 @@ DEFAULT_VOCAB_PATH = PROJECT_ROOT / "models" / "bp_draft_value_vocab.json"
 BAN_VALUE_WEIGHT = 0.75
 BAN_MECHANISM_WEIGHT = 0.25
 BAN_STATS_WEIGHT = 0.10
+BAN_WORST_RESPONSE_WEIGHT = 0.70
 
 
 class MonsterVocab:
@@ -80,7 +81,7 @@ class BPBanValueRecommender:
         else:
             raise RuntimeError(
                 f"Unsupported draft value model type: {self.meta.get('model_type')}. "
-                "Retrain with train_draft_value_net.py to produce the current transformer model."
+                "Retrain with python -m training.draft_value to produce the current transformer model."
             )
 
         self.model = model_cls(**model_kwargs)
@@ -116,7 +117,108 @@ class BPBanValueRecommender:
             mask.append(0)
         return ids, mask
 
-    @torch.no_grad()
+    @torch.inference_mode()
+    def evaluate_states(self, states, return_detail=False):
+        states = list(states or [])
+        if not states:
+            return []
+
+        encoded_rows = []
+        for state in states:
+            my_ids, my_mask = self._encode_list(state.get("my_picks"), 5)
+            enemy_ids, enemy_mask = self._encode_list(state.get("enemy_picks"), 5)
+            pad_id = self.vocab.get_id(PAD_TOKEN)
+            my_ban_id = (
+                self.vocab.get_id(self._to_slug(state["my_ban"]))
+                if state.get("my_ban")
+                else pad_id
+            )
+            enemy_ban_id = (
+                self.vocab.get_id(self._to_slug(state["enemy_ban"]))
+                if state.get("enemy_ban")
+                else pad_id
+            )
+            my_leader_id = (
+                self.vocab.get_id(self._to_slug(state["my_leader"]))
+                if state.get("my_leader")
+                else pad_id
+            )
+            enemy_leader_id = (
+                self.vocab.get_id(self._to_slug(state["enemy_leader"]))
+                if state.get("enemy_leader")
+                else pad_id
+            )
+            encoded_rows.append(
+                {
+                    "my_ids": my_ids,
+                    "my_mask": my_mask,
+                    "enemy_ids": enemy_ids,
+                    "enemy_mask": enemy_mask,
+                    "my_ban_id": my_ban_id,
+                    "enemy_ban_id": enemy_ban_id,
+                    "my_leader_id": my_leader_id,
+                    "enemy_leader_id": enemy_leader_id,
+                }
+            )
+
+        batch = {
+            "my_picks": torch.tensor(
+                [row["my_ids"] for row in encoded_rows],
+                dtype=torch.long,
+                device=self.device,
+            ),
+            "my_mask": torch.tensor(
+                [row["my_mask"] for row in encoded_rows],
+                dtype=torch.float32,
+                device=self.device,
+            ),
+            "enemy_picks": torch.tensor(
+                [row["enemy_ids"] for row in encoded_rows],
+                dtype=torch.long,
+                device=self.device,
+            ),
+            "enemy_mask": torch.tensor(
+                [row["enemy_mask"] for row in encoded_rows],
+                dtype=torch.float32,
+                device=self.device,
+            ),
+            "my_ban": torch.tensor(
+                [row["my_ban_id"] for row in encoded_rows],
+                dtype=torch.long,
+                device=self.device,
+            ),
+            "enemy_ban": torch.tensor(
+                [row["enemy_ban_id"] for row in encoded_rows],
+                dtype=torch.long,
+                device=self.device,
+            ),
+            "my_leader": torch.tensor(
+                [row["my_leader_id"] for row in encoded_rows],
+                dtype=torch.long,
+                device=self.device,
+            ),
+            "enemy_leader": torch.tensor(
+                [row["enemy_leader_id"] for row in encoded_rows],
+                dtype=torch.long,
+                device=self.device,
+            ),
+        }
+        raw_probs = torch.sigmoid(self.model(**batch)).detach().cpu().tolist()
+        calibrated_probs = [
+            apply_probability_calibration(raw_prob, self.prob_calibration)
+            for raw_prob in raw_probs
+        ]
+        if not return_detail:
+            return calibrated_probs
+        return [
+            {
+                "raw_win_rate": float(raw_prob),
+                "calibrated_win_rate": float(calibrated_prob),
+            }
+            for raw_prob, calibrated_prob in zip(raw_probs, calibrated_probs)
+        ]
+
+    @torch.inference_mode()
     def evaluate_state(
         self,
         my_picks,
@@ -127,37 +229,21 @@ class BPBanValueRecommender:
         enemy_leader=None,
         return_detail=False,
     ):
-        my_ids, my_mask = self._encode_list(my_picks, 5)
-        enemy_ids, enemy_mask = self._encode_list(enemy_picks, 5)
+        return self.evaluate_states(
+            [
+                {
+                    "my_picks": my_picks,
+                    "enemy_picks": enemy_picks,
+                    "my_ban": my_ban,
+                    "enemy_ban": enemy_ban,
+                    "my_leader": my_leader,
+                    "enemy_leader": enemy_leader,
+                }
+            ],
+            return_detail=return_detail,
+        )[0]
 
-        my_ban_id = self.vocab.get_id(self._to_slug(my_ban)) if my_ban else self.vocab.get_id(PAD_TOKEN)
-        enemy_ban_id = self.vocab.get_id(self._to_slug(enemy_ban)) if enemy_ban else self.vocab.get_id(PAD_TOKEN)
-        my_leader_id = self.vocab.get_id(self._to_slug(my_leader)) if my_leader else self.vocab.get_id(PAD_TOKEN)
-        enemy_leader_id = self.vocab.get_id(self._to_slug(enemy_leader)) if enemy_leader else self.vocab.get_id(PAD_TOKEN)
-
-        batch = {
-            "my_picks": torch.tensor([my_ids], dtype=torch.long, device=self.device),
-            "my_mask": torch.tensor([my_mask], dtype=torch.float32, device=self.device),
-            "enemy_picks": torch.tensor([enemy_ids], dtype=torch.long, device=self.device),
-            "enemy_mask": torch.tensor([enemy_mask], dtype=torch.float32, device=self.device),
-            "my_ban": torch.tensor([my_ban_id], dtype=torch.long, device=self.device),
-            "enemy_ban": torch.tensor([enemy_ban_id], dtype=torch.long, device=self.device),
-            "my_leader": torch.tensor([my_leader_id], dtype=torch.long, device=self.device),
-            "enemy_leader": torch.tensor([enemy_leader_id], dtype=torch.long, device=self.device),
-        }
-
-        logits = self.model(**batch)
-        raw_prob = torch.sigmoid(logits)[0].item()
-        calibrated_prob = apply_probability_calibration(raw_prob, self.prob_calibration)
-
-        if return_detail:
-            return {
-                "raw_win_rate": raw_prob,
-                "calibrated_win_rate": calibrated_prob,
-            }
-        return calibrated_prob
-
-    @torch.no_grad()
+    @torch.inference_mode()
     def recommend_bans(
         self,
         my_picks,
@@ -169,32 +255,75 @@ class BPBanValueRecommender:
     ):
         candidates = [self._to_slug(x) for x in (enemy_picks or []) if x]
         candidates = list(dict.fromkeys(candidates))
+        if not candidates:
+            return []
 
-        base_eval = self.evaluate_state(
-            my_picks=my_picks,
-            enemy_picks=enemy_picks,
-            my_ban=None,
-            enemy_ban=enemy_ban,
-            my_leader=my_leader,
-            enemy_leader=enemy_leader,
+        response_bans = (
+            [self._to_slug(enemy_ban)]
+            if enemy_ban
+            else list(dict.fromkeys(self._to_slug(x) for x in (my_picks or []) if x))
+        )
+        response_bans = [ban for ban in response_bans if ban] or [None]
+        base_states = [
+            {
+                "my_picks": my_picks,
+                "enemy_picks": enemy_picks,
+                "my_ban": None,
+                "enemy_ban": response_ban,
+                "my_leader": my_leader,
+                "enemy_leader": enemy_leader,
+            }
+            for response_ban in response_bans
+        ]
+        target_states = [
+            {
+                "my_picks": my_picks,
+                "enemy_picks": enemy_picks,
+                "my_ban": target,
+                "enemy_ban": response_ban,
+                "my_leader": my_leader,
+                "enemy_leader": enemy_leader,
+            }
+            for target in candidates
+            for response_ban in response_bans
+        ]
+        evaluations = self.evaluate_states(
+            base_states + target_states,
             return_detail=True,
         )
-        base_wr = float(base_eval["calibrated_win_rate"])
-        base_raw_wr = float(base_eval["raw_win_rate"])
+        base_evaluations = evaluations[: len(base_states)]
+        target_evaluations = evaluations[len(base_states) :]
+        base_wr_by_response = [
+            float(item["calibrated_win_rate"]) for item in base_evaluations
+        ]
+        base_raw_wr_by_response = [
+            float(item["raw_win_rate"]) for item in base_evaluations
+        ]
 
         plans = []
-        for target in candidates:
-            eval_result = self.evaluate_state(
-                my_picks=my_picks,
-                enemy_picks=enemy_picks,
-                my_ban=target,
-                enemy_ban=enemy_ban,
-                my_leader=my_leader,
-                enemy_leader=enemy_leader,
-                return_detail=True,
+        response_count = len(response_bans)
+        for candidate_index, target in enumerate(candidates):
+            start = candidate_index * response_count
+            target_batch = target_evaluations[start : start + response_count]
+            target_wrs = [
+                float(item["calibrated_win_rate"]) for item in target_batch
+            ]
+            target_raw_wrs = [
+                float(item["raw_win_rate"]) for item in target_batch
+            ]
+            worst_index = min(range(response_count), key=target_wrs.__getitem__)
+            mean_target_wr = sum(target_wrs) / response_count
+            mean_base_wr = sum(base_wr_by_response) / response_count
+            wr = (
+                BAN_WORST_RESPONSE_WEIGHT * target_wrs[worst_index]
+                + (1.0 - BAN_WORST_RESPONSE_WEIGHT) * mean_target_wr
             )
-            wr = float(eval_result["calibrated_win_rate"])
-            raw_wr = float(eval_result["raw_win_rate"])
+            raw_wr = target_raw_wrs[worst_index]
+            base_wr = (
+                BAN_WORST_RESPONSE_WEIGHT * base_wr_by_response[worst_index]
+                + (1.0 - BAN_WORST_RESPONSE_WEIGHT) * mean_base_wr
+            )
+            base_raw_wr = base_raw_wr_by_response[worst_index]
             gain = wr - base_wr
             raw_gain = raw_wr - base_raw_wr
             ban_stats = self.lucksack_stats.score_ban_action(
@@ -221,10 +350,25 @@ class BPBanValueRecommender:
                 weight_total += BAN_STATS_WEIGHT
                 source_parts.append("stats_0.10")
             decision_score = weighted_score / max(weight_total, 1e-6)
-            ranking_source = "ban_" + "_".join(source_parts)
+            ranking_source = "ban_robust_response_" + "_".join(source_parts)
 
             display = self._to_display_name(target)
             image_name = self._to_image_name(target)
+            response_rows = [
+                {
+                    "enemy_ban": self._to_display_name(response_ban)
+                    if response_ban
+                    else None,
+                    "enemy_ban_slug": response_ban,
+                    "pre_ban_win_rate": round(base_wr_by_response[index], 6),
+                    "post_ban_win_rate": round(target_wrs[index], 6),
+                    "win_rate_gain": round(
+                        target_wrs[index] - base_wr_by_response[index],
+                        6,
+                    ),
+                }
+                for index, response_ban in enumerate(response_bans)
+            ]
 
             plans.append(
                 {
@@ -237,9 +381,10 @@ class BPBanValueRecommender:
                     "plan_score": round(decision_score, 6),
                     "estimated_win_rate": round(wr, 6),
                     "source": str(self.meta.get("model_type", "bp_draft_value_model")),
-                    "summary": "Ban recommendation from full-draft value model",
+                    "summary": "Response-aware ban recommendation from full-draft value model",
                     "reasons": [
                         "Compares full draft win rate before and after banning the target",
+                        "Includes the strongest opposing ban response",
                         "Ranks bans by learned value plus mechanism threat removal",
                         *list(ban_stats.get("mechanism_reasons") or []),
                     ],
@@ -252,6 +397,28 @@ class BPBanValueRecommender:
                         "raw_pre_ban_win_rate": round(base_raw_wr, 6),
                         "raw_post_ban_win_rate": round(raw_wr, 6),
                         "raw_win_rate_gain": round(raw_gain, 6),
+                        "mean_pre_ban_win_rate": round(
+                            sum(base_wr_by_response) / response_count,
+                            6,
+                        ),
+                        "mean_post_ban_win_rate": round(
+                            sum(target_wrs) / response_count,
+                            6,
+                        ),
+                        "worst_pre_ban_win_rate": round(
+                            base_wr_by_response[worst_index],
+                            6,
+                        ),
+                        "worst_post_ban_win_rate": round(
+                            target_wrs[worst_index],
+                            6,
+                        ),
+                        "response_worst_weight": BAN_WORST_RESPONSE_WEIGHT,
+                        "worst_enemy_ban": response_rows[worst_index]["enemy_ban"],
+                        "worst_enemy_ban_slug": response_bans[worst_index],
+                        "opponent_ban_responses": response_rows,
+                        "opponent_response_count": response_count,
+                        "response_aware": response_count > 1,
                         "mechanism_score": round(mechanism_score, 6),
                         "mechanism_available": mechanism_available,
                         "mechanism_threat_reduction": round(

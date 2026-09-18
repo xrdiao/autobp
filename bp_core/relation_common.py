@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
 
-from bp_data_common import NameResolver
-from bp_transformer_common import PAD_TOKEN, UNK_TOKEN, normalize_name
+from bp_core.data_common import NameResolver
+from bp_core.transformer_common import PAD_TOKEN, UNK_TOKEN, normalize_name
 
 
 class MonsterVocab:

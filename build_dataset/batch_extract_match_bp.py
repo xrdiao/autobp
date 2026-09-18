@@ -8,12 +8,14 @@ import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
+from tqdm import tqdm
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from bp_data_common import count_record_rows, find_existing_record_keys, upsert_record_rows
-from dataset_versions import (
+from bp_core.data_common import count_record_rows, find_existing_record_keys, upsert_record_rows
+from bp_core.dataset_versions import (
     build_version_weight_map,
     describe_dataset_versions,
     extract_dataset_version_from_path,
@@ -321,14 +323,21 @@ def batch_extract_match_bp(
                 for path_str in html_files
             }
 
-            for future in as_completed(future_to_file):
-                path_str = future_to_file[future]
-                try:
-                    path_str, raw_matches, dataset_matches = future.result()
-                    consume_result(path_str, raw_matches, dataset_matches)
-                except Exception as exc:
-                    print(f"[ERR] {os.path.relpath(path_str, input_root)}: {exc}")
-                    retry_serial_paths.append(path_str)
+            with tqdm(
+                total=len(future_to_file),
+                desc="提取比赛 BP",
+                unit="file",
+                dynamic_ncols=True,
+            ) as progress:
+                for future in as_completed(future_to_file):
+                    path_str = future_to_file[future]
+                    try:
+                        path_str, raw_matches, dataset_matches = future.result()
+                        consume_result(path_str, raw_matches, dataset_matches)
+                    except Exception as exc:
+                        print(f"[ERR] {os.path.relpath(path_str, input_root)}: {exc}")
+                        retry_serial_paths.append(path_str)
+                    progress.update(1)
     except (PermissionError, OSError) as exc:
         print(f"[WARN] process pool unavailable, fallback to serial extraction: {exc}")
         retry_serial_paths = list(html_files)
@@ -336,7 +345,7 @@ def batch_extract_match_bp(
     if retry_serial_paths:
         unique_retry_paths = list(dict.fromkeys(retry_serial_paths))
         print(f"[WARN] retrying {len(unique_retry_paths)} files serially after process pool errors")
-        for path_str in unique_retry_paths:
+        for path_str in tqdm(unique_retry_paths, desc="串行重试提取", unit="file", dynamic_ncols=True):
             try:
                 path_str, raw_matches, dataset_matches = handle_file(path_str, str(input_root), version_weights)
                 consume_result(path_str, raw_matches, dataset_matches)

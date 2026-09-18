@@ -16,7 +16,7 @@ except ModuleNotFoundError:  # pragma: no cover - allows non-training utilities 
 
     nn = _NNNamespace()
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 PAD_TOKEN = "[PAD]"
 UNK_TOKEN = "[UNK]"

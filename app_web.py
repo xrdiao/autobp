@@ -3,18 +3,20 @@ from __future__ import annotations
 import base64
 import html
 import json
-import math
 import mimetypes
 import sqlite3
 from pathlib import Path
 import streamlit as st
 import streamlit.components.v1 as components
 
-from bp_ban_value_recommender import BPBanValueRecommender
-from bp_lucksack_stats import BPLucksackStats
-from bp_relation_common import infer_pick_count
-from bp_relation_recommender import BPRelationRecommender
-from bp_transformer_common import normalize_name, slugify_fallback
+from bp_recommender.ban_value import BPBanValueRecommender
+from bp_core.account_profile import load_account_profile
+from bp_core.draft_state import DraftState
+from bp_recommender.decision_engine import BPDecisionEngine
+from bp_core.lucksack_stats import BPLucksackStats
+from bp_core.relation_common import infer_pick_count
+from bp_recommender.relation import BPRelationRecommender
+from bp_core.transformer_common import normalize_name, slugify_fallback
 
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -28,6 +30,7 @@ BP_ICON_PICKER = components.declare_component(
 )
 
 MY_BOX_PATH = JSON_DIR / "my_box.json"
+ACCOUNT_PROFILE_PATH = JSON_DIR / "account_profile.json"
 IMAGE_MAP_PATH = JSON_DIR / "monster_images.json"
 ATTR_MAP_PATH = JSON_DIR / "monster_attributes.json"
 FAMILY_MAP_PATH = JSON_DIR / "monster_families.json"
@@ -215,6 +218,7 @@ def load_web_assets():
     luck_stats = BPLucksackStats(stats_path=LUCK_STATS_PATH, catalog_path=LUCK_CATALOG_PATH)
     swkit_alias_data = read_json(SWKIT_ALIAS_PATH, {})
     my_box = read_json(MY_BOX_PATH, [])
+    account_profile = load_account_profile(ACCOUNT_PROFILE_PATH)
     if not isinstance(my_box, list):
         my_box = []
 
@@ -267,6 +271,13 @@ def load_web_assets():
         fallback_names,
     )
     option_set = set(options)
+    if not my_box and account_profile is not None:
+        owned_slugs = set(account_profile.owned_monsters)
+        my_box = [
+            name
+            for name in options
+            if normalize_name(name) in owned_slugs
+        ]
     my_box = [name for name in my_box if name in option_set]
     search_text_map = {
         name: " ".join(
@@ -275,6 +286,16 @@ def load_web_assets():
         ).lower()
         for name in options
     }
+    rank_groups = [
+        {
+            "id": str(item.get("group_id")),
+            "name": str(item.get("group_name") or item.get("group_id")),
+        }
+        for item in (luck_stats.data.get("rank_groups") or [])
+        if item.get("group_id") is not None
+    ]
+    if not rank_groups:
+        rank_groups = [{"id": str(luck_stats.rank_group), "name": "当前数据"}]
 
     return {
         "relation_bundle": relation_bundle,
@@ -282,6 +303,7 @@ def load_web_assets():
         "ban_value_ready": bundle_ready(BAN_VALUE_BUNDLE),
         "options": options,
         "my_box": sorted(set(my_box), key=normalize_name),
+        "account_profile": account_profile,
         "image_lookup": {
             **build_image_lookup(image_map),
             **build_image_lookup(remote_image_map),
@@ -294,6 +316,8 @@ def load_web_assets():
         "families": ["全部"] + sorted({str(value) for value in family_map.values() if str(value).strip()}),
         "luck_stats_ready": bool(luck_stats.ready),
         "luck_stats_source": luck_stats.source_label,
+        "rank_groups": rank_groups,
+        "default_rank_group": str(luck_stats.rank_group),
     }
 
 
@@ -309,20 +333,21 @@ def load_sample_count(path):
 
 
 @st.cache_resource(show_spinner=False)
-def load_relation_recommender(model_path, meta_path, vocab_path, device):
+def load_relation_recommender(model_path, meta_path, vocab_path, device, rank_group):
     selected_device = None if device == "auto" else device
     return BPRelationRecommender(
         model_path=model_path,
         meta_path=meta_path,
         vocab_path=vocab_path,
         device=selected_device,
+        stats_rank_group=rank_group,
     )
 
 
 @st.cache_resource(show_spinner=False)
 def load_prefix_value_recommender(model_path, meta_path, vocab_path, device):
     selected_device = None if device == "auto" else device
-    from bp_prefix_value_recommender import BPPrefixValueRecommender
+    from bp_recommender.prefix_value import BPPrefixValueRecommender
 
     return BPPrefixValueRecommender(
         model_path=model_path,
@@ -333,13 +358,14 @@ def load_prefix_value_recommender(model_path, meta_path, vocab_path, device):
 
 
 @st.cache_resource(show_spinner=False)
-def load_ban_value_recommender(model_path, meta_path, vocab_path, device):
+def load_ban_value_recommender(model_path, meta_path, vocab_path, device, rank_group):
     selected_device = None if device == "auto" else device
     return BPBanValueRecommender(
         model_path=model_path,
         meta_path=meta_path,
         vocab_path=vocab_path,
         device=selected_device,
+        stats_rank_group=rank_group,
     )
 
 
@@ -395,6 +421,7 @@ def initialize_state(assets):
         "max_pair_candidates": 400,
         "show_details": False,
         "device": "auto",
+        "rank_group": assets.get("default_rank_group", "102"),
         "gallery_search": "",
         "gallery_attr": "全部",
         "gallery_family": "全部",
@@ -415,6 +442,9 @@ def initialize_state(assets):
     st.session_state.my_picks = [item for item in st.session_state.my_picks if item in options]
     st.session_state.enemy_picks = [item for item in st.session_state.enemy_picks if item in options]
     st.session_state.my_box = [item for item in st.session_state.my_box if item in options]
+    valid_rank_groups = {item["id"] for item in assets.get("rank_groups", [])}
+    if st.session_state.rank_group not in valid_rank_groups:
+        st.session_state.rank_group = assets.get("default_rank_group", "102")
     if st.session_state.my_leader not in st.session_state.my_picks:
         st.session_state.my_leader = ""
     if st.session_state.enemy_leader not in st.session_state.enemy_picks:
@@ -454,6 +484,7 @@ def get_relation_model(assets):
         str(bundle["meta_path"]),
         str(bundle["vocab_path"]),
         st.session_state.device,
+        st.session_state.rank_group,
     )
 
 
@@ -472,365 +503,39 @@ def get_ban_model(assets):
     return load_ban_value_recommender(
         *(str(path) for path in BAN_VALUE_BUNDLE),
         st.session_state.device,
+        st.session_state.rank_group,
     )
 
 
-LOOKAHEAD_PLAN_LIMIT = 12
-LOOKAHEAD_RESPONSE_LIMIT = 3
-LOOKAHEAD_PAIR_CANDIDATE_LIMIT = 80
-
-
-def _plan_monsters(item):
-    monsters = [value for value in item.get("plan") or item.get("monsters") or [] if value]
-    if not monsters:
-        monster = item.get("monster") or item.get("display_name")
-        monsters = [monster] if monster else []
-    return monsters
-
-
-def _prefix_state_value(prefix_model, state, my_picks, enemy_picks, turn, current_side, cache):
-    key = (
-        tuple(my_picks),
-        tuple(enemy_picks),
-        int(turn),
-        normalize_name(state["first_pick_side"]),
-        normalize_name(current_side),
-        state.get("my_leader", ""),
-        state.get("enemy_leader", ""),
-    )
-    if key not in cache:
-        evaluation = prefix_model.evaluate_state(
-            my_picks=list(my_picks),
-            enemy_picks=list(enemy_picks),
-            turn=turn,
-            first_pick_side=state["first_pick_side"],
-            current_side=current_side,
-            my_leader=state["my_leader"],
-            enemy_leader=state["enemy_leader"],
-            return_detail=True,
-        )
-        cache[key] = float(evaluation.get("calibrated_win_rate", 0.5))
-    return cache[key]
-
-
-def _evidence_score(detail):
-    values = []
-    if (
-        float(detail.get("draft_stats_coverage", 0.0) or 0.0) > 0.0
-        or detail.get("draft_stats_source") not in {None, "unavailable"}
-    ):
-        values.append(float(detail.get("draft_stats_score", 0.5) or 0.5))
-    if bool(detail.get("mechanism_available")):
-        values.append(float(detail.get("mechanism_score", 0.5) or 0.5))
-    if not values:
-        return 0.5
-    return sum(values) / len(values)
-
-
-def _weighted_response_value(response_rows):
-    if not response_rows:
-        return None, None, []
-    values = [float(row["value"]) for row in response_rows]
-    priorities = [float(row.get("priority", 0.5)) for row in response_rows]
-    highest_priority = max(priorities)
-    weights = [math.exp((priority - highest_priority) / 0.05) for priority in priorities]
-    weight_sum = sum(weights) or 1.0
-    expected = sum(value * weight for value, weight in zip(values, weights)) / weight_sum
-    return min(values), expected, response_rows
-
-
-def _my_action_lookahead(plan, relation_model, prefix_model, state, assets, cache):
-    picked = _plan_monsters(plan)
-    if not picked:
-        return None
-    post_my = list(state["my_picks"]) + picked
-    post_turn = int(state["turn"]) + len(picked)
-    post_side = side_for_turn(post_turn, state["first_pick_side"]) or "enemy"
-    responses = []
-    if post_side == "enemy":
-        counter_plans = relation_model.recommend_enemy_next_picks(
-            my_picks=post_my,
-            enemy_picks=state["enemy_picks"],
-            first_pick_side=state["first_pick_side"],
-            top_k=LOOKAHEAD_RESPONSE_LIMIT,
-            candidate_pool=assets["options"],
-            max_pair_candidates=min(
-                int(state.get("max_pair_candidates", LOOKAHEAD_PAIR_CANDIDATE_LIMIT)),
-                LOOKAHEAD_PAIR_CANDIDATE_LIMIT,
-            ),
-        )
-        for counter_plan in counter_plans:
-            counter = _plan_monsters(counter_plan)
-            if not counter:
-                continue
-            next_turn = post_turn + len(counter)
-            next_side = side_for_turn(next_turn, state["first_pick_side"]) or "me"
-            responses.append(
-                {
-                    "plan": counter,
-                    "priority": float(counter_plan.get("final_score", 0.5)),
-                    "value": _prefix_state_value(
-                        prefix_model,
-                        state,
-                        post_my,
-                        list(state["enemy_picks"]) + counter,
-                        next_turn,
-                        next_side,
-                        cache,
-                    ),
-                }
-            )
-    worst, expected, rows = _weighted_response_value(responses)
-    immediate = _prefix_state_value(
-        prefix_model,
-        state,
-        post_my,
-        state["enemy_picks"],
-        post_turn,
-        post_side,
-        cache,
-    )
-    robust = immediate if worst is None else 0.65 * worst + 0.35 * expected
-    return {
-        "immediate": immediate,
-        "robust": robust,
-        "worst_counter": worst,
-        "mean_counter": expected,
-        "responses": rows,
-    }
-
-
-def _enemy_action_lookahead(plan, relation_model, prefix_model, state, assets, cache):
-    picked = _plan_monsters(plan)
-    if not picked:
-        return None
-    post_enemy = list(state["enemy_picks"]) + picked
-    post_turn = int(state["turn"]) + len(picked)
-    post_side = side_for_turn(post_turn, state["first_pick_side"]) or "me"
-    immediate = _prefix_state_value(
-        prefix_model,
-        state,
-        state["my_picks"],
-        post_enemy,
-        post_turn,
-        post_side,
-        cache,
-    )
-    responses = []
-    if post_side == "me":
-        response_plans = relation_model.recommend_pick_plans(
-            my_picks=state["my_picks"],
-            enemy_picks=post_enemy,
-            first_pick_side=state["first_pick_side"],
-            candidate_pool=assets["options"],
-            my_box=state.get("my_box"),
-            use_my_box_for_reco=bool(state.get("use_my_box", True)),
-            top_k=LOOKAHEAD_RESPONSE_LIMIT,
-            max_pair_candidates=min(
-                int(state.get("max_pair_candidates", LOOKAHEAD_PAIR_CANDIDATE_LIMIT)),
-                LOOKAHEAD_PAIR_CANDIDATE_LIMIT,
-            ),
-        )
-        for response_plan in response_plans:
-            response = _plan_monsters(response_plan)
-            if not response:
-                continue
-            next_turn = post_turn + len(response)
-            next_side = side_for_turn(next_turn, state["first_pick_side"]) or "enemy"
-            responses.append(
-                {
-                    "plan": response,
-                    "priority": float(response_plan.get("plan_score", 0.5)),
-                    "value": _prefix_state_value(
-                        prefix_model,
-                        state,
-                        list(state["my_picks"]) + response,
-                        post_enemy,
-                        next_turn,
-                        next_side,
-                        cache,
-                    ),
-                }
-            )
-    best_response = max((row["value"] for row in responses), default=immediate)
-    return {
-        "immediate": immediate,
-        "best_response": best_response,
-        "responses": responses,
-    }
+LOOKAHEAD_PLAN_MULTIPLIER = 2
 
 
 def rerank_my_plans(plans, prefix_model, relation_model, state, assets, top_k):
-    if not plans or prefix_model is None:
-        return plans[:top_k]
+    if not plans:
+        return []
+    if prefix_model is None:
+        enriched = []
+        for plan in plans[:top_k]:
+            item = dict(plan)
+            enriched.append(item)
+        return enriched
 
-    value_cache = {}
-    base_win_rate = _prefix_state_value(
-        prefix_model,
-        state,
-        state["my_picks"],
-        state["enemy_picks"],
-        state["turn"],
-        side_for_turn(state["turn"], state["first_pick_side"]) or "me",
-        value_cache,
-    )
-    enriched = []
-    for plan_index, plan in enumerate(plans):
-        item = dict(plan)
-        picked = _plan_monsters(item)
-        detail = dict(item.get("detail", {}) or {})
-        try:
-            lookahead = None
-            if plan_index < LOOKAHEAD_PLAN_LIMIT and relation_model is not None:
-                lookahead = _my_action_lookahead(
-                    item,
-                    relation_model,
-                    prefix_model,
-                    state,
-                    assets,
-                    value_cache,
-                )
-            if lookahead is None:
-                post_turn = state["turn"] + len(picked)
-                post_side = side_for_turn(post_turn, state["first_pick_side"]) or "enemy"
-                win_rate = _prefix_state_value(
-                    prefix_model,
-                    state,
-                    state["my_picks"] + picked,
-                    state["enemy_picks"],
-                    post_turn,
-                    post_side,
-                    value_cache,
-                )
-                robust_win_rate = win_rate
-            else:
-                win_rate = float(lookahead["immediate"])
-                robust_win_rate = float(lookahead["robust"])
-            relation_score = float(
-                detail.get("normalized_relation_score", item.get("plan_score", 0.0)) or 0.0
-            )
-            evidence_score = _evidence_score(detail)
-            fused_score = (
-                0.60 * robust_win_rate
-                + 0.15 * win_rate
-                + 0.15 * relation_score
-                + 0.10 * evidence_score
-            )
-            item["plan_score"] = round(fused_score, 6)
-            item["estimated_win_rate"] = round(win_rate, 6)
-            detail.update(
-                {
-                    "pre_pick_win_rate": round(base_win_rate, 6),
-                    "post_pick_win_rate": round(win_rate, 6),
-                    "adversarial_win_rate": round(robust_win_rate, 6),
-                    "win_rate_gain": round(win_rate - base_win_rate, 6),
-                    "win_rate_source": "prefix_value",
-                    "relation_component": round(relation_score, 6),
-                    "value_component": round(win_rate, 6),
-                    "adversarial_value_component": round(robust_win_rate, 6),
-                    "evidence_component": round(evidence_score, 6),
-                    "lookahead_enabled": bool(lookahead),
-                    "worst_counter_win_rate": (
-                        None if not lookahead else lookahead.get("worst_counter")
-                    ),
-                    "mean_counter_win_rate": (
-                        None if not lookahead else lookahead.get("mean_counter")
-                    ),
-                    "counter_plans": [] if not lookahead else [
-                        {
-                            "plan": row["plan"],
-                            "win_rate": round(float(row["value"]), 6),
-                            "priority": round(float(row["priority"]), 6),
-                        }
-                        for row in lookahead.get("responses", [])
-                    ],
-                    "ranking_source": "minimax_value_0.60_immediate_0.15_relation_0.15_evidence_0.10",
-                }
-            )
-        except Exception as exc:
-            detail["win_rate_source"] = "prefix_value_failed"
-            detail["value_error"] = str(exc)
-        item["detail"] = detail
-        enriched.append(item)
-    enriched.sort(key=lambda row: float(row.get("plan_score", 0.0)), reverse=True)
-    return enriched[:top_k]
+    return BPDecisionEngine(
+        relation_model=relation_model,
+        value_model=prefix_model,
+        assets=assets,
+    ).rank_my_plans(plans, state, top_k)
 
 
 def rerank_enemy_plans(plans, prefix_model, relation_model, state, assets, top_k):
     if not plans or prefix_model is None:
         return plans[:top_k]
 
-    value_cache = {}
-    enriched = []
-    for plan_index, plan in enumerate(plans):
-        item = dict(plan)
-        monsters = _plan_monsters(item)
-        detail = dict(item.get("detail", {}) or {})
-        try:
-            next_side = side_for_turn(state["turn"] + len(monsters), state["first_pick_side"]) or "me"
-            lookahead = None
-            if plan_index < LOOKAHEAD_PLAN_LIMIT and relation_model is not None:
-                lookahead = _enemy_action_lookahead(
-                    item,
-                    relation_model,
-                    prefix_model,
-                    state,
-                    assets,
-                    value_cache,
-                )
-            if lookahead is None:
-                win_rate = _prefix_state_value(
-                    prefix_model,
-                    state,
-                    state["my_picks"],
-                    state["enemy_picks"] + monsters,
-                    state["turn"] + len(monsters),
-                    next_side,
-                    value_cache,
-                )
-                best_response = win_rate
-            else:
-                win_rate = float(lookahead["immediate"])
-                best_response = float(lookahead["best_response"])
-            relation_score = float(
-                detail.get("normalized_relation_score", item.get("final_score", 0.0)) or 0.0
-            )
-            evidence_score = _evidence_score(detail)
-            adversarial_score = (
-                0.60 * (1.0 - best_response)
-                + 0.15 * (1.0 - win_rate)
-                + 0.15 * relation_score
-                + 0.10 * evidence_score
-            )
-            item["estimated_win_rate"] = round(win_rate, 6)
-            item["final_score"] = round(adversarial_score, 6)
-            detail.update(
-                {
-                    "post_enemy_pick_win_rate": round(win_rate, 6),
-                    "best_response_win_rate": round(best_response, 6),
-                    "enemy_adversarial_score": round(adversarial_score, 6),
-                    "relation_component": round(relation_score, 6),
-                    "evidence_component": round(evidence_score, 6),
-                    "win_rate_source": "prefix_value",
-                    "lookahead_enabled": bool(lookahead),
-                    "response_plans": [] if not lookahead else [
-                        {
-                            "plan": row["plan"],
-                            "win_rate": round(float(row["value"]), 6),
-                            "priority": round(float(row["priority"]), 6),
-                        }
-                        for row in lookahead.get("responses", [])
-                    ],
-                    "ranking_source": "minimax_enemy_0.60_best_response_0.15_immediate_0.15_relation_0.10_evidence",
-                }
-            )
-        except Exception as exc:
-            detail["win_rate_source"] = "prefix_value_failed"
-            detail["value_error"] = str(exc)
-        item["detail"] = detail
-        enriched.append(item)
-    enriched.sort(key=lambda row: float(row.get("final_score", 0.0)), reverse=True)
-    return enriched[:top_k]
+    return BPDecisionEngine(
+        relation_model=relation_model,
+        value_model=prefix_model,
+        assets=assets,
+    ).rank_enemy_plans(plans, state, top_k)
 
 
 def calculate_my_recommendations(assets):
@@ -851,24 +556,35 @@ def calculate_my_recommendations(assets):
         candidate_pool=assets["options"],
         my_box=st.session_state.my_box,
         use_my_box_for_reco=bool(st.session_state.use_my_box),
-        top_k=top_k * 4 if prefix_model is not None else top_k,
+        top_k=(
+            top_k * LOOKAHEAD_PLAN_MULTIPLIER
+            if prefix_model is not None
+            else top_k
+        ),
         max_pair_candidates=int(st.session_state.max_pair_candidates),
+        preserve_evidence=True,
+    )
+    state = DraftState(
+        my_picks=tuple(my_picks),
+        enemy_picks=tuple(enemy_picks),
+        my_leader=st.session_state.my_leader,
+        enemy_leader=st.session_state.enemy_leader,
+        first_pick_side=first_pick_side,
+        turn=turn,
+    ).to_runtime_dict()
+    state.update(
+        {
+            "my_box": list(st.session_state.my_box),
+            "use_my_box": bool(st.session_state.use_my_box),
+            "max_pair_candidates": int(st.session_state.max_pair_candidates),
+            "current_side": side_for_turn(turn, first_pick_side),
+        }
     )
     return rerank_my_plans(
         plans,
         prefix_model,
         relation_model,
-        {
-            "my_picks": my_picks,
-            "enemy_picks": enemy_picks,
-            "turn": turn,
-            "first_pick_side": first_pick_side,
-            "my_leader": st.session_state.my_leader,
-            "enemy_leader": st.session_state.enemy_leader,
-            "my_box": list(st.session_state.my_box),
-            "use_my_box": bool(st.session_state.use_my_box),
-            "max_pair_candidates": int(st.session_state.max_pair_candidates),
-        },
+        state,
         assets,
         top_k,
     )
@@ -885,27 +601,38 @@ def calculate_enemy_recommendations(assets):
         my_picks=my_picks,
         enemy_picks=enemy_picks,
         first_pick_side=st.session_state.first_pick_side,
-        top_k=top_k * 4 if prefix_model is not None else top_k,
+        top_k=(
+            top_k * LOOKAHEAD_PLAN_MULTIPLIER
+            if prefix_model is not None
+            else top_k
+        ),
         candidate_pool=assets["options"],
         max_pair_candidates=int(st.session_state.max_pair_candidates),
+        preserve_evidence=True,
         my_leader=st.session_state.my_leader,
         enemy_leader=st.session_state.enemy_leader,
+    )
+    state = DraftState(
+        my_picks=tuple(my_picks),
+        enemy_picks=tuple(enemy_picks),
+        my_leader=st.session_state.my_leader,
+        enemy_leader=st.session_state.enemy_leader,
+        first_pick_side=st.session_state.first_pick_side,
+        turn=turn,
+    ).to_runtime_dict()
+    state.update(
+        {
+            "my_box": list(st.session_state.my_box),
+            "use_my_box": bool(st.session_state.use_my_box),
+            "max_pair_candidates": int(st.session_state.max_pair_candidates),
+            "current_side": side_for_turn(turn, st.session_state.first_pick_side),
+        }
     )
     return rerank_enemy_plans(
         predictions,
         prefix_model,
         relation_model,
-        {
-            "my_picks": my_picks,
-            "enemy_picks": enemy_picks,
-            "turn": turn,
-            "first_pick_side": st.session_state.first_pick_side,
-            "my_leader": st.session_state.my_leader,
-            "enemy_leader": st.session_state.enemy_leader,
-            "my_box": list(st.session_state.my_box),
-            "use_my_box": bool(st.session_state.use_my_box),
-            "max_pair_candidates": int(st.session_state.max_pair_candidates),
-        },
+        state,
         assets,
         top_k,
     )
@@ -1354,8 +1081,12 @@ def render_result_card(index, item, assets, result_type):
         "ban_value_0.75": "Ban Value",
         "minimax_value_0.60_immediate_0.15_relation_0.15_evidence_0.10": "两步预演 + Value + 数据",
         "minimax_enemy_0.60_best_response_0.15_immediate_0.15_relation_0.10_evidence": "对手预演 + 反制价值",
+        "robust_search_value_3ply_relation_stats_mechanism": "三层鲁棒搜索 + Value + 机制",
+        "robust_enemy_search_value_relation_stats_mechanism": "对手搜索 + Value + 机制",
         "relation": "Relation",
     }.get(str(ranking_source), str(ranking_source))
+    if str(ranking_source).startswith("ban_robust_response_"):
+        source_text = "鲁棒响应 + Ban Value + 机制/统计"
     safe_title = html.escape(f"{index}. {' + '.join(monsters)}")
     image_markup = []
     for monster in monsters:
@@ -1441,6 +1172,11 @@ def render_model_status(assets):
         st.success("Ban Value：已加载")
     else:
         st.warning("Ban Value：未找到，完整阵容 Ban 使用 Relation 备用")
+    account_profile = assets.get("account_profile")
+    if account_profile is None:
+        st.caption("账号档案：未加载，推荐不限制我方 Box")
+    else:
+        st.caption("账号档案：已加载，仅用于识别我方拥有的魔灵")
 
 
 def main():
@@ -1775,6 +1511,16 @@ def main():
     with st.sidebar:
         st.header("控制")
         st.checkbox("只从我的 Box 推荐", key="use_my_box")
+        rank_group_map = {
+            item["id"]: item["name"] for item in assets.get("rank_groups", [])
+        }
+        st.selectbox(
+            "统计段位",
+            options=list(rank_group_map),
+            format_func=lambda value: rank_group_map[value],
+            key="rank_group",
+            help="统计层使用所选段位；模型仍会结合当前阵容和机制约束。",
+        )
         st.slider("结果数量", min_value=1, max_value=12, key="top_k")
         st.slider(
             "双选候选预筛选",

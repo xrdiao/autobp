@@ -5,18 +5,43 @@
 - `relation v2`：根据真实时间前缀（chronological prefix）学习选人 / 双选兼容性，使用选人顺序、双方侧别、当前回合和 action-state cross attention。
 - `prefix value`：根据未完成 BP 状态预测我方最终胜率，训练数据只来自逐回合前缀，不把完整阵容模型直接用于半成品状态。
 - 完整 5v5 后的 Ban：继续使用 `bp_draft_value_net.pt`，因为此时输入已经是完整阵容。
-- 双选采用 Relation 先筛选、再对少量高分组合计算完整统计和机制证据，避免每个组合重复扫描全部外部数据。
+- 双选采用 Relation、统计协同组合和机制证据共同做候选召回，再对少量组合计算完整证据，避免只保留单体高分而漏掉高协同双选。
 
 桌面端排序逻辑：
 
 - 我方选人：先由 Relation v2、Lucksack、RTA 和机制层生成候选，再对前 12 个候选做“我方动作 -> 对方前三个反制 -> 我方状态价值”的两步预演，最终按 `0.60 * adversarial_value + 0.15 * immediate_value + 0.15 * relation + 0.10 * evidence` 排序。
 - 对方选人预测：模拟对方动作后的我方前三个最佳回应，按我方回应后剩余胜率反向排序。
 - Lucksack 统计层融合当前赛季 / 补丁的单体胜率、双魔灵 / 三魔灵组合胜率，以及当前 BP 阶段的 `pick_rate / win_rate`；样本数会参与置信度收缩，避免低样本组合直接主导排序。
+- 每个统计动作都会保留 `sample_count / evidence_confidence / evidence_uncertainty`；搜索层会对低样本或新魔灵降低统计与模型结论的决策强度，而不是把缺失数据当成负面证据。
 - 网页统计还会提供 `pick_win_rate / ban_rate / lead_rate`、先后手总胜率、段位分布和数据覆盖度；Ban 推荐使用 Ban 压力和目标胜率作为额外证据。
 - SWKit 的 RTA 评级榜单作为小权重先验加入统计层，用于补充低出场或新版本样本不足的魔灵。
 - SWRT 对位层会加入候选对敌方单体 / 双体阵容的实际胜率；Ban 时也会用目标对我方阵容的对位胜率作为小权重证据。
 - SWARFARM 技能机制层在存在敌方阵容时参与排序；Relation 候选预筛选也会使用机制分，避免双选时把低热度反制位提前过滤掉。
-- Ban：完整 5v5 后先比较 Ban 前后的完整阵容 value，再融合机制威胁削弱和网页 Ban 压力。
+- Ban：完整 5v5 后先比较 Ban 前后的完整阵容 value，再用对手 Ban 响应的最坏值和平均值做鲁棒融合，最后加入机制威胁削弱和网页 Ban 压力。
+
+## 代码结构
+
+根目录只保留网页入口和项目配置，模型与数据处理代码按职责分组：
+
+```text
+app_web.py                 Streamlit 网页入口
+apps/desktop.py            Tk 桌面入口
+bp_core/                   状态、数据、统计、机制和通用网络组件
+bp_recommender/            Relation、Prefix Value、Ban Value 和决策搜索
+training/                  三个模型训练脚本和一键训练入口
+evaluation/                回放评测和逐回合数据审计
+build_dataset/             抓取、解析、归一化和公开数据同步
+sw_ui_detection/           BP 截图识别工具
+tests/                     单元测试
+```
+
+训练、评测和审计统一使用模块入口，避免脚本所在目录改变资源路径：
+
+```bash
+python -m training.all_models
+python -m evaluation.replay --limit 2000 --with-value
+python -m evaluation.audit_prefix_data
+```
 
 ## Lucksack 实时数据
 
@@ -57,8 +82,10 @@ python build_dataset/sync_swrt_data.py --monster-limit 400
 
 ```bash
 conda activate autobp
-python build_dataset/sync_lucksack_data.py --combo-limit 2000
+python build_dataset/sync_lucksack_data.py --combo-limit 2000 --group-concurrency 2
 ```
+
+Lucksack 按段位并行同步，详情页抓取也默认使用 2 个 worker，并在页面内容就绪后立即保存，减少固定等待。若站点出现限流，可把 `--group-concurrency` 或 `--detail-concurrency` 调回 `1`。
 
 同步文件：
 
@@ -95,7 +122,7 @@ python build_dataset/sync_swarfarm_mechanisms.py
 
 ```bash
 conda activate autobp
-python train_all_models.py --sync-web-data
+python -m training.all_models --sync-web-data
 ```
 
 这条命令会依次同步 Lucksack / SWKit / SWRT / SWARFARM，审计逐回合数据，然后增量训练 relation v2、prefix value 和完整阵容 Ban 模型。未来出现新魔灵时，网页目录、别称、RTA 评级、SWRT 当前统计和机制标签会先进入推荐器；即使新魔灵暂时没有历史训练样本，也会通过当前网页统计和机制层参与候选排序。
@@ -103,13 +130,13 @@ python train_all_models.py --sync-web-data
 只重训本地数据，不重新抓网页：
 
 ```bash
-python train_all_models.py
+python -m training.all_models
 ```
 
 需要完全重训 relation v2 时显式指定：
 
 ```bash
-python train_all_models.py --sync-web-data --from-scratch
+python -m training.all_models --sync-web-data --from-scratch
 ```
 
 常用控制参数：
@@ -125,7 +152,7 @@ python train_all_models.py --sync-web-data --from-scratch
 python build_dataset/run_all.py --skip-lucksack --skip-swkit --skip-mechanisms
 ```
 
-默认使用 `102`（Guardian 全段位）统计。同步会保存所有可用段位分组；推荐器读取时可用环境变量切换：
+默认使用 `102`（Guardian 全段位）统计。同步会保存所有可用段位分组；Web 页面左侧可以直接切换统计段位，命令行或无界面运行时仍可用环境变量切换：
 
 ```bash
 BP_LUCKSACK_RANK_GROUP=16 streamlit run app_web.py --server.address 0.0.0.0 --server.port 8501
@@ -136,6 +163,38 @@ BP_LUCKSACK_RANK_GROUP=16 streamlit run app_web.py --server.address 0.0.0.0 --se
 ### 符文速度、技能循环和临场操作
 
 当前推荐器可以直接使用魔灵基础速度、队长速度、技能冷却、技能效果、命中次数和倍率缩放信息，因而能识别“速度/行动条/冷却控制”等机制类型。但 SWARFARM 和 SWRT 的公开接口没有提供每场 RTA 的实际符文速度、速度调优、符文套装、实时行动条、技能剩余冷却或玩家按键记录，所以当前不能凭这些网页数据可靠还原具体速度轴和临场操作。
+
+当前 Web 推荐已经统一经过 `bp_recommender/decision_engine.py`：Relation 模型负责候选动作，机制和公开统计负责证据覆盖，Prefix Value 负责局面价值，搜索层按“我方动作 -> 对手高概率回应 -> 我方续接”进行有限深度鲁棒评估。对手不是随机响应，而是从对手视角的 Relation 候选中取高优先级分支；搜索只在少量候选上展开，以保持实时性。
+
+离线回放不再把“是否猜中原玩家的下一手”当成唯一指标。`python -m evaluation.replay --with-value` 同时报告推荐动作相对实际动作的 `value_lift`、推荐胜率和推荐胜率更高的比例，并用每场比赛一个前缀的真实胜负结果计算校准指标；前者衡量决策价值，后者只作为行为参考。因为最优动作不一定是历史玩家当时实际选择的动作，单纯行为命中率会误导模型优化。
+
+现在账号侧新增了一个可选档案 `json/account_profile.json`。它可以直接放原始 SWEX JSON，也可以放规范化档案；程序从中解析 `owned_monsters`，仅用于初始化和限制我方 Box。符文和面板字段可以保留在档案中，但当前不进入客观推荐排序，也不会被当作确定的 RTA 构筑。魔灵 ID 通过当前 Lucksack 目录的 `com2us_id` 映射，无法映射的 ID 会显示为未解析，不会静默错配。
+
+最小档案格式如下，`verified_fields` 只填写已经确认含义的字段：
+
+```json
+{
+  "schema_version": 1,
+  "source": "manual_normalized",
+  "source_version": "",
+  "parse_confidence": 1.0,
+  "owned_monsters": ["Monster Name"],
+  "runes_by_monster": {
+    "Monster Name": {
+      "speed": 312,
+      "sets": ["swift", "will"],
+      "rune_ids": ["..."],
+      "rune_set_ids": ["..."],
+      "rune_slots": [2],
+      "verified_fields": ["speed", "sets"],
+      "confidence": 1.0,
+      "source": "manual_verified"
+    }
+  }
+}
+```
+
+对手符文在实战中不可见，后续只能根据段位、版本、魔灵选择和公开样本建立速度等属性的分布，并保留不确定性；不会把对手当作拥有某套确定符文来计算必胜结果。
 
 要把这三项能力做实，需要继续接入两类数据：
 
@@ -223,19 +282,19 @@ python -c "import torch; print(torch.__version__); print('CUDA:', torch.cuda.is_
 先检查展开后的逐回合数据：
 
 ```bash
-python audit_bp_prefix_data.py --data-path data/bp_samples.sqlite
+python -m evaluation.audit_prefix_data --data-path data/bp_samples.sqlite
 ```
 
 训练 relation v2：
 
 ```bash
-python train_bp_relation_net.py --from-scratch
+python -m training.relation --from-scratch
 ```
 
 训练 prefix value：
 
 ```bash
-python train_prefix_value_net.py
+python -m training.prefix_value
 ```
 
 Linux / Windows Web UI：
@@ -265,13 +324,13 @@ prefix value 输出：
 常规增量 fine-tune：
 
 ```bash
-python train_bp_relation_net.py --fine-tune
+python -m training.relation --fine-tune
 ```
 
 偏向新数据：
 
 ```bash
-python train_bp_relation_net.py --fine-tune \
+python -m training.relation --fine-tune \
   --new-data-weight 4.0 \
   --old-data-replay-ratio 0.35
 ```
@@ -279,13 +338,13 @@ python train_bp_relation_net.py --fine-tune \
 只使用本次新增 group：
 
 ```bash
-python train_bp_relation_net.py --fine-tune --fine-tune-new-only
+python -m training.relation --fine-tune --fine-tune-new-only
 ```
 
 默认每个 epoch 会对部分 train context 做 model-aware hard negative mining。关闭它：
 
 ```bash
-python train_bp_relation_net.py --hard-negative-ratio 0
+python -m training.relation --hard-negative-ratio 0
 ```
 
 主要参数：
@@ -322,7 +381,7 @@ python train_bp_relation_net.py --hard-negative-ratio 0
 
 ## 3. Prefix Value 训练
 
-`train_prefix_value_net.py` 使用 `data/bp_samples.sqlite` 中每场比赛的逐回合样本：
+`training.prefix_value` 使用 `data/bp_samples.sqlite` 中每场比赛的逐回合样本：
 
 - 按 `match_id` 划分 train / validation，避免同一比赛的不同 prefix 泄漏到两侧。
 - 标签是该场比赛最终结果。
@@ -333,12 +392,28 @@ python train_bp_relation_net.py --hard-negative-ratio 0
 常用命令：
 
 ```bash
-python train_prefix_value_net.py --epochs 10 --batch-size 256
+python -m training.prefix_value --epochs 10 --batch-size 256
 ```
 
-## 4. 数据排查
+## 4. BP 回放评估
 
-`audit_bp_prefix_data.py` 会检查：
+使用历史 BP 前缀检查推荐命中率和推理耗时：
+
+```bash
+python -m evaluation.replay --limit 2000 --top-k 6
+```
+
+加入 Prefix Value 和对手回应搜索：
+
+```bash
+python -m evaluation.replay --limit 2000 --top-k 6 --with-value
+```
+
+默认使用 `models/bp_relation_split_manifest.json` 的 `val` 对局集合，按比赛划分避免训练和评测共享同一场比赛；需要查看全部数据时显式传 `--eval-split all`。`--limit > 0` 时会按 `--seed` 做固定种子随机抽样，默认种子为 `42`；设为 `--limit 0` 可评估当前 split 的全部有效前缀。输出包含总体 Top-1 / Top-3 命中率、按回合统计和平均延迟，并记录评测 split、抽样策略和种子。启用 `--with-value` 后还会从每场比赛随机取一个前缀，按真实 `won/result` 计算 Brier、Log Loss、ECE，并按回合和段位分组；同一场比赛不会重复计入这组校准指标。回放命中率用于比较版本变化，不代表反事实胜率；模型改动应同时观察真实结果校准和模型排序结果。
+
+## 5. 数据排查
+
+`evaluation.audit_prefix_data` 会检查：
 
 - `current_side` 是否与 `turn` 和 `first_pick_side` 一致
 - 已选数量是否等于 `turn - 1`
@@ -347,7 +422,7 @@ python train_prefix_value_net.py --epochs 10 --batch-size 256
 
 如果审计失败，应先修复数据展开，再训练模型。
 
-## 5. 参考思路
+## 6. 参考思路
 
 实现只吸收通用方法，不直接套用其他游戏规则：
 

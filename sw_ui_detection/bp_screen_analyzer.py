@@ -9,6 +9,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from sw_ui_detection.capture import crop_game_canvas
 from sw_ui_detection.detector import BoundingBox, SlotDetection, SummonersWarUIDetector, _clip_box, _iou
 from sw_ui_detection.monster_bank import MonsterTemplateBank
 
@@ -43,6 +44,8 @@ class BPScreenAnalysis:
     my_box_region: BoundingBox
     draft_region: BoundingBox
     generic_slot_count: int
+    canvas_bbox: BoundingBox | None = None
+    canvas_confidence: float = 0.0
 
     def to_dict(self) -> dict:
         return {
@@ -57,14 +60,16 @@ class BPScreenAnalysis:
             "my_box_region": self.my_box_region.to_dict(),
             "draft_region": self.draft_region.to_dict(),
             "generic_slot_count": self.generic_slot_count,
+            "canvas_bbox": None if self.canvas_bbox is None else self.canvas_bbox.to_dict(),
+            "canvas_confidence": self.canvas_confidence,
         }
 
 
 class BPDraftScreenAnalyzer:
     # Draft region is still estimated roughly from the whole image,
     # but all slot anchors below are normalized inside draft_region.
-    BOX_REGION = (0.014, 0.680, 0.700, 0.260)
-    DRAFT_REGION = (0.108, 0.180, 0.788, 0.390)
+    BOX_REGION = (0.014, 0.662, 0.700, 0.269)
+    DRAFT_REGION = (0.108, 0.150, 0.788, 0.405)
     MY_FIRST_LAYOUTS = {
         "my": [
             ("my_1", (0.029, 0.274, 0.098, 0.310)),
@@ -128,7 +133,8 @@ class BPDraftScreenAnalyzer:
         candidate_top_k: int = 4,
         validate_sides: tuple[str, ...] | None = None,
     ) -> BPScreenAnalysis:
-        image = self.ui_detector._load_image(image_or_path)
+        original_image = self.ui_detector._load_image(image_or_path)
+        image, canvas_location = crop_game_canvas(original_image)
         generic_result = self.ui_detector.detect(image, validate_monsters=False)
         draft_region = self._estimate_draft_region(image, generic_result.candidate_slots)
 
@@ -193,10 +199,10 @@ class BPDraftScreenAnalyzer:
             best_variant["score"],
         )
 
-        return BPScreenAnalysis(
-            image_width=int(image.shape[1]),
-            image_height=int(image.shape[0]),
-            is_bp_screen=confidence >= 0.58,
+        analysis = BPScreenAnalysis(
+            image_width=int(original_image.shape[1]),
+            image_height=int(original_image.shape[0]),
+            is_bp_screen=confidence >= 0.50,
             confidence=float(round(confidence, 4)),
             first_pick_side=str(best_variant["first_pick_side"]),
             current_pick_side=current_pick_side,
@@ -205,7 +211,26 @@ class BPDraftScreenAnalyzer:
             my_box_region=my_box_region,
             draft_region=draft_region,
             generic_slot_count=len(generic_result.candidate_slots),
+            canvas_bbox=canvas_location.bbox,
+            canvas_confidence=float(round(canvas_location.confidence, 4)),
         )
+        if canvas_location.bbox != BoundingBox(x=0, y=0, w=original_image.shape[1], h=original_image.shape[0]):
+            self._offset_analysis(analysis, canvas_location.bbox.x, canvas_location.bbox.y)
+        return analysis
+
+    def _offset_analysis(self, analysis: BPScreenAnalysis, offset_x: int, offset_y: int) -> None:
+        def offset_box(box: BoundingBox) -> BoundingBox:
+            return BoundingBox(
+                x=box.x + int(offset_x),
+                y=box.y + int(offset_y),
+                w=box.w,
+                h=box.h,
+            )
+
+        for slot in analysis.my_slots + analysis.enemy_slots:
+            slot.bbox = offset_box(slot.bbox)
+        analysis.my_box_region = offset_box(analysis.my_box_region)
+        analysis.draft_region = offset_box(analysis.draft_region)
 
     def annotate(self, image_or_path: str | Path | np.ndarray, analysis: BPScreenAnalysis) -> np.ndarray:
         image = self.ui_detector._load_image(image_or_path).copy()
@@ -341,6 +366,7 @@ class BPDraftScreenAnalyzer:
                         "color_score": float(candidate.get("color_score", 0.0)),
                         "edge_score": float(candidate.get("edge_score", 0.0)),
                         "good_matches": int(candidate.get("good_matches", 0)),
+                        "inlier_matches": int(candidate.get("inlier_matches", 0)),
                         "reference_path": ref_path,
                     }
                 )
@@ -490,7 +516,8 @@ class BPDraftScreenAnalyzer:
                         f"总分 {candidate['score']:.3f} · 特征 {candidate['feature_score']:.3f} · "
                         f"模板 {candidate['template_score']:.3f} · 边缘 {candidate.get('edge_score', 0.0):.3f} · "
                         f"颜色 {candidate['color_score']:.3f} · "
-                        f"good_matches {candidate['good_matches']}"
+                        f"good_matches {candidate['good_matches']} · "
+                        f"inliers {candidate.get('inlier_matches', 0)}"
                         "</div>"
                     )
                     parts.append("</div></div>")
@@ -549,13 +576,19 @@ class BPDraftScreenAnalyzer:
                 side=side,
                 first_pick_side=first_pick_side,
             )
-            layout_score = max(best_score, visual_score * 0.70)
+            slot_crop = self._extract_slot_crop(image, slot_box, inset_ratio=0.0)
+            empty_layout_score = self._empty_slot_layout_score(slot_crop)
+            layout_score = max(best_score, visual_score * 0.70, empty_layout_score)
             slots.append(
                 BPSlot(
                     slot_id=slot_id,
                     side=side,
                     bbox=slot_box,
-                    matched_layout=(best_candidate is not None and best_score >= 0.18) or visual_score >= 0.28,
+                    matched_layout=(
+                        (best_candidate is not None and best_score >= 0.18)
+                        or visual_score >= 0.28
+                        or empty_layout_score >= 0.30
+                    ),
                     layout_score=float(round(layout_score, 4)),
                 )
             )
@@ -716,6 +749,7 @@ class BPDraftScreenAnalyzer:
                     "color_score": round(match.color_score, 4),
                     "edge_score": round(match.edge_score, 4),
                     "good_matches": int(match.good_matches),
+                    "inlier_matches": int(match.inlier_matches),
                 }
                 for match in matches
             ]
@@ -801,6 +835,8 @@ class BPDraftScreenAnalyzer:
         std = float(gray.std()) / 255.0
         saturation = float(hsv[..., 1].mean()) / 255.0
         edge_density = float(np.mean(edges > 0))
+        if brightness < 0.24 and std < 0.07 and edge_density < 0.04:
+            return True
         return (
             brightness < 0.33
             and std < 0.11
@@ -811,6 +847,15 @@ class BPDraftScreenAnalyzer:
             and saturation < 0.28
             and edge_density < 0.06
         )
+
+    def _empty_slot_layout_score(self, crop: np.ndarray) -> float:
+        if not self._is_empty_slot(crop):
+            return 0.0
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        brightness = float(gray.mean()) / 255.0
+        flatness = 1.0 - min(1.0, float(gray.std()) / 0.12 / 255.0)
+        darkness = 1.0 - min(1.0, brightness / 0.34)
+        return float(0.38 + 0.22 * (0.58 * darkness + 0.42 * flatness))
 
     def _highlight_score(self, crop: np.ndarray) -> float:
         if crop.size == 0:

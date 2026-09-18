@@ -8,7 +8,7 @@ import time
 from collections import Counter
 from pathlib import Path
 
-from bp_transformer_common import normalize_name, slugify_fallback
+from bp_core.transformer_common import normalize_name, slugify_fallback
 
 
 def load_json(path, default=None):

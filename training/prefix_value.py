@@ -9,19 +9,19 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from bp_data_common import (
+from bp_core.data_common import (
     NameResolver,
     build_name_resolution_resources,
     load_record_rows,
     normalize_relation_sample,
 )
-from bp_prefix_value_common import (
+from bp_recommender.prefix_value_common import (
     BPPrefixValueNet,
     build_prefix_value_vocab,
     encode_prefix_list,
 )
-from bp_transformer_common import PAD_TOKEN, PROJECT_ROOT, normalize_name
-from rank_tiers import get_rank_context_from_record
+from bp_core.transformer_common import PAD_TOKEN, PROJECT_ROOT, normalize_name
+from bp_core.rank_tiers import get_rank_context_from_record
 
 DATA_PATH = str(PROJECT_ROOT / "data" / "bp_samples.sqlite")
 SAVE_DIR = str(PROJECT_ROOT / "models")

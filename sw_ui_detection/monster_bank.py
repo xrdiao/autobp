@@ -7,9 +7,10 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from bp_transformer_common import PROJECT_ROOT
+from bp_core.transformer_common import PROJECT_ROOT
 
 DEFAULT_MONSTER_IMAGE_MAP = PROJECT_ROOT / "json" / "monster_images.json"
+DEFAULT_MONSTER_CATALOG = PROJECT_ROOT / "json" / "lucksack_monster_catalog.json"
 
 
 @dataclass
@@ -21,6 +22,7 @@ class MonsterMatch:
     color_score: float = 0.0
     edge_score: float = 0.0
     good_matches: int = 0
+    inlier_matches: int = 0
 
 
 def _center_crop_square(image: np.ndarray, margin_ratio: float = 0.08) -> np.ndarray:
@@ -92,23 +94,25 @@ def _prepare_edge_map(image: np.ndarray, is_query: bool, size: int = 64) -> np.n
 
 
 def _create_feature_extractor():
-    if hasattr(cv2, "SIFT_create"):
-        return "sift", cv2.SIFT_create(nfeatures=240), cv2.NORM_L2
-    return "orb", cv2.ORB_create(nfeatures=450), cv2.NORM_HAMMING
+    return "orb", cv2.ORB_create(nfeatures=600, fastThreshold=7), cv2.NORM_HAMMING
 
 
 class MonsterTemplateBank:
     def __init__(
         self,
         image_map_path: str | Path = DEFAULT_MONSTER_IMAGE_MAP,
+        catalog_path: str | Path = DEFAULT_MONSTER_CATALOG,
         template_size: int = 64,
         feature_prefilter_limit: int = 64,
     ):
         self.image_map_path = Path(image_map_path)
+        self.catalog_path = Path(catalog_path)
         self.template_size = int(template_size)
         self.feature_prefilter_limit = max(1, int(feature_prefilter_limit))
         self.feature_name, self.feature_extractor, matcher_norm = _create_feature_extractor()
         self.matcher = cv2.BFMatcher(matcher_norm)
+        self.refine_feature_extractor = cv2.SIFT_create(nfeatures=240) if hasattr(cv2, "SIFT_create") else None
+        self.refine_matcher = cv2.BFMatcher(cv2.NORM_L2) if self.refine_feature_extractor is not None else None
         self.monster_image_map: dict[str, Path] = {}
         self.templates = self._load_templates()
 
@@ -116,14 +120,35 @@ class MonsterTemplateBank:
         with open(self.image_map_path, "r", encoding="utf-8") as f:
             image_map = json.load(f)
 
+        image_entries = list((str(monster), str(relative_path)) for monster, relative_path in image_map.items())
+        if self.catalog_path.exists():
+            with open(self.catalog_path, "r", encoding="utf-8") as f:
+                catalog = json.load(f)
+            known_names = {monster for monster, _path in image_entries}
+            for row in catalog:
+                if not isinstance(row, dict):
+                    continue
+                monster = str(row.get("slabel") or row.get("label") or row.get("slug") or "").strip()
+                relative_path = str(row.get("image") or "").strip()
+                if monster and relative_path and monster not in known_names:
+                    image_entries.append((monster, relative_path))
+                    known_names.add(monster)
+
         templates = []
-        for monster, relative_path in image_map.items():
-            image_path = PROJECT_ROOT / str(relative_path)
+        loaded_paths: set[Path] = set()
+        for monster, relative_path in image_entries:
+            image_path = PROJECT_ROOT / relative_path
             if not image_path.exists():
+                image_path = PROJECT_ROOT / "images" / relative_path
+            if not image_path.exists():
+                continue
+            image_path = image_path.resolve()
+            if image_path in loaded_paths:
                 continue
             image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
             if image is None:
                 continue
+            loaded_paths.add(image_path)
             self.monster_image_map[str(monster)] = image_path
             template_gray = _prepare_gray(image, size=self.template_size, is_query=False)
             feature_gray = _prepare_feature_gray(image, is_query=False, size=96)
@@ -135,8 +160,12 @@ class MonsterTemplateBank:
                     "gray_norm": cv2.normalize(template_gray.astype(np.float32), None, 0.0, 1.0, cv2.NORM_MINMAX),
                     "edge": _prepare_edge_map(image, is_query=False, size=self.template_size),
                     "hist": _prepare_color_hist(image, is_query=False),
+                    "keypoints": keypoints or [],
                     "descriptors": descriptors,
                     "keypoint_count": 0 if keypoints is None else len(keypoints),
+                    "feature_gray": feature_gray,
+                    "refine_keypoints": None,
+                    "refine_descriptors": None,
                 }
             )
         return templates
@@ -158,7 +187,7 @@ class MonsterTemplateBank:
         query_hist = _prepare_color_hist(crop_bgr, is_query=True)
         query_hist_f = query_hist.astype(np.float32)
         query_feature = _prepare_feature_gray(crop_bgr, is_query=True, size=96)
-        _, query_descriptors = self.feature_extractor.detectAndCompute(query_feature, None)
+        query_keypoints, query_descriptors = self.feature_extractor.detectAndCompute(query_feature, None)
 
         quick_candidates = []
         for template in self.templates:
@@ -188,6 +217,18 @@ class MonsterTemplateBank:
             )
 
         quick_candidates.sort(key=lambda item: item["quick_score"], reverse=True)
+        refine_needed = bool(
+            self.refine_feature_extractor is not None
+            and len(quick_candidates) >= 2
+            and (
+                quick_candidates[0]["quick_score"] < 0.73
+                or quick_candidates[0]["quick_score"] - quick_candidates[1]["quick_score"] < 0.10
+            )
+        )
+        refine_keypoints = None
+        refine_descriptors = None
+        if refine_needed:
+            refine_keypoints, refine_descriptors = self.refine_feature_extractor.detectAndCompute(query_feature, None)
         if query_descriptors is None:
             feature_pool = quick_candidates[: max(top_k, min(len(quick_candidates), self.feature_prefilter_limit // 2))]
         else:
@@ -195,17 +236,43 @@ class MonsterTemplateBank:
             feature_pool = quick_candidates[: min(len(quick_candidates), prefilter_limit)]
 
         matches = []
-        for candidate in feature_pool:
+        refine_limit = max(top_k * 3, min(self.feature_prefilter_limit, 12))
+        for candidate_index, candidate in enumerate(feature_pool):
             template = candidate["template"]
             monster = template["monster"]
             template_score = candidate["template_score"]
             edge_score = candidate["edge_score"]
             color_score = candidate["color_score"]
             good_matches = 0
+            inlier_matches = 0
             feature_score = 0.0
             template_descriptors = template["descriptors"]
-            if query_descriptors is not None and template_descriptors is not None and len(template_descriptors) >= 3:
-                knn_matches = self.matcher.knnMatch(query_descriptors, template_descriptors, k=2)
+            matcher = self.matcher
+            active_query_keypoints = query_keypoints
+            active_query_descriptors = query_descriptors
+            active_template_keypoints = template["keypoints"]
+            if (
+                refine_needed
+                and candidate_index < refine_limit
+                and refine_descriptors is not None
+                and self.refine_matcher is not None
+            ):
+                if template["refine_descriptors"] is None:
+                    (
+                        template["refine_keypoints"],
+                        template["refine_descriptors"],
+                    ) = self.refine_feature_extractor.detectAndCompute(template["feature_gray"], None)
+                matcher = self.refine_matcher
+                active_query_keypoints = refine_keypoints
+                active_query_descriptors = refine_descriptors
+                active_template_keypoints = template["refine_keypoints"] or []
+                template_descriptors = template["refine_descriptors"]
+            if (
+                active_query_descriptors is not None
+                and template_descriptors is not None
+                and len(template_descriptors) >= 3
+            ):
+                knn_matches = matcher.knnMatch(active_query_descriptors, template_descriptors, k=2)
                 filtered = []
                 for pair in knn_matches:
                     if len(pair) < 2:
@@ -215,7 +282,24 @@ class MonsterTemplateBank:
                         filtered.append(m)
                 good_matches = len(filtered)
                 denom = max(8.0, min(24.0, float(template["keypoint_count"])))
-                feature_score = max(0.0, min(1.0, good_matches / denom))
+                ratio_score = max(0.0, min(1.0, good_matches / denom))
+                if active_query_keypoints is not None and len(filtered) >= 4 and active_template_keypoints:
+                    source_points = np.float32(
+                        [active_query_keypoints[match.queryIdx].pt for match in filtered]
+                    ).reshape(-1, 1, 2)
+                    target_points = np.float32(
+                        [active_template_keypoints[match.trainIdx].pt for match in filtered]
+                    ).reshape(-1, 1, 2)
+                    _homography, inlier_mask = cv2.findHomography(
+                        source_points,
+                        target_points,
+                        cv2.RANSAC,
+                        5.0,
+                    )
+                    if inlier_mask is not None:
+                        inlier_matches = int(np.count_nonzero(inlier_mask))
+                inlier_score = max(0.0, min(1.0, inlier_matches / denom))
+                feature_score = max(0.0, min(1.0, 0.55 * ratio_score + 0.45 * inlier_score))
 
             appearance_score = 0.52 * feature_score + 0.30 * color_score + 0.18 * min(feature_score, color_score)
             score = (
@@ -236,6 +320,7 @@ class MonsterTemplateBank:
                     color_score=float(color_score),
                     edge_score=float(edge_score),
                     good_matches=int(good_matches),
+                    inlier_matches=int(inlier_matches),
                 )
             )
 

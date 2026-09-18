@@ -7,7 +7,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, Optional
 
-DATASET_ROOT = Path(__file__).resolve().parent / "dataset"
+DATASET_ROOT = Path(__file__).resolve().parents[1] / "dataset"
 LEGACY_DATASET_VERSION = "legacy"
 DEFAULT_VERSION_WEIGHT_MIN = 0.6
 DEFAULT_VERSION_WEIGHT_MAX = 1.0

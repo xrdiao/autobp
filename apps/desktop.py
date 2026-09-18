@@ -14,8 +14,9 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 from PIL import Image, ImageGrab, ImageOps, ImageTk
+from sw_ui_detection.capture import save_screen_capture
 
-ROOT_DIR = Path(__file__).resolve().parent
+ROOT_DIR = Path(__file__).resolve().parent.parent
 MY_BOX_PATH = ROOT_DIR / "json" / "my_box.json"
 IMAGE_MAP_PATH = ROOT_DIR / "json" / "monster_images.json"
 ATTR_MAP_PATH = ROOT_DIR / "json" / "monster_attributes.json"
@@ -199,7 +200,7 @@ def load_neural_monster_metadata():
         except Exception:
             pick_freq[display_name] = 0
 
-    from bp_lucksack_stats import BPLucksackStats
+    from bp_core.lucksack_stats import BPLucksackStats
 
     luck_stats = BPLucksackStats()
     for slug in luck_stats.candidate_slugs():
@@ -360,6 +361,7 @@ class DesktopBPApp:
         self.bp_recognition_result = None
         self.bp_recognition_source = None
         self.bp_recognition_image_path = None
+        self._screen_capture_hidden = False
         self.bp_enemy_candidate_top_n_var = tk.IntVar(value=4)
 
         self.status_var = tk.StringVar(value="就绪")
@@ -427,7 +429,7 @@ class DesktopBPApp:
         image_map = load_json_file(IMAGE_MAP_PATH, {})
         attr_map = load_json_file(ATTR_MAP_PATH, {})
         family_map = load_json_file(FAMILY_MAP_PATH, {})
-        from bp_lucksack_stats import BPLucksackStats
+        from bp_core.lucksack_stats import BPLucksackStats
 
         luck_stats = BPLucksackStats()
         for slug in luck_stats.candidate_slugs():
@@ -866,8 +868,8 @@ class DesktopBPApp:
         if self.relation_recommender is not None:
             return self.relation_recommender
         if not self._relation_model_bundle_ready():
-            raise RuntimeError("Relation model is not available. Run python train_bp_relation_net.py first.")
-        from bp_relation_recommender import BPRelationRecommender
+            raise RuntimeError("Relation model is not available. Run python -m training.relation first.")
+        from bp_recommender.relation import BPRelationRecommender
 
         self.relation_recommender = BPRelationRecommender()
         return self.relation_recommender
@@ -883,8 +885,8 @@ class DesktopBPApp:
         if self.prefix_value_recommender is not None:
             return self.prefix_value_recommender
         if not self._prefix_value_model_bundle_ready():
-            raise RuntimeError("Prefix value model is not available. Run python train_prefix_value_net.py first.")
-        from bp_prefix_value_recommender import BPPrefixValueRecommender
+            raise RuntimeError("Prefix value model is not available. Run python -m training.prefix_value first.")
+        from bp_recommender.prefix_value import BPPrefixValueRecommender
 
         self.prefix_value_recommender = BPPrefixValueRecommender()
         return self.prefix_value_recommender
@@ -892,7 +894,7 @@ class DesktopBPApp:
     def _get_ban_value_recommender(self):
         if self.ban_value_recommender is not None:
             return self.ban_value_recommender
-        from bp_ban_value_recommender import BPBanValueRecommender
+        from bp_recommender.ban_value import BPBanValueRecommender
 
         self.ban_value_recommender = BPBanValueRecommender()
         return self.ban_value_recommender
@@ -1066,6 +1068,7 @@ class DesktopBPApp:
             )
             return
 
+        self._restore_after_screen_capture()
         self._clear_active_task(task_id)
         if error is not None:
             print(error_trace, file=sys.stderr)
@@ -1131,6 +1134,40 @@ class DesktopBPApp:
         self.bp_recognition_image_path = Path(result["image_path"]) if result.get("image_path") else None
         self.set_status("BP recognition finished")
         self.refresh_bp_state_panel()
+
+    def _restore_after_screen_capture(self):
+        if not self._screen_capture_hidden:
+            return
+        self._screen_capture_hidden = False
+        self.root.deiconify()
+        self.root.lift()
+
+    def recognize_bp_from_screen(self):
+        if self._active_task_name:
+            self._set_transient_status(f"{self._active_task_name} in progress...")
+            return False
+
+        candidate_top_k = max(1, int(self.bp_enemy_candidate_top_n_var.get()))
+        self._screen_capture_hidden = True
+        self.root.withdraw()
+
+        def work():
+            time.sleep(0.15)
+            save_screen_capture(APP_BP_IMPORT_PATH)
+            return self._run_bp_recognition_from_path(
+                APP_BP_IMPORT_PATH,
+                "system screen capture",
+                candidate_top_k,
+            )
+
+        started = self._start_background_task(
+            "Recognizing current screen",
+            work,
+            self._apply_bp_recognition_result,
+        )
+        if not started:
+            self._restore_after_screen_capture()
+        return started
 
     def recognize_bp_from_clipboard(self):
         try:
@@ -1395,6 +1432,9 @@ class DesktopBPApp:
 
         toolbar_row = ttk.Frame(section)
         toolbar_row.pack(fill=tk.X, pady=(8, 4))
+        ttk.Button(toolbar_row, text="Capture Current Screen", command=self.recognize_bp_from_screen).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=2
+        )
         ttk.Button(toolbar_row, text="Paste Screenshot", command=self.recognize_bp_from_clipboard).pack(
             side=tk.LEFT, fill=tk.X, expand=True, padx=2
         )

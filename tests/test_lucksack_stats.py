@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from bp_lucksack_stats import BPLucksackStats
+from bp_core.lucksack_stats import BPLucksackStats
 
 
 class BPLucksackStatsTests(unittest.TestCase):
@@ -125,11 +125,20 @@ class BPLucksackStatsTests(unittest.TestCase):
         self.assertEqual(stats.to_display_name("beta"), "Beta")
         self.assertEqual(stats.to_image_name("alpha"), "alpha.png")
         self.assertEqual(stats.candidate_slugs(), ["alpha", "beta"])
+        synergy_pairs = stats.candidate_synergy_pairs(["alpha", "beta"])
+        self.assertEqual(synergy_pairs[0]["slugs"], ("alpha", "beta"))
         self.assertGreater(result["solo_score"], 0.5)
         self.assertGreater(result["synergy_score"], 0.5)
         self.assertGreater(result["draft_position_score"], 0.5)
         self.assertGreater(result["rta_tier_score"], 0.5)
         self.assertGreater(result["score"], 0.5)
+        self.assertEqual(result["sample_count"], 1000)
+        self.assertGreater(result["evidence_confidence"], 0.0)
+        self.assertLess(result["evidence_uncertainty"], 1.0)
+        self.assertEqual(
+            len([item for item in result["evidence"] if item["kind"] == "duo"]),
+            1,
+        )
         self.assertEqual(
             {item["kind"] for item in result["evidence"]},
             {"solo", "duo", "draft_position", "swkit_rta_tier"},
@@ -145,7 +154,10 @@ class BPLucksackStatsTests(unittest.TestCase):
 
         self.assertFalse(stats.ready)
         self.assertEqual(stats.candidate_slugs(), [])
-        self.assertEqual(stats.score_action([], [], ["new-monster"])["score"], 0.5)
+        result = stats.score_action([], [], ["new-monster"])
+        self.assertEqual(result["score"], 0.5)
+        self.assertEqual(result["evidence_confidence"], 0.0)
+        self.assertEqual(result["evidence_uncertainty"], 1.0)
 
     def test_uses_swrt_matchup_evidence(self):
         snapshot = {
