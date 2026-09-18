@@ -74,9 +74,25 @@ def side_for_order(order, first_pick_side):
 
 
 def infer_pick_count(my_picks, enemy_picks, first_pick_side):
+    return infer_pick_count_for_side(
+        my_picks,
+        enemy_picks,
+        first_pick_side,
+        "me",
+    )
+
+
+def infer_pick_count_for_side(my_picks, enemy_picks, first_pick_side, side):
+    """Return how many consecutive picks belong to ``side`` at the current turn."""
     next_order = len(my_picks or []) + len(enemy_picks or []) + 1
+    side = normalize_name(side)
+    if side not in {"me", "enemy"}:
+        return 0
     count = 0
-    while next_order + count <= 10 and side_for_order(next_order + count, first_pick_side) == "me":
+    while (
+        next_order + count <= 10
+        and side_for_order(next_order + count, first_pick_side) == side
+    ):
         count += 1
     return count
 

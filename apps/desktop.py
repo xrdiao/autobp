@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import io
 import math
 import os
 import queue
@@ -8,6 +9,7 @@ import sys
 import threading
 import time
 import traceback
+import urllib.request
 from collections import Counter
 from pathlib import Path
 import tkinter as tk
@@ -15,10 +17,13 @@ from tkinter import messagebox, ttk
 
 from PIL import Image, ImageGrab, ImageOps, ImageTk
 from sw_ui_detection.capture import save_screen_capture
+from bp_core.relation_common import infer_pick_count_for_side
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 MY_BOX_PATH = ROOT_DIR / "json" / "my_box.json"
 IMAGE_MAP_PATH = ROOT_DIR / "json" / "monster_images.json"
+ALIAS_MAP_PATH = ROOT_DIR / "json" / "monster_alias_map.json"
+SWKIT_ALIAS_PATH = ROOT_DIR / "json" / "swkit_monster_aliases.json"
 ATTR_MAP_PATH = ROOT_DIR / "json" / "monster_attributes.json"
 FAMILY_MAP_PATH = ROOT_DIR / "json" / "monster_families.json"
 RELATION_META_V2_PATH = ROOT_DIR / "models" / "bp_relation_meta_v2.json"
@@ -105,11 +110,23 @@ def slugify_fallback(name):
     return "-".join(text.split())
 
 
+def lucksack_image_url(value):
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith(("http://", "https://")):
+        return raw
+    return f"https://static.lucksack.gg/images/monsters/{raw.lstrip('/')}"
+
+
 def resolve_image_path(path_value):
     if not path_value:
         return None
 
-    raw = str(path_value).strip().replace("/", "\\")
+    raw = str(path_value).strip()
+    if raw.startswith(("http://", "https://")):
+        return raw
+    raw = raw.replace("/", "\\")
     path = Path(raw)
     candidates = []
     if path.is_absolute():
@@ -218,20 +235,25 @@ def sort_monsters_by_pick_frequency(monsters, pick_freq):
     return sorted(monsters, key=lambda m: (-pick_freq.get(m, 0), m))
 
 
-def infer_bp_stage(my_picks, enemy_picks):
+def infer_bp_stage(my_picks, enemy_picks, first_pick_side="me"):
     my_count = len(my_picks or [])
     enemy_count = len(enemy_picks or [])
 
     if my_count >= 5 and enemy_count >= 5:
         return "ban"
 
-    if my_count < 5:
-        remain = 5 - my_count
-        if remain == 1 or (my_count == 0 and enemy_count == 0):
-            return "pick_single"
+    order = my_count + enemy_count + 1
+    side = infer_side_for_order(order, first_pick_side)
+    if side is None:
+        return "idle"
+    current_count = my_count if side == "my" else enemy_count
+    remain = 5 - current_count
+    if remain <= 0:
+        return "idle"
+    next_side = infer_side_for_order(order + 1, first_pick_side)
+    if remain >= 2 and next_side == side:
         return "pick_multi"
-
-    return "idle"
+    return "pick_single"
 
 
 def infer_turn_from_state(my_picks, enemy_picks, first_pick_side):
@@ -342,6 +364,8 @@ class DesktopBPApp:
         self.attr_map = {}
         self.family_map = {}
         self.image_lookup = {}
+        self.alias_lookup = {}
+        self.search_text_map = {}
         self.pick_freq = Counter()
 
         self.photo_cache = {}
@@ -427,27 +451,88 @@ class DesktopBPApp:
 
     def _lazy_load_core_data(self):
         image_map = load_json_file(IMAGE_MAP_PATH, {})
+        generated_alias_map = load_json_file(ALIAS_MAP_PATH, {})
+        swkit_alias_data = load_json_file(SWKIT_ALIAS_PATH, {})
+        if not isinstance(generated_alias_map, dict):
+            generated_alias_map = {}
+        if not isinstance(swkit_alias_data, dict):
+            swkit_alias_data = {}
         attr_map = load_json_file(ATTR_MAP_PATH, {})
         family_map = load_json_file(FAMILY_MAP_PATH, {})
         from bp_core.lucksack_stats import BPLucksackStats
 
         luck_stats = BPLucksackStats()
+        catalog_by_slug = {
+            str(item.get("slug") or "").strip().lower(): item
+            for item in (luck_stats.catalog if isinstance(luck_stats.catalog, list) else [])
+            if item.get("slug")
+        }
+        alias_entries = dict(generated_alias_map)
+        aliases_by_id = swkit_alias_data.get("aliases_by_id") or {}
+        for item in (luck_stats.catalog if isinstance(luck_stats.catalog, list) else []):
+            display_name = luck_stats.to_display_name(item.get("slug"))
+            unit_id = str(item.get("com2us_id") or "").strip()
+            if display_name and unit_id:
+                for alias in aliases_by_id.get(unit_id, []):
+                    alias_entries.setdefault(str(alias).strip(), display_name)
         for slug in luck_stats.candidate_slugs():
             display_name = luck_stats.to_display_name(slug)
             if not display_name:
                 continue
-            attr_map.setdefault(display_name, "")
+            catalog_item = catalog_by_slug.get(str(slug).strip().lower(), {})
+            attr_map.setdefault(display_name, str(catalog_item.get("element") or ""))
+            family = str(
+                catalog_item.get("family")
+                or catalog_item.get("family_name")
+                or catalog_item.get("familyName")
+                or ""
+            ).strip()
+            if family:
+                family_map.setdefault(display_name, family)
+            image_name = luck_stats.to_image_name(slug)
+            if image_name:
+                image_map.setdefault(display_name, lucksack_image_url(image_name))
+
+        image_by_name = {
+            normalize_name(key): value
+            for key, value in image_map.items()
+        }
+        for alias, display_name in alias_entries.items():
+            image_value = image_by_name.get(normalize_name(display_name))
+            if image_value:
+                image_map.setdefault(alias, image_value)
+
         image_lookup = build_image_lookup(image_map)
         monster_pool, pick_freq = load_neural_monster_metadata()
         if not monster_pool:
             fallback_names = set(image_map) | set(attr_map) | set(family_map)
             monster_pool = sorted(str(name).strip() for name in fallback_names if str(name).strip())
+        alias_lookup = {}
+        search_text_map = {}
+        pool_lookup = {
+            normalize_name(monster): monster
+            for monster in monster_pool
+        }
+        aliases_by_target = {}
+        for alias, display_name in alias_entries.items():
+            target = pool_lookup.get(normalize_name(display_name))
+            if target:
+                aliases_by_target.setdefault(target, set()).add(str(alias).strip())
+                alias_lookup[normalize_name(alias)] = target
+        for monster in monster_pool:
+            alias_lookup.setdefault(normalize_name(monster), monster)
+            aliases = sorted(aliases_by_target.get(monster, set()))
+            search_text_map[monster] = " ".join(
+                [monster, slugify_fallback(monster), *aliases]
+            ).lower()
         return {
             "monster_pool": monster_pool,
             "pick_freq": pick_freq,
             "attr_map": attr_map,
             "family_map": family_map,
             "image_lookup": image_lookup,
+            "alias_lookup": alias_lookup,
+            "search_text_map": search_text_map,
         }
 
     def _apply_lazy_bootstrap_result(self, result):
@@ -461,6 +546,8 @@ class DesktopBPApp:
         self.attr_map = result["attr_map"]
         self.family_map = result["family_map"]
         self.image_lookup = result["image_lookup"]
+        self.alias_lookup = result["alias_lookup"]
+        self.search_text_map = result["search_text_map"]
         self.attributes = ["全部"] + sorted(set(v for v in self.attr_map.values() if v))
         self.families = ["全部"] + sorted(set(v for v in self.family_map.values() if v))
         self._refresh_filter_widget_values()
@@ -835,7 +922,11 @@ class DesktopBPApp:
             return None
 
         try:
-            image = Image.open(image_path).convert("RGBA")
+            if isinstance(image_path, str) and image_path.startswith(("http://", "https://")):
+                with urllib.request.urlopen(image_path, timeout=15) as response:
+                    image = Image.open(io.BytesIO(response.read())).convert("RGBA")
+            else:
+                image = Image.open(image_path).convert("RGBA")
             image = ImageOps.fit(image, size, method=Image.Resampling.LANCZOS)
             photo = ImageTk.PhotoImage(image)
         except Exception:
@@ -988,7 +1079,11 @@ class DesktopBPApp:
         if len(self.my_picks) == 5 and len(self.enemy_picks) == 5:
             return "ban" if not self.my_final_ban else None
 
-        stage = infer_bp_stage(self.my_picks, self.enemy_picks)
+        stage = infer_bp_stage(
+            self.my_picks,
+            self.enemy_picks,
+            self.first_pick_var.get(),
+        )
         if stage in {"pick_single", "pick_multi"}:
             side = self._current_pick_side()
             if side == "my":
@@ -1252,7 +1347,11 @@ class DesktopBPApp:
 
         if search_text:
             search_text = search_text.strip().lower()
-            monsters = [m for m in monsters if search_text in m.lower()]
+            monsters = [
+                m
+                for m in monsters
+                if search_text in self.search_text_map.get(m, m.lower())
+            ]
 
         if attr_filter != "全部":
             monsters = [m for m in monsters if self.attr_map.get(m) == attr_filter]
@@ -1688,6 +1787,18 @@ class DesktopBPApp:
         side_label = "我方" if side == "my" else "敌方"
         self.add_unique(side, monster, status_text=f"已将 {monster} 填入{side_label}第 {order} 手")
 
+    def _resolve_monster_name(self, value):
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        resolved = self.alias_lookup.get(normalize_name(text))
+        if resolved:
+            return resolved
+        for monster in self.monster_pool:
+            if normalize_name(monster) == normalize_name(text):
+                return monster
+        return ""
+
     def add_unique(self, side, monster, status_text=None):
         target = self.my_picks if side == "my" else self.enemy_picks
         if monster in target:
@@ -1715,7 +1826,11 @@ class DesktopBPApp:
         self._apply_bp_state_change("已清空当前 BP 状态")
 
     def apply_pick_plan(self, plan):
-        targets = [x for x in plan.get("plan", []) if x]
+        targets = [
+            self._resolve_monster_name(x) or str(x).strip()
+            for x in plan.get("plan", [])
+            if x
+        ]
         remain = 5 - len(self.my_picks)
         unique_targets = []
         for monster in targets:
@@ -1735,9 +1850,14 @@ class DesktopBPApp:
         self._apply_bp_state_change(f"已采用推荐方案：{joined}")
 
     def apply_enemy_prediction(self, prediction):
-        targets = [x for x in prediction.get("plan") or prediction.get("monsters") or [] if x]
+        targets = [
+            self._resolve_monster_name(x) or str(x).strip()
+            for x in (prediction.get("plan") or prediction.get("monsters") or [])
+            if x
+        ]
         if not targets and prediction.get("monster"):
-            targets = [prediction.get("monster")]
+            target = self._resolve_monster_name(prediction.get("monster"))
+            targets = [target or str(prediction.get("monster")).strip()]
         remain = 5 - len(self.enemy_picks)
         unique_targets = []
         for monster in targets:
@@ -1764,7 +1884,11 @@ class DesktopBPApp:
         if not self._ensure_core_data_ready(silent=silent):
             return False
         turn = infer_turn_from_state(self.my_picks, self.enemy_picks, self.first_pick_var.get())
-        stage = infer_bp_stage(self.my_picks, self.enemy_picks)
+        stage = infer_bp_stage(
+            self.my_picks,
+            self.enemy_picks,
+            self.first_pick_var.get(),
+        )
         if stage not in {"pick_single", "pick_multi"} or turn is None:
             if not silent:
                 messagebox.showinfo("Notice", "It is not my pick turn right now.")
@@ -1911,7 +2035,11 @@ class DesktopBPApp:
     def generate_enemy_predictions(self, silent=False):
         if not self._ensure_core_data_ready(silent=silent):
             return False
-        stage = infer_bp_stage(self.my_picks, self.enemy_picks)
+        stage = infer_bp_stage(
+            self.my_picks,
+            self.enemy_picks,
+            self.first_pick_var.get(),
+        )
         current_side = self._current_pick_side()
         if stage not in {"pick_single", "pick_multi"} or current_side != "enemy":
             if not silent:
@@ -1923,6 +2051,12 @@ class DesktopBPApp:
             "enemy_picks": list(self.enemy_picks),
             "turn": len(self.my_picks) + len(self.enemy_picks) + 1,
             "first_pick_side": self.first_pick_var.get(),
+            "pick_count": infer_pick_count_for_side(
+                self.my_picks,
+                self.enemy_picks,
+                self.first_pick_var.get(),
+                "enemy",
+            ),
             "top_k": max(1, int(self.top_k_var.get())),
             "candidate_pool": list(self.build_candidate_pool()),
             "my_leader": self.my_leader_var.get().strip(),
@@ -1936,6 +2070,7 @@ class DesktopBPApp:
                 my_picks=state_snapshot["my_picks"],
                 enemy_picks=state_snapshot["enemy_picks"],
                 first_pick_side=state_snapshot["first_pick_side"],
+                pick_count=state_snapshot["pick_count"],
                 top_k=(
                     state_snapshot["top_k"] * 4
                     if self._prefix_value_model_bundle_ready()

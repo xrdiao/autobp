@@ -7,6 +7,7 @@ from pathlib import Path
 DATASET_DIR = "dataset"
 IMAGES_DIR = "images"
 OUTPUT_PATH = "json//monster_images.json"
+LUCK_CATALOG_PATH = "json//lucksack_monster_catalog.json"
 MISSING_REPORT_PATH = "json//missing_images_report.json"
 
 # 只接受 unit_icon 开头的图片
@@ -70,6 +71,53 @@ def image_src_to_images_path(src: str):
 
     return os.path.join(IMAGES_DIR, filename).replace("\\", "/")
 
+
+def lucksack_image_url(value):
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith(("http://", "https://")):
+        return raw
+    return f"https://static.lucksack.gg/images/monsters/{raw.lstrip('/')}"
+
+
+def load_existing_image_map():
+    for path in (OUTPUT_PATH,):
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                value = json.load(f)
+            if isinstance(value, dict):
+                return value
+        except (OSError, json.JSONDecodeError):
+            pass
+    return {}
+
+
+def load_lucksack_image_map():
+    if not os.path.exists(LUCK_CATALOG_PATH):
+        return {}
+    try:
+        with open(LUCK_CATALOG_PATH, "r", encoding="utf-8") as f:
+            catalog = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(catalog, list):
+        return {}
+    result = {}
+    for item in catalog:
+        name = str(
+            item.get("slabel")
+            or item.get("label")
+            or item.get("slug")
+            or ""
+        ).strip()
+        image = lucksack_image_url(item.get("image"))
+        if name and image:
+            result.setdefault(name, image)
+    return result
+
 def parse_html_file(html_path: str):
     with open(html_path, "r", encoding="utf-8") as f:
         html = f.read()
@@ -125,7 +173,9 @@ def parse_html_file(html_path: str):
     return image_map, missing_files, skipped_non_unit_icon
 
 def rebuild_monster_images():
-    final_map = {}
+    final_map = load_existing_image_map()
+    for name, image in load_lucksack_image_map().items():
+        final_map.setdefault(name, image)
     all_missing = []
     total_skipped_non_unit_icon = 0
     html_count = 0

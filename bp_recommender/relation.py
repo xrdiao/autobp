@@ -12,6 +12,7 @@ from bp_core.relation_common import (
     MonsterVocab,
     encode_pick_list,
     infer_pick_count,
+    infer_pick_count_for_side,
     valid_vocab_slugs,
 )
 from bp_core.transformer_common import PAD_TOKEN, PROJECT_ROOT, UNK_TOKEN, normalize_name, slugify_fallback
@@ -790,11 +791,18 @@ class BPRelationRecommender:
         candidate_pool=None,
         max_pair_candidates=400,
         preserve_evidence=False,
+        pick_count=None,
         **_unused,
     ):
         turn = len(my_picks or []) + len(enemy_picks or []) + 1
         swapped_first_pick_side = self._swap_first_pick_side(first_pick_side)
-        pick_count = infer_pick_count(enemy_picks, my_picks, swapped_first_pick_side)
+        if pick_count is None:
+            pick_count = infer_pick_count_for_side(
+                my_picks,
+                enemy_picks,
+                first_pick_side,
+                "enemy",
+            )
         plans = self.recommend_pick_plans(
             my_picks=enemy_picks,
             enemy_picks=my_picks,

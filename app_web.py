@@ -14,7 +14,7 @@ from bp_core.account_profile import load_account_profile
 from bp_core.draft_state import DraftState
 from bp_recommender.decision_engine import BPDecisionEngine
 from bp_core.lucksack_stats import BPLucksackStats
-from bp_core.relation_common import infer_pick_count
+from bp_core.relation_common import infer_pick_count, infer_pick_count_for_side
 from bp_recommender.relation import BPRelationRecommender
 from bp_core.transformer_common import normalize_name, slugify_fallback
 
@@ -32,6 +32,7 @@ BP_ICON_PICKER = components.declare_component(
 MY_BOX_PATH = JSON_DIR / "my_box.json"
 ACCOUNT_PROFILE_PATH = JSON_DIR / "account_profile.json"
 IMAGE_MAP_PATH = JSON_DIR / "monster_images.json"
+ALIAS_MAP_PATH = JSON_DIR / "monster_alias_map.json"
 ATTR_MAP_PATH = JSON_DIR / "monster_attributes.json"
 FAMILY_MAP_PATH = JSON_DIR / "monster_families.json"
 SAMPLES_DB_PATH = DATA_DIR / "bp_samples.sqlite"
@@ -84,6 +85,28 @@ def bundle_ready(bundle):
     return all(Path(path).exists() for path in bundle)
 
 
+def asset_cache_stamp():
+    paths = (
+        IMAGE_MAP_PATH,
+        ALIAS_MAP_PATH,
+        ATTR_MAP_PATH,
+        FAMILY_MAP_PATH,
+        LUCK_STATS_PATH,
+        LUCK_CATALOG_PATH,
+        SWKIT_ALIAS_PATH,
+        MY_BOX_PATH,
+    )
+    return tuple(
+        (
+            str(path),
+            int(path.stat().st_mtime_ns),
+            int(path.stat().st_size),
+        )
+        for path in paths
+        if path.exists()
+    )
+
+
 def select_relation_bundle():
     for label, model_path, meta_path, vocab_path in RELATION_BUNDLES:
         if bundle_ready((model_path, meta_path, vocab_path)):
@@ -111,6 +134,32 @@ def value_variants(value):
         normalize_key(text.replace(" ", "-")),
         normalize_key(slugify_fallback(text)),
     }
+
+
+def lucksack_image_url(value):
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith(("http://", "https://")):
+        return raw
+    return f"https://static.lucksack.gg/images/monsters/{raw.lstrip('/')}"
+
+
+def resolve_option_name(value, assets):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    alias_lookup = assets.get("alias_lookup") or {}
+    for variant in value_variants(text):
+        resolved = alias_lookup.get(variant)
+        if resolved:
+            return resolved
+    options = assets.get("options") or []
+    normalized = normalize_name(text)
+    for option in options:
+        if normalize_name(option) == normalized:
+            return option
+    return ""
 
 
 def resolve_image_path(value):
@@ -208,11 +257,14 @@ def build_monster_options(vocab, display_name_map, frequency_map, fallback_names
 
 
 @st.cache_data(show_spinner=False)
-def load_web_assets():
+def load_web_assets(asset_stamp=None):
     relation_bundle = select_relation_bundle()
     relation_meta = read_json(relation_bundle["meta_path"], {}) if relation_bundle else {}
     relation_vocab = read_json(relation_bundle["vocab_path"], {}) if relation_bundle else {}
     image_map = read_json(IMAGE_MAP_PATH, {})
+    generated_alias_map = read_json(ALIAS_MAP_PATH, {})
+    if not isinstance(generated_alias_map, dict):
+        generated_alias_map = {}
     attr_map = read_json(ATTR_MAP_PATH, {})
     family_map = read_json(FAMILY_MAP_PATH, {})
     luck_stats = BPLucksackStats(stats_path=LUCK_STATS_PATH, catalog_path=LUCK_CATALOG_PATH)
@@ -225,8 +277,24 @@ def load_web_assets():
     remote_catalog = luck_stats.catalog if isinstance(luck_stats.catalog, list) else []
     remote_image_map = {}
     remote_names = set()
-    alias_map = {}
+    alias_sets = {}
     catalog_slugs = set()
+
+    def add_aliases(display_name, *values):
+        display_name = str(display_name or "").strip()
+        if not display_name:
+            return
+        aliases = alias_sets.setdefault(display_name, set())
+        for value in values:
+            if isinstance(value, (list, tuple, set)):
+                values_to_add = value
+            else:
+                values_to_add = (value,)
+            for alias in values_to_add:
+                alias = str(alias or "").strip()
+                if alias:
+                    aliases.add(alias)
+
     for item in remote_catalog:
         if not item.get("searchable", True) or int(item.get("natural_stars") or 0) < 4:
             continue
@@ -235,14 +303,28 @@ def load_web_assets():
         if not display_name:
             continue
         remote_names.add(display_name)
+        add_aliases(
+            display_name,
+            item.get("slug"),
+            item.get("label"),
+            item.get("slabel"),
+            item.get("com2us_id"),
+        )
         unit_id = str(item.get("com2us_id") or "")
         aliases = (swkit_alias_data.get("aliases_by_id") or {}).get(unit_id, [])
-        if aliases:
-            alias_map[display_name] = sorted(set(str(alias) for alias in aliases if str(alias).strip()))
+        add_aliases(display_name, aliases)
         image_name = str(item.get("image") or "").strip()
         if image_name:
-            remote_image_map[display_name] = f"https://static.lucksack.gg/images/monsters/{image_name}"
+            remote_image_map[display_name] = lucksack_image_url(image_name)
         attr_map.setdefault(display_name, str(item.get("element") or ""))
+        family = str(
+            item.get("family")
+            or item.get("family_name")
+            or item.get("familyName")
+            or ""
+        ).strip()
+        if family:
+            family_map.setdefault(display_name, family)
 
     for slug in luck_stats.candidate_slugs():
         if slug in catalog_slugs:
@@ -251,11 +333,14 @@ def load_web_assets():
         if not display_name:
             continue
         remote_names.add(display_name)
+        add_aliases(display_name, slug)
         image_name = luck_stats.to_image_name(slug)
         if image_name:
-            remote_image_map[display_name] = (
-                f"https://static.lucksack.gg/images/monsters/{image_name}"
-            )
+            remote_image_map[display_name] = lucksack_image_url(image_name)
+
+    for alias, display_name in (generated_alias_map or {}).items():
+        add_aliases(display_name, alias)
+        remote_names.add(str(display_name).strip())
 
     fallback_names = (
         set(image_map)
@@ -279,6 +364,47 @@ def load_web_assets():
             if normalize_name(name) in owned_slugs
         ]
     my_box = [name for name in my_box if name in option_set]
+    option_lookup = {}
+    for option in options:
+        for variant in value_variants(option):
+            option_lookup.setdefault(variant, option)
+    alias_lookup = dict(option_lookup)
+    for display_name, aliases in alias_sets.items():
+        target = ""
+        for variant in value_variants(display_name):
+            target = option_lookup.get(variant, "")
+            if target:
+                break
+        if not target:
+            continue
+        for alias in aliases:
+            for variant in value_variants(alias):
+                alias_lookup.setdefault(variant, target)
+    normalized_box = []
+    for value in my_box:
+        target = next(
+            (alias_lookup.get(variant) for variant in value_variants(value) if alias_lookup.get(variant)),
+            "",
+        )
+        if target and target not in normalized_box:
+            normalized_box.append(target)
+    my_box = normalized_box
+    alias_map_sets = {}
+    for display_name, aliases in alias_sets.items():
+        target = next(
+            (
+                option_lookup.get(variant)
+                for variant in value_variants(display_name)
+                if option_lookup.get(variant)
+            ),
+            "",
+        )
+        if target:
+            alias_map_sets.setdefault(target, set()).update(aliases)
+    alias_map = {
+        target: sorted(aliases)
+        for target, aliases in alias_map_sets.items()
+    }
     search_text_map = {
         name: " ".join(
             [name, slugify_fallback(name)]
@@ -311,6 +437,7 @@ def load_web_assets():
         "attr_map": attr_map,
         "family_map": family_map,
         "alias_map": alias_map,
+        "alias_lookup": alias_lookup,
         "search_text_map": search_text_map,
         "attributes": ["全部"] + sorted({str(value) for value in attr_map.values() if str(value).strip()}),
         "families": ["全部"] + sorted({str(value) for value in family_map.values() if str(value).strip()}),
@@ -439,9 +566,21 @@ def initialize_state(assets):
         st.session_state.setdefault(key, value)
 
     options = set(assets["options"])
-    st.session_state.my_picks = [item for item in st.session_state.my_picks if item in options]
-    st.session_state.enemy_picks = [item for item in st.session_state.enemy_picks if item in options]
-    st.session_state.my_box = [item for item in st.session_state.my_box if item in options]
+    st.session_state.my_picks = clean_picker_values(
+        st.session_state.my_picks,
+        options,
+        assets,
+    )
+    st.session_state.enemy_picks = clean_picker_values(
+        st.session_state.enemy_picks,
+        options,
+        assets,
+    )
+    st.session_state.my_box = clean_picker_values(
+        st.session_state.my_box,
+        options,
+        assets,
+    )
     valid_rank_groups = {item["id"] for item in assets.get("rank_groups", [])}
     if st.session_state.rank_group not in valid_rank_groups:
         st.session_state.rank_group = assets.get("default_rank_group", "102")
@@ -457,15 +596,21 @@ def clear_results():
     st.session_state.ban_results = None
 
 
-def apply_recommendation_plan(result_type, monsters, options):
+def apply_recommendation_plan(result_type, monsters, assets):
     target = st.session_state.my_picks if result_type == "pick" else st.session_state.enemy_picks
+    options = set(assets.get("options") or [])
     occupied = set(st.session_state.my_picks) | set(st.session_state.enemy_picks)
-    for monster in monsters:
+    added = 0
+    for raw_monster in monsters:
+        monster = resolve_option_name(raw_monster, assets)
         if monster not in options or len(target) >= 5 or monster in occupied:
             continue
         target.append(monster)
         occupied.add(monster)
-    clear_results()
+        added += 1
+    if added:
+        clear_results()
+    return added
 
 
 def save_my_box():
@@ -594,13 +739,21 @@ def calculate_enemy_recommendations(assets):
     my_picks = list(st.session_state.my_picks)
     enemy_picks = list(st.session_state.enemy_picks)
     turn = len(my_picks) + len(enemy_picks) + 1
+    first_pick_side = st.session_state.first_pick_side
+    pick_count = infer_pick_count_for_side(
+        my_picks,
+        enemy_picks,
+        first_pick_side,
+        "enemy",
+    )
     prefix_model = get_prefix_model(assets)
     relation_model = get_relation_model(assets)
     top_k = int(st.session_state.top_k)
     predictions = relation_model.recommend_enemy_next_picks(
         my_picks=my_picks,
         enemy_picks=enemy_picks,
-        first_pick_side=st.session_state.first_pick_side,
+        first_pick_side=first_pick_side,
+        pick_count=pick_count,
         top_k=(
             top_k * LOOKAHEAD_PLAN_MULTIPLIER
             if prefix_model is not None
@@ -617,7 +770,7 @@ def calculate_enemy_recommendations(assets):
         enemy_picks=tuple(enemy_picks),
         my_leader=st.session_state.my_leader,
         enemy_leader=st.session_state.enemy_leader,
-        first_pick_side=st.session_state.first_pick_side,
+        first_pick_side=first_pick_side,
         turn=turn,
     ).to_runtime_dict()
     state.update(
@@ -625,7 +778,7 @@ def calculate_enemy_recommendations(assets):
             "my_box": list(st.session_state.my_box),
             "use_my_box": bool(st.session_state.use_my_box),
             "max_pair_candidates": int(st.session_state.max_pair_candidates),
-            "current_side": side_for_turn(turn, st.session_state.first_pick_side),
+            "current_side": side_for_turn(turn, first_pick_side),
         }
     )
     return rerank_enemy_plans(
@@ -713,11 +866,11 @@ def build_picker_payload(monsters, assets):
     ], state_items
 
 
-def clean_picker_values(values, options):
+def clean_picker_values(values, options, assets=None):
     cleaned = []
     seen = set()
     for value in values or []:
-        monster = str(value or "")
+        monster = resolve_option_name(value, assets or {"options": list(options)})
         if monster in options and monster not in seen:
             cleaned.append(monster)
             seen.add(monster)
@@ -734,21 +887,23 @@ def apply_picker_value(value, assets):
         return False
 
     options = set(assets["options"])
-    my_picks = clean_picker_values(value.get("my_picks"), options)
-    enemy_picks = clean_picker_values(value.get("enemy_picks"), options)
+    my_picks = clean_picker_values(value.get("my_picks"), options, assets)
+    enemy_picks = clean_picker_values(value.get("enemy_picks"), options, assets)
     my_set = set(my_picks)
     enemy_picks = [monster for monster in enemy_picks if monster not in my_set]
 
     st.session_state.my_picks = my_picks
     st.session_state.enemy_picks = enemy_picks
+    my_leader = resolve_option_name(value.get("my_leader"), assets)
+    enemy_leader = resolve_option_name(value.get("enemy_leader"), assets)
     st.session_state.my_leader = (
-        str(value.get("my_leader", "") or "")
-        if str(value.get("my_leader", "") or "") in my_picks
+        my_leader
+        if my_leader in my_picks
         else ""
     )
     st.session_state.enemy_leader = (
-        str(value.get("enemy_leader", "") or "")
-        if str(value.get("enemy_leader", "") or "") in enemy_picks
+        enemy_leader
+        if enemy_leader in enemy_picks
         else ""
     )
     st.session_state.picker_event_id = event_id
@@ -1135,8 +1290,10 @@ def render_result_card(index, item, assets, result_type):
             type="primary",
             use_container_width=True,
         ):
-            apply_recommendation_plan(result_type, monsters, set(assets["options"]))
-            st.rerun(scope="fragment")
+            added = apply_recommendation_plan(result_type, monsters, assets)
+            if added:
+                st.rerun(scope="fragment")
+            st.warning("没有新的魔灵被加入 BP 状态，请检查当前空位和别称映射。")
     if st.session_state.show_details and detail:
         with st.expander("模型明细", expanded=False):
             st.json(detail)
@@ -1504,7 +1661,7 @@ def main():
         unsafe_allow_html=True,
     )
 
-    assets = load_web_assets()
+    assets = load_web_assets(asset_cache_stamp())
     initialize_state(assets)
     sample_count = load_sample_count(str(SAMPLES_DB_PATH))
 

@@ -20,6 +20,7 @@ API_BASE = "https://api.lucksack.gg"
 CATALOG_URL = "https://static.lucksack.gg/data/monsters_catalog.json"
 DEFAULT_STATS_PATH = PROJECT_ROOT / "json" / "lucksack_stats.json"
 DEFAULT_CATALOG_PATH = PROJECT_ROOT / "json" / "lucksack_monster_catalog.json"
+DEFAULT_IMAGE_MAP_PATH = PROJECT_ROOT / "json" / "monster_images.json"
 DEFAULT_COMBO_LIMIT = 2000
 STATISTICS_LIMIT = 10000
 DEFAULT_GROUP_CONCURRENCY = 2
@@ -32,6 +33,35 @@ def save_json(data, path):
     with open(temp_path, "w", encoding="utf-8") as file:
         json.dump(data, file, ensure_ascii=False, indent=2)
     temp_path.replace(path)
+
+
+def update_image_map_from_catalog(catalog, image_map_path=DEFAULT_IMAGE_MAP_PATH):
+    image_map_path = Path(image_map_path)
+    existing = {}
+    if image_map_path.exists():
+        try:
+            with open(image_map_path, "r", encoding="utf-8") as file:
+                value = json.load(file)
+            if isinstance(value, dict):
+                existing = value
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+
+    for item in catalog or []:
+        name = str(
+            item.get("slabel")
+            or item.get("label")
+            or item.get("slug")
+            or ""
+        ).strip()
+        image = str(item.get("image") or "").strip()
+        if not name or not image:
+            continue
+        if not image.startswith(("http://", "https://")):
+            image = f"https://static.lucksack.gg/images/monsters/{image.lstrip('/')}"
+        existing.setdefault(name, image)
+    save_json(existing, image_map_path)
+    return existing
 
 
 async def fetch_json(page, url):
@@ -264,8 +294,10 @@ async def sync_lucksack_data(
     )
     save_json(snapshot, stats_path)
     save_json(snapshot["catalog"], catalog_path)
+    image_map = update_image_map_from_catalog(snapshot["catalog"])
     print(f"[OK] saved stats: {stats_path}")
     print(f"[OK] saved catalog: {catalog_path} ({len(snapshot['catalog'])} entries)")
+    print(f"[OK] completed image map: {DEFAULT_IMAGE_MAP_PATH} ({len(image_map)} entries)")
     print(
         "[OK] season="
         f"{snapshot['season'].get('season_number')} "
