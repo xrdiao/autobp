@@ -8,7 +8,11 @@ import time
 from collections import Counter
 from pathlib import Path
 
-from bp_core.transformer_common import normalize_name, slugify_fallback
+from bp_core.action_space import validate_timeline
+from bp_core.names import normalize_name, slugify_name
+
+
+PICK_SIDE_PATTERN = ("me", "enemy", "enemy", "me", "me", "enemy", "enemy", "me", "me", "enemy")
 
 
 def load_json(path, default=None):
@@ -24,27 +28,6 @@ def save_json(data, path, *, indent=None):
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=indent, separators=None if indent else (",", ":"))
-    tmp_path.replace(path)
-
-
-def load_pt(path, default=None):
-    if not os.path.exists(path):
-        return [] if default is None else default
-    import torch
-
-    try:
-        return torch.load(path, map_location="cpu", weights_only=False)
-    except TypeError:
-        return torch.load(path, map_location="cpu")
-
-
-def save_pt(data, path):
-    import torch
-
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    torch.save(data, tmp_path)
     tmp_path.replace(path)
 
 
@@ -197,7 +180,7 @@ class NameResolver:
         for slug, display_name in self.display_name_map.items():
             self.alias_map.setdefault(slug, slug)
             self.alias_map.setdefault(normalize_name(display_name), slug)
-            self.alias_map.setdefault(slugify_fallback(display_name), slug)
+            self.alias_map.setdefault(slugify_name(display_name), slug)
 
     def to_slug(self, value):
         cache_key = "" if value is None else str(value)
@@ -208,17 +191,16 @@ class NameResolver:
         if not normalized:
             self._slug_cache[cache_key] = ""
             return ""
-        fallback = slugify_fallback(value)
-        sanitized_fallback = fallback.replace("[", "").replace("]", "")
-        for key in (normalized, fallback, sanitized_fallback):
+        generated = slugify_name(value)
+        sanitized = generated.replace("[", "").replace("]", "")
+        for key in (normalized, generated, sanitized):
             resolved = self.alias_map.get(key)
             if resolved:
                 result = normalize_name(resolved)
                 self._slug_cache[cache_key] = result
                 return result
-        result = sanitized_fallback or fallback or normalized
-        self._slug_cache[cache_key] = result
-        return result
+        self._slug_cache[cache_key] = ""
+        return ""
 
     def normalize_slug_list(self, values):
         return [slug for slug in (self.to_slug(value) for value in (values or [])) if slug]
@@ -233,32 +215,53 @@ def _record_name_slug_pair(alias_counters, display_counters, name, slug):
     slug_text = normalize_name(slug)
     if not name_text or not slug_text:
         return
-    for key in {normalize_name(name_text), slugify_fallback(name_text), slug_text}:
+    for key in {normalize_name(name_text), slugify_name(name_text), slug_text}:
         if key:
             alias_counters.setdefault(key, Counter())[slug_text] += 1
-    display_counters.setdefault(slug_text, Counter())[name_text] += 1
+    if normalize_name(name_text) != slug_text:
+        display_counters.setdefault(slug_text, Counter())[name_text] += 1
 
 
 def build_name_resolution_resources(samples):
     alias_counters = {}
     display_counters = {}
 
-    def record_paired_lists(names, slugs):
-        for name, slug in zip(names or [], slugs or []):
-            _record_name_slug_pair(alias_counters, display_counters, name, slug)
-
     for sample in samples or []:
-        _record_name_slug_pair(alias_counters, display_counters, sample.get("next_pick"), sample.get("next_pick_slug"))
-        _record_name_slug_pair(alias_counters, display_counters, sample.get("my_ban"), sample.get("my_ban_slug"))
-        _record_name_slug_pair(alias_counters, display_counters, sample.get("enemy_ban"), sample.get("enemy_ban_slug"))
-        _record_name_slug_pair(alias_counters, display_counters, sample.get("my_leader"), sample.get("my_leader_slug"))
-        _record_name_slug_pair(alias_counters, display_counters, sample.get("enemy_leader"), sample.get("enemy_leader_slug"))
-        record_paired_lists(sample.get("my_picks"), sample.get("my_picks_slugs"))
-        record_paired_lists(sample.get("enemy_picks"), sample.get("enemy_picks_slugs"))
-        record_paired_lists(sample.get("remaining_my_picks"), sample.get("remaining_my_pick_slugs"))
-        record_paired_lists(sample.get("remaining_enemy_picks"), sample.get("remaining_enemy_pick_slugs"))
-        record_paired_lists(sample.get("final_my_picks"), sample.get("final_my_pick_slugs"))
-        record_paired_lists(sample.get("final_enemy_picks"), sample.get("final_enemy_pick_slugs"))
+        # ``full_events`` is the authoritative name source.  ``events`` is
+        # always a prefix of it, so scanning it again only multiplies the
+        # resolver work without adding aliases.
+        full_events = sample.get("full_events")
+        if not isinstance(full_events, (list, tuple)):
+            raise ValueError("样本缺少 canonical full_events")
+        for raw_event in full_events:
+            if not isinstance(raw_event, dict):
+                raise ValueError("full_events 中存在非法事件")
+            slugs = raw_event.get("monsters")
+            if not isinstance(slugs, (list, tuple)):
+                raise ValueError("full_events 事件缺少 monsters")
+            names = raw_event.get("monster_names") or ()
+            for index, slug in enumerate(slugs):
+                name = names[index] if index < len(names) else slug
+                _record_name_slug_pair(alias_counters, display_counters, name, slug)
+        next_action = sample.get("next_action_slugs")
+        if not isinstance(next_action, (list, tuple)):
+            raise ValueError("样本缺少 canonical next_action_slugs")
+        for slug in next_action:
+            _record_name_slug_pair(alias_counters, display_counters, slug, slug)
+        _record_name_slug_pair(
+            alias_counters,
+            display_counters,
+            sample.get("ban_name"),
+            sample.get("ban_slug"),
+        )
+        for leader_key in ("my_leader", "enemy_leader"):
+            slug_key = f"{leader_key}_slug"
+            _record_name_slug_pair(
+                alias_counters,
+                display_counters,
+                sample.get(leader_key),
+                sample.get(slug_key),
+            )
 
     name_slug_aliases = {key: counter.most_common(1)[0][0] for key, counter in alias_counters.items() if counter}
     display_name_map = {slug: counter.most_common(1)[0][0] for slug, counter in display_counters.items() if counter}
@@ -269,23 +272,143 @@ def build_name_resolution_resources(samples):
     }
 
 
-def normalize_relation_sample(sample, resolver):
+def normalize_bp_sample(sample, resolver):
     item = dict(sample)
-    item["my_picks_slugs"] = list(item.get("my_picks_slugs") or resolver.normalize_slug_list(item.get("my_picks")))
-    item["enemy_picks_slugs"] = list(item.get("enemy_picks_slugs") or resolver.normalize_slug_list(item.get("enemy_picks")))
-    item["next_pick_slug"] = item.get("next_pick_slug") or resolver.to_slug(item.get("next_pick"))
-    item["my_ban_slug"] = item.get("my_ban_slug") or resolver.to_slug(item.get("my_ban"))
-    item["enemy_ban_slug"] = item.get("enemy_ban_slug") or resolver.to_slug(item.get("enemy_ban"))
-    item["my_leader_slug"] = item.get("my_leader_slug") or resolver.to_slug(item.get("my_leader"))
-    item["enemy_leader_slug"] = item.get("enemy_leader_slug") or resolver.to_slug(item.get("enemy_leader"))
-    item["remaining_my_pick_slugs"] = list(
-        item.get("remaining_my_pick_slugs") or resolver.normalize_slug_list(item.get("remaining_my_picks"))
-    )
-    item["remaining_enemy_pick_slugs"] = list(
-        item.get("remaining_enemy_pick_slugs") or resolver.normalize_slug_list(item.get("remaining_enemy_picks"))
-    )
-    item["final_my_pick_slugs"] = list(item.get("final_my_pick_slugs") or resolver.normalize_slug_list(item.get("final_my_picks")))
-    item["final_enemy_pick_slugs"] = list(
-        item.get("final_enemy_pick_slugs") or resolver.normalize_slug_list(item.get("final_enemy_picks"))
-    )
+
+    required = ("events", "full_events", "next_action_slugs", "turn", "first_pick_side", "current_side")
+    missing = [key for key in required if key not in item]
+    if missing:
+        raise ValueError(f"样本缺少 canonical 字段: {', '.join(missing)}")
+
+    def normalize_events(raw_events, field_name, *, require_nonempty):
+        if not isinstance(raw_events, (list, tuple)):
+            raise ValueError(f"样本缺少 canonical {field_name} 事件列表")
+        if require_nonempty and not raw_events:
+            raise ValueError(f"样本的 {field_name} 不能为空")
+        normalized = []
+        for index, raw_event in enumerate(raw_events, start=1):
+            if not isinstance(raw_event, dict):
+                raise ValueError(f"{field_name}[{index}] 不是事件对象")
+            event = dict(raw_event)
+            raw_values = event.get("monsters")
+            if not isinstance(raw_values, (list, tuple)) or not raw_values:
+                raise ValueError(f"{field_name}[{index}] 缺少 monsters")
+            values = resolver.normalize_slug_list(raw_values)
+            if len(values) != len(raw_values) or len(values) not in {1, 2}:
+                raise ValueError(f"{field_name}[{index}] 包含未解析或非法数量的魔灵")
+            event["monsters"] = values
+            if normalize_name(event.get("action_type") or "pick") != "pick":
+                raise ValueError(f"{field_name}[{index}] 不是 pick 事件")
+            event["action_type"] = "pick"
+            event["side"] = normalize_name(event.get("side"))
+            if event["side"] not in {"me", "enemy"}:
+                raise ValueError(f"{field_name}[{index}] side 无效")
+            event["order"] = index
+            event["is_pair"] = len(values) == 2
+            names = event.get("monster_names") or []
+            event["monster_names"] = [
+                str(names[name_index]).strip()
+                if name_index < len(names) and names[name_index]
+                else value
+                for name_index, value in enumerate(values)
+            ]
+            normalized.append(event)
+        return normalized
+
+    item["events"] = normalize_events(item["events"], "events", require_nonempty=False)
+    item["full_events"] = normalize_events(item["full_events"], "full_events", require_nonempty=True)
+
+    first_pick_side = normalize_name(item["first_pick_side"])
+    current_side = normalize_name(item["current_side"])
+    if first_pick_side not in {"me", "enemy"}:
+        raise ValueError("first_pick_side 必须是 me 或 enemy")
+    if current_side not in {"me", "enemy"}:
+        raise ValueError("current_side 必须是 me 或 enemy")
+    try:
+        turn = int(item["turn"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("turn 必须是整数") from exc
+    if turn < 1 or turn > 10:
+        raise ValueError("训练样本 turn 必须位于 1 到 10")
+
+    prefix_timeline = _timeline_from_events(item["events"])
+    full_timeline = _timeline_from_events(item["full_events"])
+    validate_timeline(prefix_timeline, first_pick_side, allow_bans=False)
+    validate_timeline(full_timeline, first_pick_side, allow_bans=False, complete=True)
+    if full_timeline.slots_used != 10:
+        raise ValueError("full_events 必须完整包含十个 pick 槽位")
+    full_values = [normalize_name(value) for value in full_timeline.picks_for("me") + full_timeline.picks_for("enemy")]
+    if len(full_values) != 10 or not all(full_values) or len(set(full_values)) != 10:
+        raise ValueError("full_events 必须包含十个互不重复的魔灵")
+    slot = 1
+    for event in full_timeline.events:
+        for _monster in event.monsters:
+            if event.side != _side_for_pick_slot(slot, first_pick_side):
+                raise ValueError("full_events 的 side 顺序与 BP 轮次不一致")
+            slot += 1
+    if len(full_timeline.picks_for("me")) != 5 or len(full_timeline.picks_for("enemy")) != 5:
+        raise ValueError("full_events 必须让双方各有五个 pick")
+    if prefix_timeline.slots_used != turn - 1:
+        raise ValueError("events 前缀与 turn 不一致")
+    if len(prefix_timeline.events) >= len(full_timeline.events) and turn <= 10:
+        raise ValueError("events 必须在下一动作前截断")
+    for prefix_event, full_event in zip(prefix_timeline.events, full_timeline.events):
+        if prefix_event.canonical_key != full_event.canonical_key:
+            raise ValueError("events 不是 full_events 的严格前缀")
+    expected_side = _side_for_pick_slot(turn, first_pick_side)
+    if current_side != expected_side:
+        raise ValueError("current_side 与 turn/first_pick_side 不一致")
+
+    raw_next = item.get("next_action_slugs")
+    if not isinstance(raw_next, (list, tuple)) or len(raw_next) not in {1, 2}:
+        raise ValueError("样本缺少合法的 next_action_slugs")
+    item["next_action_slugs"] = resolver.normalize_slug_list(raw_next)
+    if len(item["next_action_slugs"]) != len(raw_next):
+        raise ValueError("next_action_slugs 包含未解析的魔灵")
+    if len(item["next_action_slugs"]) == 2:
+        item["next_action_slugs"] = sorted(item["next_action_slugs"])
+    next_event = _next_event_from_timeline(full_timeline, turn)
+    if next_event is None:
+        raise ValueError("full_events 中找不到 turn 对应的下一事件")
+    expected_action = tuple(normalize_name(value) for value in next_event.monsters)
+    if tuple(item["next_action_slugs"]) != expected_action:
+        raise ValueError("next_action_slugs 与 full_events 的下一事件不一致")
+    raw_ban = item.get("ban_slug")
+    item["ban_slug"] = resolver.to_slug(raw_ban) if raw_ban else ""
+    if raw_ban and not item["ban_slug"]:
+        raise ValueError("ban_slug 无法解析")
+    enemy_final = set(normalize_name(value) for value in full_timeline.picks_for("enemy"))
+    if item["ban_slug"] and item["ban_slug"] not in enemy_final:
+        raise ValueError("ban_slug 必须属于敌方最终阵容")
+    for leader_key in ("my_leader_slug", "enemy_leader_slug"):
+        raw_leader = item.get(leader_key)
+        item[leader_key] = resolver.to_slug(raw_leader) if raw_leader else ""
+        if raw_leader and not item[leader_key]:
+            raise ValueError(f"{leader_key} 无法解析")
+    if item["my_leader_slug"] and item["my_leader_slug"] not in set(full_timeline.picks_for("me")):
+        raise ValueError("my_leader_slug 必须属于我方最终阵容")
+    if item["enemy_leader_slug"] and item["enemy_leader_slug"] not in enemy_final:
+        raise ValueError("enemy_leader_slug 必须属于敌方最终阵容")
     return item
+
+
+def _timeline_from_events(events):
+    """Build a strict pick timeline after names have been resolved."""
+    from bp_core.action_space import DraftTimeline
+
+    return DraftTimeline(events)
+
+
+def _side_for_pick_slot(slot, first_pick_side):
+    if first_pick_side == "me":
+        return PICK_SIDE_PATTERN[int(slot) - 1]
+    return tuple("enemy" if side == "me" else "me" for side in PICK_SIDE_PATTERN)[int(slot) - 1]
+
+
+def _next_event_from_timeline(timeline, turn):
+    slots = 0
+    for event in timeline.events:
+        if slots + 1 == int(turn):
+            return event
+        slots += event.count
+    return None

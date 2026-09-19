@@ -491,20 +491,3 @@ def process_html_file(html_path: str, dataset_root=None, version_weights=None):
             dataset_matches.append(normalize_match_for_dataset(match, version_weights=version_weights))
 
     return raw_matches, dataset_matches
-
-
-if __name__ == "__main__":
-    import torch
-
-    html_path = "D:\\jupyter\\auto_bp\\dataset\\1.html"
-
-    raw_matches, dataset_matches = process_html_file(html_path)
-
-    output_dir = ROOT_DIR / "data"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(raw_matches, output_dir / "extract_match_raw_smoke.pt")
-    torch.save(dataset_matches, output_dir / "extract_match_dataset_smoke.pt")
-
-    print(f"raw matches: {len(raw_matches)}")
-    print(f"dataset matches: {len(dataset_matches)}")
-    print("saved: data/extract_match_raw_smoke.pt, data/extract_match_dataset_smoke.pt")

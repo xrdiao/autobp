@@ -2,10 +2,20 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from pathlib import Path
 
-
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from bp_core.lucksack_stats import (
+    build_catalog_display_name_map,
+    is_usable_catalog_item,
+)
+from bp_core.names import normalize_name
+
+
 JSON_DIR = PROJECT_ROOT / "json"
 CATALOG_PATH = JSON_DIR / "monster_catalog.json"
 LUCK_CATALOG_PATH = JSON_DIR / "lucksack_monster_catalog.json"
@@ -75,7 +85,10 @@ def _add_alias(alias_map, alias, standard_name):
     alias = str(alias or "").strip()
     standard_name = normalize_standard_name(standard_name)
     if alias and standard_name:
-        alias_map.setdefault(alias, standard_name)
+        if alias not in alias_map:
+            alias_map[alias] = standard_name
+        elif alias_map[alias] != standard_name:
+            alias_map[alias] = ""
 
 
 def _merge_entry(
@@ -123,6 +136,7 @@ def generate_alias_and_images(
     if not isinstance(swkit_alias_data, dict):
         swkit_alias_data = {}
 
+    luck_catalog_display_names = build_catalog_display_name_map(luck_catalog)
     entries = {}
     for source_entry in catalog:
         standard_name = normalize_standard_name(source_entry.get("base_name"))
@@ -143,15 +157,28 @@ def generate_alias_and_images(
 
     aliases_by_id = swkit_alias_data.get("aliases_by_id") or {}
     for source_entry in luck_catalog:
-        display_name = normalize_standard_name(
-            source_entry.get("slabel")
-            or source_entry.get("label")
-            or source_entry.get("slug")
+        if not is_usable_catalog_item(source_entry):
+            continue
+        slug = normalize_standard_name(source_entry.get("slug"))
+        display_name = luck_catalog_display_names.get(
+            slug,
+            normalize_standard_name(
+                source_entry.get("slabel")
+                or source_entry.get("label")
+                or source_entry.get("slug")
+            ),
         )
         if not display_name:
             continue
         unit_id = str(source_entry.get("com2us_id") or "").strip()
         aliases = list(make_aliases_for_entry(source_entry))
+        short_name = normalize_standard_name(source_entry.get("slabel"))
+        if short_name and normalize_name(short_name) != normalize_name(display_name):
+            aliases = [
+                alias
+                for alias in aliases
+                if normalize_name(alias) != normalize_name(short_name)
+            ]
         aliases.extend(aliases_by_id.get(unit_id, []))
         image = _lucksack_image_url(source_entry.get("image"))
         attribute = _first_value(
@@ -188,7 +215,11 @@ def generate_alias_and_images(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     outputs = {
-        "monster_alias_map.json": alias_map,
+        "monster_alias_map.json": {
+            alias: standard_name
+            for alias, standard_name in alias_map.items()
+            if standard_name
+        },
         "monster_images.json": image_map,
         "monster_attributes.json": attr_map,
         "monster_families.json": family_map,
@@ -197,7 +228,10 @@ def generate_alias_and_images(
         with open(output_dir / filename, "w", encoding="utf-8") as file:
             json.dump(payload, file, ensure_ascii=False, indent=2, sort_keys=True)
 
-    print(f"Saved monster_alias_map.json ({len(alias_map)} aliases)")
+    print(
+        f"Saved monster_alias_map.json "
+        f"({len(outputs['monster_alias_map.json'])} aliases)"
+    )
     print(f"Saved monster_images.json ({len(image_map)} images)")
     print(f"Saved monster_attributes.json ({len(attr_map)} attributes)")
     print(f"Saved monster_families.json ({len(family_map)} families)")

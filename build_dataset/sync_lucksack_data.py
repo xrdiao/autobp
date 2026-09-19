@@ -15,6 +15,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from bp_core.lucksack_stats import (
+    build_catalog_display_name_map,
+    is_usable_catalog_item,
+)
+
 ROOT_URL = "https://lucksack.gg/"
 API_BASE = "https://api.lucksack.gg"
 CATALOG_URL = "https://static.lucksack.gg/data/monsters_catalog.json"
@@ -47,13 +52,34 @@ def update_image_map_from_catalog(catalog, image_map_path=DEFAULT_IMAGE_MAP_PATH
         except (OSError, json.JSONDecodeError):
             existing = {}
 
+    display_names = build_catalog_display_name_map(catalog)
+    ambiguous_short_names = {
+        str(item.get("slabel") or "").strip()
+        for item in (catalog or [])
+        if is_usable_catalog_item(item)
+        and str(item.get("slabel") or "").strip()
+        and display_names.get(str(item.get("slug") or "").strip().lower())
+        != str(item.get("slabel") or "").strip()
+    }
+    existing = {
+        name: image
+        for name, image in existing.items()
+        if name not in ambiguous_short_names
+    }
+
     for item in catalog or []:
-        name = str(
-            item.get("slabel")
-            or item.get("label")
-            or item.get("slug")
-            or ""
-        ).strip()
+        if not is_usable_catalog_item(item):
+            continue
+        slug = str(item.get("slug") or "").strip().lower()
+        name = display_names.get(
+            slug,
+            str(
+                item.get("slabel")
+                or item.get("label")
+                or item.get("slug")
+                or ""
+            ).strip(),
+        )
         image = str(item.get("image") or "").strip()
         if not name or not image:
             continue

@@ -7,7 +7,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from bp_core.transformer_common import PROJECT_ROOT
+from bp_core.names import PROJECT_ROOT
 
 DEFAULT_MONSTER_IMAGE_MAP = PROJECT_ROOT / "json" / "monster_images.json"
 DEFAULT_MONSTER_CATALOG = PROJECT_ROOT / "json" / "lucksack_monster_catalog.json"

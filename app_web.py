@@ -9,14 +9,19 @@ from pathlib import Path
 import streamlit as st
 import streamlit.components.v1 as components
 
-from bp_recommender.ban_value import BPBanValueRecommender
 from bp_core.account_profile import load_account_profile
+from bp_core.action_space import timeline_from_picks
 from bp_core.draft_state import DraftState
 from bp_recommender.decision_engine import BPDecisionEngine
-from bp_core.lucksack_stats import BPLucksackStats
-from bp_core.relation_common import infer_pick_count, infer_pick_count_for_side
-from bp_recommender.relation import BPRelationRecommender
-from bp_core.transformer_common import normalize_name, slugify_fallback
+from bp_core.lucksack_stats import (
+    BPLucksackStats,
+    build_catalog_ambiguous_short_names,
+    is_usable_catalog_item,
+)
+from bp_core.bp_common import infer_pick_count, infer_pick_count_for_side, side_for_order
+from bp_recommender.shared import BPSharedRecommender
+from bp_core.names import normalize_name, slugify_name
+from streamlit.errors import StreamlitInvalidLayoutContextError
 
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -40,32 +45,13 @@ LUCK_STATS_PATH = JSON_DIR / "lucksack_stats.json"
 LUCK_CATALOG_PATH = JSON_DIR / "lucksack_monster_catalog.json"
 SWKIT_ALIAS_PATH = JSON_DIR / "swkit_monster_aliases.json"
 
-RELATION_BUNDLES = (
-    (
-        "relation v2",
-        MODEL_DIR / "bp_relation_net_v2.pt",
-        MODEL_DIR / "bp_relation_meta_v2.json",
-        MODEL_DIR / "bp_relation_vocab_v2.json",
-    ),
-    (
-        "relation legacy",
-        MODEL_DIR / "bp_relation_net.pt",
-        MODEL_DIR / "bp_relation_meta.json",
-        MODEL_DIR / "bp_relation_vocab.json",
-    ),
-)
-PREFIX_VALUE_BUNDLE = (
-    MODEL_DIR / "bp_prefix_value_net.pt",
-    MODEL_DIR / "bp_prefix_value_meta.json",
-    MODEL_DIR / "bp_prefix_value_vocab.json",
-)
-BAN_VALUE_BUNDLE = (
-    MODEL_DIR / "bp_draft_value_net.pt",
-    MODEL_DIR / "bp_draft_value_meta.json",
-    MODEL_DIR / "bp_draft_value_vocab.json",
+SHARED_BUNDLE = (
+    "Shared BP Core",
+    MODEL_DIR / "bp_shared.pt",
+    MODEL_DIR / "bp_shared_meta.json",
+    MODEL_DIR / "bp_shared_vocab.json",
 )
 
-TURN_PATTERN = ("me", "enemy", "enemy", "me", "me", "enemy", "enemy", "me", "me", "enemy")
 BP_GALLERY_COLUMNS = 17
 BP_GALLERY_PAGE_ROWS = 3
 BP_GALLERY_PAGE_SIZE = BP_GALLERY_COLUMNS * BP_GALLERY_PAGE_ROWS
@@ -85,6 +71,13 @@ def bundle_ready(bundle):
     return all(Path(path).exists() for path in bundle)
 
 
+def rerun_fragment_or_app():
+    try:
+        st.rerun(scope="fragment")
+    except StreamlitInvalidLayoutContextError:
+        st.rerun()
+
+
 def asset_cache_stamp():
     paths = (
         IMAGE_MAP_PATH,
@@ -95,6 +88,7 @@ def asset_cache_stamp():
         LUCK_CATALOG_PATH,
         SWKIT_ALIAS_PATH,
         MY_BOX_PATH,
+        *SHARED_BUNDLE[1:],
     )
     return tuple(
         (
@@ -107,16 +101,16 @@ def asset_cache_stamp():
     )
 
 
-def select_relation_bundle():
-    for label, model_path, meta_path, vocab_path in RELATION_BUNDLES:
-        if bundle_ready((model_path, meta_path, vocab_path)):
-            return {
-                "label": label,
-                "model_path": model_path,
-                "meta_path": meta_path,
-                "vocab_path": vocab_path,
-            }
-    return None
+def select_shared_bundle():
+    label, model_path, meta_path, vocab_path = SHARED_BUNDLE
+    if not bundle_ready((model_path, meta_path, vocab_path)):
+        return None
+    return {
+        "label": label,
+        "model_path": model_path,
+        "meta_path": meta_path,
+        "vocab_path": vocab_path,
+    }
 
 
 def normalize_key(value):
@@ -132,7 +126,7 @@ def value_variants(value):
         normalize_name(text),
         normalize_key(text.replace("-", " ")),
         normalize_key(text.replace(" ", "-")),
-        normalize_key(slugify_fallback(text)),
+        normalize_key(slugify_name(text)),
     }
 
 
@@ -219,7 +213,7 @@ def load_image_data_uri(path):
     return f"data:{mime_type};base64,{encoded}"
 
 
-def build_monster_options(vocab, display_name_map, frequency_map, fallback_names):
+def build_monster_options(vocab, display_name_map, frequency_map):
     options = []
     seen = set()
     for slug, raw_id in sorted((vocab or {}).items(), key=lambda item: int(item[1])):
@@ -242,8 +236,6 @@ def build_monster_options(vocab, display_name_map, frequency_map, fallback_names
             frequency = 0
         options.append((display_name, frequency))
 
-    options.extend((str(name).strip(), 0) for name in fallback_names if str(name).strip())
-
     unique = {}
     for name, frequency in options:
         unique.setdefault(normalize_name(name), (name, frequency))
@@ -258,9 +250,9 @@ def build_monster_options(vocab, display_name_map, frequency_map, fallback_names
 
 @st.cache_data(show_spinner=False)
 def load_web_assets(asset_stamp=None):
-    relation_bundle = select_relation_bundle()
-    relation_meta = read_json(relation_bundle["meta_path"], {}) if relation_bundle else {}
-    relation_vocab = read_json(relation_bundle["vocab_path"], {}) if relation_bundle else {}
+    shared_bundle = select_shared_bundle()
+    shared_meta = read_json(shared_bundle["meta_path"], {}) if shared_bundle else {}
+    shared_vocab = read_json(shared_bundle["vocab_path"], {}) if shared_bundle else {}
     image_map = read_json(IMAGE_MAP_PATH, {})
     generated_alias_map = read_json(ALIAS_MAP_PATH, {})
     if not isinstance(generated_alias_map, dict):
@@ -279,6 +271,19 @@ def load_web_assets(asset_stamp=None):
     remote_names = set()
     alias_sets = {}
     catalog_slugs = set()
+    usable_catalog = [
+        item for item in remote_catalog
+        if is_usable_catalog_item(item)
+    ]
+    ambiguous_short_names = build_catalog_ambiguous_short_names(remote_catalog)
+    usable_catalog_keys = set()
+    for item in usable_catalog:
+        for value in (
+            item.get("slug"),
+            item.get("label"),
+            luck_stats.to_display_name(item.get("slug")),
+        ):
+            usable_catalog_keys.update(value_variants(value))
 
     def add_aliases(display_name, *values):
         display_name = str(display_name or "").strip()
@@ -296,7 +301,7 @@ def load_web_assets(asset_stamp=None):
                     aliases.add(alias)
 
     for item in remote_catalog:
-        if not item.get("searchable", True) or int(item.get("natural_stars") or 0) < 4:
+        if not is_usable_catalog_item(item):
             continue
         catalog_slugs.add(normalize_name(item.get("slug")))
         display_name = luck_stats.to_display_name(item.get("slug"))
@@ -307,7 +312,6 @@ def load_web_assets(asset_stamp=None):
             display_name,
             item.get("slug"),
             item.get("label"),
-            item.get("slabel"),
             item.get("com2us_id"),
         )
         unit_id = str(item.get("com2us_id") or "")
@@ -332,6 +336,8 @@ def load_web_assets(asset_stamp=None):
         display_name = luck_stats.to_display_name(slug)
         if not display_name:
             continue
+        if normalize_name(display_name) in ambiguous_short_names:
+            continue
         remote_names.add(display_name)
         add_aliases(display_name, slug)
         image_name = luck_stats.to_image_name(slug)
@@ -342,19 +348,22 @@ def load_web_assets(asset_stamp=None):
         add_aliases(display_name, alias)
         remote_names.add(str(display_name).strip())
 
-    fallback_names = (
-        set(image_map)
-        | set(attr_map)
-        | set(family_map)
-        | set(my_box)
-        | remote_names
-    )
     options = build_monster_options(
-        relation_vocab,
-        relation_meta.get("display_name_map", {}) or {},
-        relation_meta.get("monster_frequency", {}) or {},
-        fallback_names,
+        shared_vocab,
+        shared_meta.get("display_name_map", {}) or {},
+        shared_meta.get("monster_frequency", {}) or {},
     )
+    if options and usable_catalog_keys:
+        options = [
+            option
+            for option in options
+            if value_variants(option) & usable_catalog_keys
+        ]
+    if not options:
+        # The catalog is also the source for the picker and Box editor.  It
+        # must remain usable before a Shared BP model has been trained; the
+        # recommender itself will still report that its model bundle is absent.
+        options = sorted(remote_names, key=normalize_name)
     option_set = set(options)
     if not my_box and account_profile is not None:
         owned_slugs = set(account_profile.owned_monsters)
@@ -368,7 +377,7 @@ def load_web_assets(asset_stamp=None):
     for option in options:
         for variant in value_variants(option):
             option_lookup.setdefault(variant, option)
-    alias_lookup = dict(option_lookup)
+    alias_targets = {}
     for display_name, aliases in alias_sets.items():
         target = ""
         for variant in value_variants(display_name):
@@ -377,9 +386,13 @@ def load_web_assets(asset_stamp=None):
                 break
         if not target:
             continue
-        for alias in aliases:
+        for alias in aliases | {display_name}:
             for variant in value_variants(alias):
-                alias_lookup.setdefault(variant, target)
+                alias_targets.setdefault(variant, set()).add(target)
+    alias_lookup = dict(option_lookup)
+    for variant, targets in alias_targets.items():
+        if len(targets) == 1:
+            alias_lookup.setdefault(variant, next(iter(targets)))
     normalized_box = []
     for value in my_box:
         target = next(
@@ -400,14 +413,21 @@ def load_web_assets(asset_stamp=None):
             "",
         )
         if target:
-            alias_map_sets.setdefault(target, set()).update(aliases)
+            for alias in aliases | {display_name}:
+                variants = value_variants(alias)
+                if any(
+                    len(alias_targets.get(variant, set())) != 1
+                    for variant in variants
+                ):
+                    continue
+                alias_map_sets.setdefault(target, set()).add(alias)
     alias_map = {
         target: sorted(aliases)
         for target, aliases in alias_map_sets.items()
     }
     search_text_map = {
         name: " ".join(
-            [name, slugify_fallback(name)]
+            [name, slugify_name(name)]
             + list(alias_map.get(name, []))
         ).lower()
         for name in options
@@ -424,9 +444,7 @@ def load_web_assets(asset_stamp=None):
         rank_groups = [{"id": str(luck_stats.rank_group), "name": "当前数据"}]
 
     return {
-        "relation_bundle": relation_bundle,
-        "prefix_value_ready": bundle_ready(PREFIX_VALUE_BUNDLE),
-        "ban_value_ready": bundle_ready(BAN_VALUE_BUNDLE),
+        "shared_bundle": shared_bundle,
         "options": options,
         "my_box": sorted(set(my_box), key=normalize_name),
         "account_profile": account_profile,
@@ -460,52 +478,15 @@ def load_sample_count(path):
 
 
 @st.cache_resource(show_spinner=False)
-def load_relation_recommender(model_path, meta_path, vocab_path, device, rank_group):
+def load_shared_recommender(model_path, meta_path, vocab_path, device, rank_group):
     selected_device = None if device == "auto" else device
-    return BPRelationRecommender(
+    return BPSharedRecommender(
         model_path=model_path,
         meta_path=meta_path,
         vocab_path=vocab_path,
         device=selected_device,
         stats_rank_group=rank_group,
     )
-
-
-@st.cache_resource(show_spinner=False)
-def load_prefix_value_recommender(model_path, meta_path, vocab_path, device):
-    selected_device = None if device == "auto" else device
-    from bp_recommender.prefix_value import BPPrefixValueRecommender
-
-    return BPPrefixValueRecommender(
-        model_path=model_path,
-        meta_path=meta_path,
-        vocab_path=vocab_path,
-        device=selected_device,
-    )
-
-
-@st.cache_resource(show_spinner=False)
-def load_ban_value_recommender(model_path, meta_path, vocab_path, device, rank_group):
-    selected_device = None if device == "auto" else device
-    return BPBanValueRecommender(
-        model_path=model_path,
-        meta_path=meta_path,
-        vocab_path=vocab_path,
-        device=selected_device,
-        stats_rank_group=rank_group,
-    )
-
-
-def side_for_turn(turn, first_pick_side):
-    if turn < 1 or turn > len(TURN_PATTERN):
-        return None
-    first_pick_side = normalize_name(first_pick_side)
-    if first_pick_side not in {"me", "enemy"}:
-        return None
-    if first_pick_side == "enemy":
-        swapped = tuple("enemy" if side == "me" else "me" for side in TURN_PATTERN)
-        return swapped[turn - 1]
-    return TURN_PATTERN[turn - 1]
 
 
 def phase_label(my_picks, enemy_picks, current_side):
@@ -580,6 +561,7 @@ def initialize_state(assets):
         st.session_state.my_box,
         options,
         assets,
+        max_items=None,
     )
     valid_rank_groups = {item["id"] for item in assets.get("rank_groups", [])}
     if st.session_state.rank_group not in valid_rank_groups:
@@ -597,20 +579,41 @@ def clear_results():
 
 
 def apply_recommendation_plan(result_type, monsters, assets):
-    target = st.session_state.my_picks if result_type == "pick" else st.session_state.enemy_picks
+    if result_type not in {"pick", "enemy"}:
+        return 0
+
+    target_side = "me" if result_type == "pick" else "enemy"
+    my_picks = st.session_state.my_picks
+    enemy_picks = st.session_state.enemy_picks
+    turn = len(my_picks) + len(enemy_picks) + 1
+    expected_side = side_for_order(turn, st.session_state.first_pick_side)
+    expected_count = infer_pick_count_for_side(
+        my_picks,
+        enemy_picks,
+        st.session_state.first_pick_side,
+        target_side,
+    )
+    if expected_side != target_side or expected_count not in {1, 2}:
+        return 0
+
+    target = my_picks if target_side == "me" else enemy_picks
     options = set(assets.get("options") or [])
-    occupied = set(st.session_state.my_picks) | set(st.session_state.enemy_picks)
-    added = 0
+    occupied = set(my_picks) | set(enemy_picks)
+    resolved = []
     for raw_monster in monsters:
         monster = resolve_option_name(raw_monster, assets)
-        if monster not in options or len(target) >= 5 or monster in occupied:
-            continue
-        target.append(monster)
-        occupied.add(monster)
-        added += 1
-    if added:
-        clear_results()
-    return added
+        if monster and monster in options and monster not in resolved:
+            resolved.append(monster)
+    if (
+        len(resolved) != expected_count
+        or len(target) + expected_count > 5
+        or any(monster in occupied for monster in resolved)
+    ):
+        return 0
+
+    target.extend(resolved)
+    clear_results()
+    return len(resolved)
 
 
 def save_my_box():
@@ -620,11 +623,13 @@ def save_my_box():
     load_web_assets.clear()
 
 
-def get_relation_model(assets):
-    bundle = assets["relation_bundle"]
+def get_shared_model(assets):
+    bundle = assets["shared_bundle"]
     if not bundle:
-        raise FileNotFoundError("没有找到 Relation 模型三件套")
-    return load_relation_recommender(
+        raise FileNotFoundError(
+            "没有找到 Shared BP Core 模型，请先运行 python -m training.shared_bp"
+        )
+    return load_shared_recommender(
         str(bundle["model_path"]),
         str(bundle["meta_path"]),
         str(bundle["vocab_path"]),
@@ -633,66 +638,25 @@ def get_relation_model(assets):
     )
 
 
-def get_prefix_model(assets):
-    if not assets["prefix_value_ready"]:
-        return None
-    return load_prefix_value_recommender(
-        *(str(path) for path in PREFIX_VALUE_BUNDLE),
-        st.session_state.device,
-    )
-
-
-def get_ban_model(assets):
-    if not assets["ban_value_ready"]:
-        return None
-    return load_ban_value_recommender(
-        *(str(path) for path in BAN_VALUE_BUNDLE),
-        st.session_state.device,
-        st.session_state.rank_group,
-    )
-
-
-LOOKAHEAD_PLAN_MULTIPLIER = 2
-
-
-def rerank_my_plans(plans, prefix_model, relation_model, state, assets, top_k):
-    if not plans:
-        return []
-    if prefix_model is None:
-        enriched = []
-        for plan in plans[:top_k]:
-            item = dict(plan)
-            enriched.append(item)
-        return enriched
-
-    return BPDecisionEngine(
-        relation_model=relation_model,
-        value_model=prefix_model,
-        assets=assets,
-    ).rank_my_plans(plans, state, top_k)
-
-
-def rerank_enemy_plans(plans, prefix_model, relation_model, state, assets, top_k):
-    if not plans or prefix_model is None:
-        return plans[:top_k]
-
-    return BPDecisionEngine(
-        relation_model=relation_model,
-        value_model=prefix_model,
-        assets=assets,
-    ).rank_enemy_plans(plans, state, top_k)
-
-
 def calculate_my_recommendations(assets):
     my_picks = list(st.session_state.my_picks)
     enemy_picks = list(st.session_state.enemy_picks)
     turn = len(my_picks) + len(enemy_picks) + 1
     first_pick_side = st.session_state.first_pick_side
     pick_count = infer_pick_count(my_picks, enemy_picks, first_pick_side)
-    relation_model = get_relation_model(assets)
-    prefix_model = get_prefix_model(assets)
+    events = timeline_from_picks(my_picks, enemy_picks, first_pick_side).to_dict()
+    state = DraftState(
+        my_picks=tuple(my_picks),
+        enemy_picks=tuple(enemy_picks),
+        my_leader=st.session_state.my_leader,
+        enemy_leader=st.session_state.enemy_leader,
+        first_pick_side=first_pick_side,
+        turn=turn,
+        events=events,
+    ).to_dict()
+    shared_model = get_shared_model(assets)
     top_k = int(st.session_state.top_k)
-    plans = relation_model.recommend_pick_plans(
+    plans = shared_model.recommend_pick_plans(
         my_picks=my_picks,
         enemy_picks=enemy_picks,
         pick_count=pick_count,
@@ -701,37 +665,20 @@ def calculate_my_recommendations(assets):
         candidate_pool=assets["options"],
         my_box=st.session_state.my_box,
         use_my_box_for_reco=bool(st.session_state.use_my_box),
-        top_k=(
-            top_k * LOOKAHEAD_PLAN_MULTIPLIER
-            if prefix_model is not None
-            else top_k
-        ),
+        top_k=top_k,
         max_pair_candidates=int(st.session_state.max_pair_candidates),
-        preserve_evidence=True,
+        events=state["events"],
     )
-    state = DraftState(
-        my_picks=tuple(my_picks),
-        enemy_picks=tuple(enemy_picks),
-        my_leader=st.session_state.my_leader,
-        enemy_leader=st.session_state.enemy_leader,
-        first_pick_side=first_pick_side,
-        turn=turn,
-    ).to_runtime_dict()
     state.update(
         {
             "my_box": list(st.session_state.my_box),
             "use_my_box": bool(st.session_state.use_my_box),
             "max_pair_candidates": int(st.session_state.max_pair_candidates),
-            "current_side": side_for_turn(turn, first_pick_side),
+            "current_side": side_for_order(turn, first_pick_side),
         }
     )
-    return rerank_my_plans(
-        plans,
-        prefix_model,
-        relation_model,
-        state,
-        assets,
-        top_k,
+    return BPDecisionEngine(model=shared_model, assets=assets).rank_my_plans(
+        plans, state, top_k
     )
 
 
@@ -746,25 +693,7 @@ def calculate_enemy_recommendations(assets):
         first_pick_side,
         "enemy",
     )
-    prefix_model = get_prefix_model(assets)
-    relation_model = get_relation_model(assets)
-    top_k = int(st.session_state.top_k)
-    predictions = relation_model.recommend_enemy_next_picks(
-        my_picks=my_picks,
-        enemy_picks=enemy_picks,
-        first_pick_side=first_pick_side,
-        pick_count=pick_count,
-        top_k=(
-            top_k * LOOKAHEAD_PLAN_MULTIPLIER
-            if prefix_model is not None
-            else top_k
-        ),
-        candidate_pool=assets["options"],
-        max_pair_candidates=int(st.session_state.max_pair_candidates),
-        preserve_evidence=True,
-        my_leader=st.session_state.my_leader,
-        enemy_leader=st.session_state.enemy_leader,
-    )
+    events = timeline_from_picks(my_picks, enemy_picks, first_pick_side).to_dict()
     state = DraftState(
         my_picks=tuple(my_picks),
         enemy_picks=tuple(enemy_picks),
@@ -772,22 +701,31 @@ def calculate_enemy_recommendations(assets):
         enemy_leader=st.session_state.enemy_leader,
         first_pick_side=first_pick_side,
         turn=turn,
-    ).to_runtime_dict()
+        events=events,
+    ).to_dict()
+    shared_model = get_shared_model(assets)
+    top_k = int(st.session_state.top_k)
+    predictions = shared_model.recommend_enemy_next_picks(
+        my_picks=my_picks,
+        enemy_picks=enemy_picks,
+        first_pick_side=first_pick_side,
+        pick_count=pick_count,
+        top_k=top_k,
+        candidate_pool=assets["options"],
+        max_pair_candidates=int(st.session_state.max_pair_candidates),
+        turn=turn,
+        events=state["events"],
+    )
     state.update(
         {
             "my_box": list(st.session_state.my_box),
             "use_my_box": bool(st.session_state.use_my_box),
             "max_pair_candidates": int(st.session_state.max_pair_candidates),
-            "current_side": side_for_turn(turn, first_pick_side),
+            "current_side": side_for_order(turn, first_pick_side),
         }
     )
-    return rerank_enemy_plans(
-        predictions,
-        prefix_model,
-        relation_model,
-        state,
-        assets,
-        top_k,
+    return BPDecisionEngine(model=shared_model, assets=assets).rank_enemy_plans(
+        predictions, state, top_k
     )
 
 
@@ -795,22 +733,27 @@ def calculate_ban_recommendations(assets):
     my_picks = list(st.session_state.my_picks)
     enemy_picks = list(st.session_state.enemy_picks)
     top_k = int(st.session_state.top_k)
-    ban_model = get_ban_model(assets)
-    if ban_model is not None:
-        return ban_model.recommend_bans(
-            my_picks=my_picks,
-            enemy_picks=enemy_picks,
-            my_leader=st.session_state.my_leader,
-            enemy_leader=st.session_state.enemy_leader,
-            top_k=top_k,
-        )
-
-    relation_model = get_relation_model(assets)
-    return relation_model.recommend_ban_plans(
+    events = timeline_from_picks(
+        my_picks,
+        enemy_picks,
+        st.session_state.first_pick_side,
+    ).to_dict()
+    state = DraftState(
+        my_picks=tuple(my_picks),
+        enemy_picks=tuple(enemy_picks),
+        my_leader=st.session_state.my_leader,
+        enemy_leader=st.session_state.enemy_leader,
+        first_pick_side=st.session_state.first_pick_side,
+        turn=11,
+        events=events,
+    ).to_dict()
+    shared_model = get_shared_model(assets)
+    return shared_model.recommend_ban_plans(
         my_picks=my_picks,
         enemy_picks=enemy_picks,
         top_k=top_k,
         first_pick_side=st.session_state.first_pick_side,
+        events=state["events"],
     )
 
 
@@ -866,7 +809,7 @@ def build_picker_payload(monsters, assets):
     ], state_items
 
 
-def clean_picker_values(values, options, assets=None):
+def clean_picker_values(values, options, assets=None, max_items=5):
     cleaned = []
     seen = set()
     for value in values or []:
@@ -874,7 +817,7 @@ def clean_picker_values(values, options, assets=None):
         if monster in options and monster not in seen:
             cleaned.append(monster)
             seen.add(monster)
-        if len(cleaned) >= 5:
+        if max_items is not None and len(cleaned) >= max_items:
             break
     return cleaned
 
@@ -952,7 +895,7 @@ def render_bp_picker_fragment(assets):
     with page_columns[0]:
         if st.button("上一页", key="gallery_prev", use_container_width=True):
             st.session_state.gallery_page = max(1, st.session_state.gallery_page - 1)
-            st.rerun(scope="fragment")
+            rerun_fragment_or_app()
     with page_columns[1]:
         st.markdown(
             f"<div style='text-align:center;padding-top:0.45rem'>第 {st.session_state.gallery_page}/{total_pages} 页 · 共 {len(gallery_monsters)} 个</div>",
@@ -961,11 +904,11 @@ def render_bp_picker_fragment(assets):
     with page_columns[2]:
         if st.button("下一页", key="gallery_next", use_container_width=True):
             st.session_state.gallery_page = min(total_pages, st.session_state.gallery_page + 1)
-            st.rerun(scope="fragment")
+            rerun_fragment_or_app()
 
     items, state_items = build_picker_payload(page_items, assets)
     current_turn = len(st.session_state.my_picks) + len(st.session_state.enemy_picks) + 1
-    current_side = side_for_turn(current_turn, st.session_state.first_pick_side) or "none"
+    current_side = side_for_order(current_turn, st.session_state.first_pick_side) or "none"
     picker_value = BP_ICON_PICKER(
         items=items,
         state_items=state_items,
@@ -985,10 +928,10 @@ def render_bp_picker_fragment(assets):
         default=None,
     )
     if apply_picker_value(picker_value, assets):
-        st.rerun(scope="fragment")
+        rerun_fragment_or_app()
 
     current_turn = len(st.session_state.my_picks) + len(st.session_state.enemy_picks) + 1
-    current_side = side_for_turn(current_turn, st.session_state.first_pick_side)
+    current_side = side_for_order(current_turn, st.session_state.first_pick_side)
     signature = make_signature(
         st.session_state.my_picks,
         st.session_state.enemy_picks,
@@ -1005,7 +948,7 @@ def render_bp_picker_fragment(assets):
             st.session_state.my_leader = ""
             st.session_state.enemy_leader = ""
             clear_results()
-            st.rerun(scope="fragment")
+            rerun_fragment_or_app()
     with action_columns[1]:
         if st.button(
             "生成我方推荐",
@@ -1020,7 +963,7 @@ def render_bp_picker_fragment(assets):
                         "signature": signature,
                         "items": calculate_my_recommendations(assets),
                     }
-            except Exception as exc:
+            except (FileNotFoundError, KeyError, OSError, RuntimeError, ValueError) as exc:
                 st.session_state.pick_results = {"signature": signature, "error": str(exc), "items": []}
     with action_columns[2]:
         if st.button(
@@ -1035,7 +978,7 @@ def render_bp_picker_fragment(assets):
                         "signature": signature,
                         "items": calculate_enemy_recommendations(assets),
                     }
-            except Exception as exc:
+            except (FileNotFoundError, KeyError, OSError, RuntimeError, ValueError) as exc:
                 st.session_state.enemy_results = {"signature": signature, "error": str(exc), "items": []}
     with action_columns[3]:
         if st.button(
@@ -1050,7 +993,7 @@ def render_bp_picker_fragment(assets):
                         "signature": signature,
                         "items": calculate_ban_recommendations(assets),
                     }
-            except Exception as exc:
+            except (FileNotFoundError, KeyError, OSError, RuntimeError, ValueError) as exc:
                 st.session_state.ban_results = {"signature": signature, "error": str(exc), "items": []}
 
     for title, key, result_type in (
@@ -1108,7 +1051,7 @@ def render_box_monsters(monsters, assets):
                     use_container_width=True,
                 ):
                     toggle_my_box(monster)
-                    st.rerun(scope="fragment")
+                    rerun_fragment_or_app()
 
 
 @st.fragment
@@ -1165,7 +1108,7 @@ def render_box_fragment(assets):
     with box_nav_left:
         if st.button("上一页", key="box_prev", use_container_width=True):
             st.session_state.box_page = max(1, st.session_state.box_page - 1)
-            st.rerun(scope="fragment")
+            rerun_fragment_or_app()
     with box_nav_label:
         st.markdown(
             f"<div style='text-align:center;padding-top:0.45rem'>第 {st.session_state.box_page} 页</div>",
@@ -1174,7 +1117,7 @@ def render_box_fragment(assets):
     with box_nav_right:
         if st.button("下一页", key="box_next", use_container_width=True):
             st.session_state.box_page = min(total_pages, st.session_state.box_page + 1)
-            st.rerun(scope="fragment")
+            rerun_fragment_or_app()
 
     save_column, clear_column = st.columns(2)
     with save_column:
@@ -1184,21 +1127,12 @@ def render_box_fragment(assets):
     with clear_column:
         if st.button("清空 Box", key="clear_box", use_container_width=True):
             st.session_state.my_box = []
-            st.rerun(scope="fragment")
+            rerun_fragment_or_app()
 
 
 def render_result_card(index, item, assets, result_type):
-    if result_type == "enemy":
-        monsters = [value for value in item.get("plan") or item.get("monsters") or [] if value]
-        if not monsters:
-            monsters = [item.get("monster") or item.get("display_name") or ""]
-        score = item.get("final_score", item.get("plan_score", 0.0))
-    elif result_type == "ban":
-        monsters = [item.get("ban") or item.get("monster") or ""]
-        score = item.get("plan_score", item.get("score", 0.0))
-    else:
-        monsters = [value for value in item.get("plan", []) if value]
-        score = item.get("plan_score", 0.0)
+    monsters = [value for value in item["plan"] if value]
+    score = item["plan_score"]
 
     detail = item.get("detail", {}) or {}
     win_rate = item.get("estimated_win_rate")
@@ -1218,30 +1152,14 @@ def render_result_card(index, item, assets, result_type):
         secondary_value = f"{float(detail['post_ban_win_rate']):.1%}"
     else:
         secondary_label = "动作"
-        secondary_value = str(detail.get("action_type") or item.get("source", "relation"))
+        secondary_value = str(detail.get("action_type") or item.get("source", "shared_policy"))
 
-    ranking_source = detail.get("ranking_source") or item.get("source") or "relation"
+    ranking_source = detail.get("ranking_source") or item.get("source") or "shared_policy"
     source_text = {
-        "prefix_value_0.65_relation_0.25_stats_0.10": "Value + Relation + Stats",
-        "prefix_value_0.70_relation_0.30": "Value + Relation",
-        "prefix_value_0.55_relation_0.20_stats_0.10_mechanism_0.15": "Value + Relation + Stats + Mechanism",
-        "prefix_value_0.60_relation_0.25_mechanism_0.15": "Value + Relation + Mechanism",
-        "enemy_value_0.65_relation_0.25_stats_0.10": "Enemy Value + Stats",
-        "enemy_value_0.70_relation_0.30": "Enemy Value + Relation",
-        "enemy_value_0.55_relation_0.20_stats_0.10_mechanism_0.15": "Enemy Value + Stats + Mechanism",
-        "enemy_value_0.60_relation_0.25_mechanism_0.15": "Enemy Value + Relation + Mechanism",
-        "ban_value_0.75_mechanism_0.25": "Ban Value + Mechanism",
-        "ban_value_0.75_mechanism_0.25_stats_0.10": "Ban Value + Mechanism + Stats",
-        "ban_value_0.75_stats_0.10": "Ban Value + Stats",
-        "ban_value_0.75": "Ban Value",
-        "minimax_value_0.60_immediate_0.15_relation_0.15_evidence_0.10": "两步预演 + Value + 数据",
-        "minimax_enemy_0.60_best_response_0.15_immediate_0.15_relation_0.10_evidence": "对手预演 + 反制价值",
-        "robust_search_value_3ply_relation_stats_mechanism": "三层鲁棒搜索 + Value + 机制",
-        "robust_enemy_search_value_relation_stats_mechanism": "对手搜索 + Value + 机制",
-        "relation": "Relation",
+        "shared_policy": "Shared BP Core",
+        "robust_search_value_3ply_shared_stats_mechanism": "三层鲁棒搜索 + Value + 机制",
+        "robust_enemy_search_value_shared_stats_mechanism": "对手搜索 + Value + 机制",
     }.get(str(ranking_source), str(ranking_source))
-    if str(ranking_source).startswith("ban_robust_response_"):
-        source_text = "鲁棒响应 + Ban Value + 机制/统计"
     safe_title = html.escape(f"{index}. {' + '.join(monsters)}")
     image_markup = []
     for monster in monsters:
@@ -1292,8 +1210,9 @@ def render_result_card(index, item, assets, result_type):
         ):
             added = apply_recommendation_plan(result_type, monsters, assets)
             if added:
-                st.rerun(scope="fragment")
-            st.warning("没有新的魔灵被加入 BP 状态，请检查当前空位和别称映射。")
+                rerun_fragment_or_app()
+            else:
+                st.warning("当前推荐与 BP 轮次不匹配，或无法解析完整动作。")
     if st.session_state.show_details and detail:
         with st.expander("模型明细", expanded=False):
             st.json(detail)
@@ -1316,19 +1235,11 @@ def render_results(title, results, assets, result_type):
 
 
 def render_model_status(assets):
-    bundle = assets["relation_bundle"]
+    bundle = assets["shared_bundle"]
     if bundle:
-        st.success(f"Relation：{bundle['label']}")
+        st.success(f"模型：{bundle['label']}")
     else:
-        st.error("Relation：未找到模型")
-    if assets["prefix_value_ready"]:
-        st.success("Prefix Value：已加载")
-    else:
-        st.warning("Prefix Value：未训练，选人排序使用 Relation")
-    if assets["ban_value_ready"]:
-        st.success("Ban Value：已加载")
-    else:
-        st.warning("Ban Value：未找到，完整阵容 Ban 使用 Relation 备用")
+        st.error("Shared BP Core：未找到，请先训练模型")
     account_profile = assets.get("account_profile")
     if account_profile is None:
         st.caption("账号档案：未加载，推荐不限制我方 Box")

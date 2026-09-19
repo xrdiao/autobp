@@ -8,7 +8,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from bp_core.transformer_common import PROJECT_ROOT
+from bp_core.names import PROJECT_ROOT
 from sw_ui_detection.bp_screen_analyzer import BPDraftScreenAnalyzer
 
 INPUT_DIR = PROJECT_ROOT / "sw_ui_detection" / "input"

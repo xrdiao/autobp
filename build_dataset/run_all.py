@@ -1,19 +1,24 @@
 import argparse
 import asyncio
+import sys
 import time
+from pathlib import Path
 
-from batch_extract_match_bp import batch_extract_match_bp
-from build_monster_catalog import build_catalog
-from download_players_by_rank import download_players_by_rank
-from expand_from_matches_raw import expand_from_matches_raw
-from generate_alias_and_images import generate_alias_and_images
-from normalize_training_samples import normalize_training_samples
-from rebuild_monster_images import rebuild_monster_images
-from sync_images import sync_images
-from sync_lucksack_data import sync_lucksack_data
-from sync_swarfarm_mechanisms import sync_swarfarm_mechanisms
-from sync_swrt_data import sync_swrt_data
-from sync_swkit_data import sync_swkit_data
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from build_dataset.batch_extract_match_bp import batch_extract_match_bp
+from build_dataset.build_monster_catalog import build_catalog
+from build_dataset.download_players_by_rank import download_players_by_rank
+from build_dataset.expand_from_matches_raw import expand_from_matches_raw
+from build_dataset.generate_alias_and_images import generate_alias_and_images
+from build_dataset.rebuild_monster_images import rebuild_monster_images
+from build_dataset.sync_images import sync_images
+from build_dataset.sync_lucksack_data import sync_lucksack_data
+from build_dataset.sync_swarfarm_mechanisms import sync_swarfarm_mechanisms
+from build_dataset.sync_swrt_data import sync_swrt_data
+from build_dataset.sync_swkit_data import sync_swkit_data
 from tqdm import tqdm
 
 
@@ -27,7 +32,6 @@ def parse_args():
     parser.add_argument("--skip-swkit", action="store_true", help="Skip syncing SWKit aliases and RTA tiers.")
     parser.add_argument("--skip-swrt", action="store_true", help="Skip syncing public SWRT RTA statistics.")
     parser.add_argument("--force-rebuild", action="store_true", help="Rebuild expanded samples instead of incremental append.")
-    parser.add_argument("--skip-normalize", action="store_true", help="Skip normalized me-only sample export.")
     parser.add_argument("--use-existing-version-csv", action="store_true", help="Reuse the current version CSV when downloading.")
     parser.add_argument("--detail-concurrency", type=int, default=2, help="Detail-page concurrency for polite crawling.")
     parser.add_argument("--max-detail-fetches", type=int, default=180, help="Max number of detail pages to fetch in one run.")
@@ -36,7 +40,6 @@ def parse_args():
     parser.add_argument("--extract-max-workers", type=int, default=None, help="Worker count for html extraction.")
     parser.add_argument("--expand-max-workers", type=int, default=None, help="Worker count for match expansion.")
     parser.add_argument("--expand-fetch-batch-size", type=int, default=1000, help="SQLite fetch batch size when expanding raw matches.")
-    parser.add_argument("--export-pt", action="store_true", help="Also export legacy .pt datasets.")
     return parser.parse_args()
 
 
@@ -80,7 +83,6 @@ def main():
                 lambda: batch_extract_match_bp(
                     incremental=not args.force_rebuild,
                     max_workers=args.extract_max_workers,
-                    export_dataset_pt=args.export_pt,
                 ),
             ),
             (
@@ -89,15 +91,12 @@ def main():
                     incremental=not args.force_rebuild,
                     fetch_batch_size=args.expand_fetch_batch_size,
                     max_workers=args.expand_max_workers,
-                    export_pt=args.export_pt,
                 ),
             ),
             ("构建魔灵目录", lambda: build_catalog("dataset", "json//monster_catalog.json")),
             ("生成别称和图片映射", generate_alias_and_images),
         ]
     )
-    if not args.skip_normalize:
-        stages.append(("导出规范化训练样本", normalize_training_samples))
     if not args.skip_images:
         stages.extend(
             [

@@ -1,8 +1,19 @@
 import os
 import re
 import json
+import sys
 from bs4 import BeautifulSoup
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from bp_core.lucksack_stats import (
+    build_catalog_ambiguous_short_names,
+    build_catalog_display_name_map,
+    is_usable_catalog_item,
+)
 
 DATASET_DIR = "dataset"
 IMAGES_DIR = "images"
@@ -105,14 +116,21 @@ def load_lucksack_image_map():
         return {}
     if not isinstance(catalog, list):
         return {}
+    display_names = build_catalog_display_name_map(catalog)
     result = {}
     for item in catalog:
-        name = str(
-            item.get("slabel")
-            or item.get("label")
-            or item.get("slug")
-            or ""
-        ).strip()
+        if not is_usable_catalog_item(item):
+            continue
+        slug = str(item.get("slug") or "").strip().lower()
+        name = display_names.get(
+            slug,
+            str(
+                item.get("slabel")
+                or item.get("label")
+                or item.get("slug")
+                or ""
+            ).strip(),
+        )
         image = lucksack_image_url(item.get("image"))
         if name and image:
             result.setdefault(name, image)
@@ -174,6 +192,24 @@ def parse_html_file(html_path: str):
 
 def rebuild_monster_images():
     final_map = load_existing_image_map()
+    try:
+        with open(LUCK_CATALOG_PATH, "r", encoding="utf-8") as f:
+            catalog = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        catalog = []
+    ambiguous_short_names = {
+        str(item.get("slabel") or "").strip()
+        for item in (catalog if isinstance(catalog, list) else [])
+        if is_usable_catalog_item(item)
+        and str(item.get("slabel") or "").strip()
+        and str(item.get("slabel") or "").strip().lower()
+        in build_catalog_ambiguous_short_names(catalog)
+    }
+    final_map = {
+        name: image
+        for name, image in final_map.items()
+        if name not in ambiguous_short_names
+    }
     for name, image in load_lucksack_image_map().items():
         final_map.setdefault(name, image)
     all_missing = []

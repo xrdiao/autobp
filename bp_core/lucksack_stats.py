@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import math
 import os
+from collections import defaultdict
 from functools import lru_cache
 from itertools import combinations
 from pathlib import Path
 
 from bp_core.mechanism import BPMechanismLayer, DEFAULT_MECHANISM_PATH
-from bp_core.transformer_common import PROJECT_ROOT, normalize_name, slugify_fallback
+from bp_core.names import PROJECT_ROOT, normalize_name, slugify_name
 
 DEFAULT_STATS_PATH = PROJECT_ROOT / "json" / "lucksack_stats.json"
 DEFAULT_CATALOG_PATH = PROJECT_ROOT / "json" / "lucksack_monster_catalog.json"
@@ -37,6 +38,66 @@ def _as_int(value, default=0):
         return int(value)
     except (TypeError, ValueError):
         return int(default)
+
+
+def is_usable_catalog_item(item):
+    """Keep Lucksack entries that represent awakened, searchable monsters."""
+    if not isinstance(item, dict) or not bool(item.get("searchable", True)):
+        return False
+    raw_stars = item.get("natural_stars")
+    if raw_stars in (None, ""):
+        return True
+    stars = _as_float(raw_stars, 0.0)
+    if stars >= 4:
+        return True
+    # Secondary-awakening entries are explicitly marked in the public
+    # catalog and remain valid even though their base family is 1--3 star.
+    label = " ".join(
+        str(item.get(key) or "").lower()
+        for key in ("label", "slabel", "slug")
+    )
+    return "[2a]" in label or "2a" in label.replace(" ", "")
+
+
+def build_catalog_display_name_map(catalog):
+    """Use full catalog labels when a short label refers to multiple units."""
+    items = [
+        item
+        for item in (catalog if isinstance(catalog, list) else [])
+        if is_usable_catalog_item(item)
+    ]
+    short_name_slugs = defaultdict(set)
+    for item in items:
+        slug = normalize_name(item.get("slug"))
+        short_name = normalize_name(item.get("slabel"))
+        if slug and short_name:
+            short_name_slugs[short_name].add(slug)
+
+    display_names = {}
+    for item in items:
+        slug = normalize_name(item.get("slug"))
+        if not slug:
+            continue
+        short_name = str(item.get("slabel") or "").strip()
+        full_name = str(item.get("label") or "").strip()
+        if short_name and len(short_name_slugs[normalize_name(short_name)]) == 1:
+            display_names[slug] = short_name
+        else:
+            display_names[slug] = full_name or short_name or slug
+    return display_names
+
+
+def build_catalog_ambiguous_short_names(catalog):
+    display_names = build_catalog_display_name_map(catalog)
+    ambiguous = set()
+    for item in (catalog if isinstance(catalog, list) else []):
+        if not is_usable_catalog_item(item):
+            continue
+        slug = normalize_name(item.get("slug"))
+        short_name = normalize_name(item.get("slabel"))
+        if slug and short_name and normalize_name(display_names.get(slug)) != short_name:
+            ambiguous.add(short_name)
+    return ambiguous
 
 
 def _clamp(value, low=0.0, high=1.0):
@@ -122,7 +183,6 @@ class BPLucksackStats:
         self._resolve_cache = {}
         self._candidate_slug_cache = None
         self._score_cache = {}
-        self._ban_score_cache = {}
 
     @staticmethod
     def _load_json(path, default):
@@ -148,11 +208,17 @@ class BPLucksackStats:
         return f"lucksack:{season_name}:{patch_name}:rank={self.rank_group}"
 
     def _build_catalog_maps(self):
+        display_names = build_catalog_display_name_map(self.catalog)
         for item in self.catalog if isinstance(self.catalog, list) else []:
+            if not is_usable_catalog_item(item):
+                continue
             slug = normalize_name(item.get("slug"))
             if not slug:
                 continue
-            display_name = str(item.get("slabel") or item.get("label") or slug).strip()
+            display_name = display_names.get(
+                slug,
+                str(item.get("slabel") or item.get("label") or slug).strip(),
+            )
             label = str(item.get("label") or display_name).strip()
             self.display_name_map[slug] = display_name
             if item.get("image"):
@@ -161,9 +227,11 @@ class BPLucksackStats:
                 slug,
                 normalize_name(display_name),
                 normalize_name(label),
-                slugify_fallback(display_name),
-                slugify_fallback(label),
+                slugify_name(display_name),
+                slugify_name(label),
             }
+            if normalize_name(item.get("slabel")) == normalize_name(display_name):
+                aliases.add(normalize_name(item.get("slabel")))
             for alias in aliases:
                 if alias:
                     self.name_slug_aliases.setdefault(alias, slug)
@@ -238,7 +306,7 @@ class BPLucksackStats:
             unit_id = str(record.get("monsterId") or "")
             slug = self._swrt_id_to_slug.get(unit_id)
             if not slug:
-                slug = slugify_fallback(
+                slug = slugify_name(
                     record.get("monsterName")
                     or record.get("monsterNameCn")
                     or record.get("monsterNameZho")
@@ -328,17 +396,6 @@ class BPLucksackStats:
             + 0.35 * (0.5 + (pick_win_rate - 0.5) * confidence)
         )
         return _clamp(score, 0.2, 0.8), confidence, record
-
-    def _solo_contest_score(self, slug):
-        record = self._solo_record(slug)
-        if not record:
-            return 0.5, 0.0
-        ban_rate = _as_float(record.get("ban_rate"), 0.0)
-        played_rate = _as_float(record.get("played_rate"), 0.0)
-        confidence = self._confidence(record.get("played_count"))
-        ban_pressure = _clamp(0.5 + 0.35 * min(1.0, ban_rate / 0.35))
-        usage_pressure = _clamp(0.5 + 0.15 * min(1.0, played_rate / 0.45))
-        return _clamp(0.7 * ban_pressure + 0.3 * usage_pressure), confidence
 
     def _combo_record(self, kind, slugs):
         key = _combo_key(slugs)
@@ -466,12 +523,8 @@ class BPLucksackStats:
         cached = self._resolve_cache.get(normalized)
         if cached is not None:
             return cached
-        fallback = slugify_fallback(value)
-        slug = (
-            self.name_slug_aliases.get(normalized)
-            or self.name_slug_aliases.get(fallback)
-            or fallback
-        )
+        fallback = slugify_name(value)
+        slug = self.name_slug_aliases.get(normalized) or self.name_slug_aliases.get(fallback) or ""
         self._resolve_cache[normalized] = slug
         return slug
 
@@ -488,9 +541,7 @@ class BPLucksackStats:
         if self._candidate_slug_cache is None:
             slugs = set(self._solo) | set(self._swrt_by_slug)
             for item in self.catalog if isinstance(self.catalog, list) else []:
-                if not item.get("searchable", True):
-                    continue
-                if _as_int(item.get("natural_stars")) < 4:
+                if not is_usable_catalog_item(item):
                     continue
                 slug = normalize_name(item.get("slug"))
                 if slug:
@@ -862,102 +913,6 @@ class BPLucksackStats:
             "sample_count": max(sample_counts, default=0),
             "evidence_confidence": data_coverage,
             "evidence_uncertainty": round(1.0 - data_coverage, 6),
-            "source": self.source_label,
-            "evidence": evidence[:12],
-        }
-
-    def score_ban_action(self, my_picks, enemy_picks, target):
-        key = (
-            tuple(self.resolve_slug(value) for value in my_picks or []),
-            tuple(self.resolve_slug(value) for value in enemy_picks or []),
-            self.resolve_slug(target),
-        )
-        cached = self._ban_score_cache.get(key)
-        if cached is None:
-            cached = self._score_ban_action_uncached(my_picks, enemy_picks, target)
-            self._ban_score_cache[key] = cached
-        return cached
-
-    def _score_ban_action_uncached(self, my_picks, enemy_picks, target):
-        target_slug = self.resolve_slug(target)
-        mechanism_detail = self.mechanisms.score_ban(
-            my_picks=my_picks,
-            enemy_picks=enemy_picks,
-            target=target,
-        )
-        evidence = []
-        record = self._solo_record(target_slug)
-        target_solo_score, target_solo_coverage, _ = self._solo_score(target_slug)
-        target_contest_score, target_contest_coverage = self._solo_contest_score(target_slug)
-        own_slugs = [self.resolve_slug(value) for value in (my_picks or [])]
-        own_slugs = [slug for slug in own_slugs if slug]
-        target_matchup_score, target_matchup_coverage, target_matchup_evidence = (
-            self._swrt_matchup_score([target_slug], own_slugs)
-        )
-        for item in target_matchup_evidence:
-            ban_matchup_evidence = {
-                "kind": "swrt_ban_matchup",
-                "target": target_slug,
-                "played": item.get("played"),
-                "win_rate": item.get("win_rate"),
-            }
-            if item.get("opponent_slug"):
-                ban_matchup_evidence["opponent_slug"] = item["opponent_slug"]
-            if item.get("opponent_slugs"):
-                ban_matchup_evidence["opponent_slugs"] = list(item["opponent_slugs"])
-            evidence.append(ban_matchup_evidence)
-        if record:
-            evidence.append(
-                {
-                    "kind": "target_solo",
-                    "slug": target_slug,
-                    "played": _as_int(record.get("played_count")),
-                    "win_rate": round(_as_float(record.get("win_rate"), 0.5), 6),
-                    "pick_win_rate": round(_as_float(record.get("pick_win_rate"), 0.5), 6),
-                    "pick_rate": round(_as_float(record.get("played_rate"), 0.0), 6),
-                    "ban_rate": round(_as_float(record.get("ban_rate"), 0.0), 6),
-                    "lead_rate": round(_as_float(record.get("lead_rate"), 0.0), 6),
-                }
-            )
-        for threat in mechanism_detail.get("threats", [])[:6]:
-            if _as_float(threat.get("reduction")) <= 0:
-                continue
-            evidence.append(
-                {
-                    "kind": "ban_mechanism_reduction",
-                    "target": target_slug,
-                    "threat": threat.get("threat"),
-                    "label": threat.get("label"),
-                    "reduction": round(_as_float(threat.get("reduction")), 6),
-                    "enemy_sources": list(threat.get("enemy_sources") or []),
-                }
-            )
-        return {
-            "score": float(mechanism_detail.get("score", 0.5)),
-            "mechanism_score": float(mechanism_detail.get("score", 0.5)),
-            "mechanism_available": bool(mechanism_detail.get("available")),
-            "mechanism_threat_reduction": float(mechanism_detail.get("threat_reduction", 0.0)),
-            "mechanism_threats": mechanism_detail.get("threats", []),
-            "mechanism_reasons": list(mechanism_detail.get("reasons", [])),
-            "target_solo_score": float(target_solo_score),
-            "target_solo_coverage": float(target_solo_coverage),
-            "target_contest_score": float(target_contest_score),
-            "target_contest_coverage": float(target_contest_coverage),
-            "ban_priority_score": float(
-                (
-                    0.55 * target_solo_score
-                    + 0.30 * target_contest_score
-                    + 0.15 * target_matchup_score
-                )
-                if target_matchup_coverage > 0
-                else 0.65 * target_solo_score + 0.35 * target_contest_score
-            ),
-            "target_matchup_score": float(target_matchup_score),
-            "target_matchup_coverage": float(target_matchup_coverage),
-            "target_solo_played": _as_int((record or {}).get("played_count")),
-            "target_solo_win_rate": _as_float((record or {}).get("win_rate"), 0.5),
-            "target_solo_ban_rate": _as_float((record or {}).get("ban_rate"), 0.0),
-            "summary_most_banned": self._summary.get("most_banned") or {},
             "source": self.source_label,
             "evidence": evidence[:12],
         }

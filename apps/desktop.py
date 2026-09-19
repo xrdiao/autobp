@@ -17,7 +17,14 @@ from tkinter import messagebox, ttk
 
 from PIL import Image, ImageGrab, ImageOps, ImageTk
 from sw_ui_detection.capture import save_screen_capture
-from bp_core.relation_common import infer_pick_count_for_side
+from bp_core.bp_common import infer_pick_count_for_side, side_for_order
+from bp_core.action_space import timeline_from_picks
+from bp_core.lucksack_stats import (
+    build_catalog_ambiguous_short_names,
+    is_usable_catalog_item,
+)
+from bp_core.names import normalize_name, slugify_name
+from bp_recommender.decision_engine import BPDecisionEngine
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 MY_BOX_PATH = ROOT_DIR / "json" / "my_box.json"
@@ -26,21 +33,11 @@ ALIAS_MAP_PATH = ROOT_DIR / "json" / "monster_alias_map.json"
 SWKIT_ALIAS_PATH = ROOT_DIR / "json" / "swkit_monster_aliases.json"
 ATTR_MAP_PATH = ROOT_DIR / "json" / "monster_attributes.json"
 FAMILY_MAP_PATH = ROOT_DIR / "json" / "monster_families.json"
-RELATION_META_V2_PATH = ROOT_DIR / "models" / "bp_relation_meta_v2.json"
-RELATION_VOCAB_V2_PATH = ROOT_DIR / "models" / "bp_relation_vocab_v2.json"
-RELATION_MODEL_V2_PATH = ROOT_DIR / "models" / "bp_relation_net_v2.pt"
-RELATION_META_LEGACY_PATH = ROOT_DIR / "models" / "bp_relation_meta.json"
-RELATION_VOCAB_LEGACY_PATH = ROOT_DIR / "models" / "bp_relation_vocab.json"
-RELATION_MODEL_LEGACY_PATH = ROOT_DIR / "models" / "bp_relation_net.pt"
-RELATION_V2_BUNDLE_READY = all(
-    path.exists()
-    for path in (RELATION_MODEL_V2_PATH, RELATION_META_V2_PATH, RELATION_VOCAB_V2_PATH)
-)
-RELATION_META_PATH = (
-    RELATION_META_V2_PATH if RELATION_V2_BUNDLE_READY else RELATION_META_LEGACY_PATH
-)
-RELATION_VOCAB_PATH = (
-    RELATION_VOCAB_V2_PATH if RELATION_V2_BUNDLE_READY else RELATION_VOCAB_LEGACY_PATH
+SHARED_META_PATH = ROOT_DIR / "models" / "bp_shared_meta.json"
+SHARED_VOCAB_PATH = ROOT_DIR / "models" / "bp_shared_vocab.json"
+SHARED_MODEL_PATH = ROOT_DIR / "models" / "bp_shared.pt"
+SHARED_BUNDLE_READY = all(
+    path.exists() for path in (SHARED_MODEL_PATH, SHARED_META_PATH, SHARED_VOCAB_PATH)
 )
 SW_UI_DIR = ROOT_DIR / "sw_ui_detection"
 SW_UI_OUTPUT_DIR = SW_UI_DIR / "output"
@@ -96,20 +93,6 @@ def save_json_file(path: Path, value):
         json.dump(value, f, ensure_ascii=False, indent=2)
 
 
-def normalize_name(name):
-    if name is None:
-        return ""
-    return str(name).strip().lower()
-
-
-def slugify_fallback(name):
-    text = normalize_name(name)
-    text = text.replace(" - ", " ")
-    text = text.replace("_", " ")
-    text = text.replace("/", " ")
-    return "-".join(text.split())
-
-
 def lucksack_image_url(value):
     raw = str(value or "").strip()
     if not raw:
@@ -126,7 +109,6 @@ def resolve_image_path(path_value):
     raw = str(path_value).strip()
     if raw.startswith(("http://", "https://")):
         return raw
-    raw = raw.replace("/", "\\")
     path = Path(raw)
     candidates = []
     if path.is_absolute():
@@ -145,7 +127,7 @@ def resolve_image_path(path_value):
 def is_supported_image_file(path_value):
     try:
         suffix = Path(path_value).suffix.lower()
-    except Exception:
+    except (TypeError, ValueError, OSError):
         return False
     return suffix in {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
 
@@ -180,7 +162,7 @@ def get_image_path_for_monster(monster, image_lookup):
         str(monster).strip().lower(),
         str(monster).strip().replace("-", " "),
         str(monster).strip().replace(" ", "-"),
-        slugify_fallback(monster),
+        slugify_name(monster),
     ]
     for candidate in candidates:
         path = image_lookup.get(normalize_name(candidate))
@@ -189,9 +171,9 @@ def get_image_path_for_monster(monster, image_lookup):
     return None
 
 
-def load_neural_monster_metadata():
-    meta = load_json_file(RELATION_META_PATH, {})
-    vocab = load_json_file(RELATION_VOCAB_PATH, {})
+def load_shared_monster_metadata():
+    meta = load_json_file(SHARED_META_PATH, {})
+    vocab = load_json_file(SHARED_VOCAB_PATH, {})
     display_name_map = meta.get("display_name_map", {}) or {}
     monster_frequency = meta.get("monster_frequency", {}) or {}
 
@@ -214,74 +196,34 @@ def load_neural_monster_metadata():
         monster_pool.append(display_name)
         try:
             pick_freq[display_name] = int(float(monster_frequency.get(slug, monster_frequency.get(str(_idx), 0)) or 0))
-        except Exception:
+        except (TypeError, ValueError):
             pick_freq[display_name] = 0
 
     from bp_core.lucksack_stats import BPLucksackStats
 
     luck_stats = BPLucksackStats()
-    for slug in luck_stats.candidate_slugs():
-        display_name = luck_stats.to_display_name(slug)
-        if not display_name or display_name in seen:
-            continue
-        seen.add(display_name)
-        monster_pool.append(display_name)
-        pick_freq[display_name] = luck_stats.pick_frequency(slug)
-
+    usable_names = {
+        normalize_name(
+            luck_stats.to_display_name(item.get("slug"))
+            or item.get("label")
+            or item.get("slabel")
+            or item.get("slug")
+            or ""
+        )
+        for item in (luck_stats.catalog if isinstance(luck_stats.catalog, list) else [])
+        if is_usable_catalog_item(item)
+    }
+    if usable_names:
+        monster_pool = [
+            monster
+            for monster in monster_pool
+            if normalize_name(monster) in usable_names
+        ]
     return monster_pool, pick_freq
 
 
 def sort_monsters_by_pick_frequency(monsters, pick_freq):
     return sorted(monsters, key=lambda m: (-pick_freq.get(m, 0), m))
-
-
-def infer_bp_stage(my_picks, enemy_picks, first_pick_side="me"):
-    my_count = len(my_picks or [])
-    enemy_count = len(enemy_picks or [])
-
-    if my_count >= 5 and enemy_count >= 5:
-        return "ban"
-
-    order = my_count + enemy_count + 1
-    side = infer_side_for_order(order, first_pick_side)
-    if side is None:
-        return "idle"
-    current_count = my_count if side == "my" else enemy_count
-    remain = 5 - current_count
-    if remain <= 0:
-        return "idle"
-    next_side = infer_side_for_order(order + 1, first_pick_side)
-    if remain >= 2 and next_side == side:
-        return "pick_multi"
-    return "pick_single"
-
-
-def infer_turn_from_state(my_picks, enemy_picks, first_pick_side):
-    total = len(my_picks) + len(enemy_picks)
-    turn = total + 1
-    first_pick_side = normalize_name(first_pick_side)
-    if first_pick_side not in {"me", "enemy"}:
-        return None
-
-    if first_pick_side == "me":
-        my_turns = {1, 4, 5, 8, 9}
-    else:
-        my_turns = {2, 3, 6, 7, 10}
-
-    if turn not in my_turns:
-        return None
-    return turn
-
-
-def infer_side_for_order(order, first_pick_side):
-    if order is None or order < 1 or order > 10:
-        return None
-    first_pick_side = normalize_name(first_pick_side)
-    if first_pick_side not in {"me", "enemy"}:
-        return None
-    first = "my" if first_pick_side == "me" else "enemy"
-    other = "enemy" if first == "my" else "my"
-    return [first, other, other, first, first, other, other, first, first, other][order - 1]
 
 
 class ScrollableFrame(ttk.Frame):
@@ -352,9 +294,7 @@ class DesktopBPApp:
         self.root.geometry("1800x1050")
         self.root.minsize(1500, 900)
 
-        self.relation_recommender = None
-        self.ban_value_recommender = None
-        self.prefix_value_recommender = None
+        self.shared_recommender = None
         self.bp_analyzer = None
         self._core_data_ready = False
         self._box_tab_loaded = False
@@ -462,6 +402,7 @@ class DesktopBPApp:
         from bp_core.lucksack_stats import BPLucksackStats
 
         luck_stats = BPLucksackStats()
+        ambiguous_short_names = build_catalog_ambiguous_short_names(luck_stats.catalog)
         catalog_by_slug = {
             str(item.get("slug") or "").strip().lower(): item
             for item in (luck_stats.catalog if isinstance(luck_stats.catalog, list) else [])
@@ -470,14 +411,23 @@ class DesktopBPApp:
         alias_entries = dict(generated_alias_map)
         aliases_by_id = swkit_alias_data.get("aliases_by_id") or {}
         for item in (luck_stats.catalog if isinstance(luck_stats.catalog, list) else []):
+            if not is_usable_catalog_item(item):
+                continue
             display_name = luck_stats.to_display_name(item.get("slug"))
             unit_id = str(item.get("com2us_id") or "").strip()
             if display_name and unit_id:
                 for alias in aliases_by_id.get(unit_id, []):
-                    alias_entries.setdefault(str(alias).strip(), display_name)
+                    alias = str(alias).strip()
+                    if not alias:
+                        continue
+                    existing_target = alias_entries.get(alias)
+                    if existing_target is None:
+                        alias_entries[alias] = display_name
+                    elif existing_target != display_name:
+                        alias_entries[alias] = ""
         for slug in luck_stats.candidate_slugs():
             display_name = luck_stats.to_display_name(slug)
-            if not display_name:
+            if not display_name or normalize_name(display_name) in ambiguous_short_names:
                 continue
             catalog_item = catalog_by_slug.get(str(slug).strip().lower(), {})
             attr_map.setdefault(display_name, str(catalog_item.get("element") or ""))
@@ -498,32 +448,41 @@ class DesktopBPApp:
             for key, value in image_map.items()
         }
         for alias, display_name in alias_entries.items():
+            if not display_name:
+                continue
             image_value = image_by_name.get(normalize_name(display_name))
             if image_value:
                 image_map.setdefault(alias, image_value)
 
         image_lookup = build_image_lookup(image_map)
-        monster_pool, pick_freq = load_neural_monster_metadata()
-        if not monster_pool:
-            fallback_names = set(image_map) | set(attr_map) | set(family_map)
-            monster_pool = sorted(str(name).strip() for name in fallback_names if str(name).strip())
+        monster_pool, pick_freq = load_shared_monster_metadata()
         alias_lookup = {}
         search_text_map = {}
         pool_lookup = {
             normalize_name(monster): monster
             for monster in monster_pool
         }
-        aliases_by_target = {}
+        alias_targets = {}
         for alias, display_name in alias_entries.items():
             target = pool_lookup.get(normalize_name(display_name))
             if target:
-                aliases_by_target.setdefault(target, set()).add(str(alias).strip())
-                alias_lookup[normalize_name(alias)] = target
+                alias_key = normalize_name(alias)
+                existing_target = alias_targets.get(alias_key)
+                if existing_target is None:
+                    alias_targets[alias_key] = target
+                elif existing_target != target:
+                    alias_targets[alias_key] = ""
+        aliases_by_target = {}
+        for alias, target in alias_targets.items():
+            if not target:
+                continue
+            aliases_by_target.setdefault(target, set()).add(alias)
+            alias_lookup[alias] = target
         for monster in monster_pool:
             alias_lookup.setdefault(normalize_name(monster), monster)
             aliases = sorted(aliases_by_target.get(monster, set()))
             search_text_map[monster] = " ".join(
-                [monster, slugify_fallback(monster), *aliases]
+                [monster, slugify_name(monster), *aliases]
             ).lower()
         return {
             "monster_pool": monster_pool,
@@ -673,7 +632,7 @@ class DesktopBPApp:
 
         images_row = tk.Frame(card, bg="#ffffff")
         images_row.pack(fill=tk.X, padx=6)
-        for monster in plan.get("plan", []):
+        for monster in plan["plan"]:
             block = tk.Frame(images_row, bg="#ffffff")
             block.pack(side=tk.LEFT, padx=2, pady=(0, 3))
             photo = self.get_photo(monster, size=SIDEBAR_PLAN_IMAGE_SIZE)
@@ -694,16 +653,6 @@ class DesktopBPApp:
         info.pack(fill=tk.X, padx=6, pady=(0, 4))
         tk.Label(info, text=f"Score {float(plan.get('plan_score', 0.0)):.4f}", bg="#ffffff", anchor="w", font=("", 8)).pack(fill=tk.X)
         tk.Label(info, text=f"Win {self._format_plan_win_rate(plan)}", bg="#ffffff", anchor="w", font=("", 8)).pack(fill=tk.X)
-        rerank_value = plan.get("rerank_value", plan.get("detail", {}).get("partial_value_win_rate"))
-        if rerank_value is None:
-            rerank_text = "N/A"
-        else:
-            try:
-                rerank_text = f"{float(rerank_value):.4f}"
-            except (TypeError, ValueError):
-                rerank_text = "N/A"
-        tk.Label(info, text=f"Rerank {rerank_text}", bg="#ffffff", anchor="w", font=("", 8)).pack(fill=tk.X)
-
         tk.Button(card, text="Apply", command=lambda p=plan: self.apply_pick_plan(p), font=("", 8, "bold"), height=1).pack(fill=tk.X, padx=6, pady=(0, 6))
         return card
 
@@ -711,7 +660,7 @@ class DesktopBPApp:
         card = tk.Frame(parent, bg="#ffffff", bd=1, relief=tk.RIDGE)
         tk.Label(card, text=f"Ban {idx}", bg="#ffffff", font=("", 9, "bold")).pack(anchor="w", padx=6, pady=(5, 3))
 
-        monster = plan.get("ban") or plan.get("monster", "")
+        monster = plan["plan"][0]
         photo = self.get_photo(monster, size=SIDEBAR_RESULT_IMAGE_SIZE)
         image_label = tk.Label(card, image=photo if photo else "", text="" if photo else "No Img", bg="#ffffff")
         image_label.image = photo
@@ -736,14 +685,10 @@ class DesktopBPApp:
         return card
 
     def _format_plan_win_rate(self, plan):
-        detail = plan.get("detail", {}) if isinstance(plan.get("detail"), dict) else {}
-        source = str(detail.get("win_rate_source") or "")
-        if source in {"prefix_value_unavailable", "prefix_value_failed"}:
-            return "N/A"
-        if source == "" and str(plan.get("source", "")).startswith("relation"):
+        if plan.get("estimated_win_rate") is None:
             return "N/A"
         try:
-            return f"{float(plan.get('estimated_win_rate', 0.0)):.4f}"
+            return f"{float(plan['estimated_win_rate']):.4f}"
         except (TypeError, ValueError):
             return "N/A"
 
@@ -941,54 +886,18 @@ class DesktopBPApp:
     def _set_transient_status(self, text):
         self.status_var.set(text)
 
-    def _relation_model_bundle_ready(self):
-        return (
-            (
-                (ROOT_DIR / "models" / "bp_relation_net_v2.pt").exists()
-                and (ROOT_DIR / "models" / "bp_relation_meta_v2.json").exists()
-                and (ROOT_DIR / "models" / "bp_relation_vocab_v2.json").exists()
-            )
-            or (
-                (ROOT_DIR / "models" / "bp_relation_net.pt").exists()
-                and (ROOT_DIR / "models" / "bp_relation_meta.json").exists()
-                and (ROOT_DIR / "models" / "bp_relation_vocab.json").exists()
-            )
-        )
+    def _shared_model_bundle_ready(self):
+        return SHARED_BUNDLE_READY
 
-    def _get_relation_recommender(self):
-        if self.relation_recommender is not None:
-            return self.relation_recommender
-        if not self._relation_model_bundle_ready():
-            raise RuntimeError("Relation model is not available. Run python -m training.relation first.")
-        from bp_recommender.relation import BPRelationRecommender
+    def _get_shared_recommender(self):
+        if self.shared_recommender is not None:
+            return self.shared_recommender
+        if not self._shared_model_bundle_ready():
+            raise RuntimeError("Shared BP Core is not available. Run python -m training.shared_bp first.")
+        from bp_recommender.shared import BPSharedRecommender
 
-        self.relation_recommender = BPRelationRecommender()
-        return self.relation_recommender
-
-    def _prefix_value_model_bundle_ready(self):
-        return (
-            (ROOT_DIR / "models" / "bp_prefix_value_net.pt").exists()
-            and (ROOT_DIR / "models" / "bp_prefix_value_meta.json").exists()
-            and (ROOT_DIR / "models" / "bp_prefix_value_vocab.json").exists()
-        )
-
-    def _get_prefix_value_recommender(self):
-        if self.prefix_value_recommender is not None:
-            return self.prefix_value_recommender
-        if not self._prefix_value_model_bundle_ready():
-            raise RuntimeError("Prefix value model is not available. Run python -m training.prefix_value first.")
-        from bp_recommender.prefix_value import BPPrefixValueRecommender
-
-        self.prefix_value_recommender = BPPrefixValueRecommender()
-        return self.prefix_value_recommender
-
-    def _get_ban_value_recommender(self):
-        if self.ban_value_recommender is not None:
-            return self.ban_value_recommender
-        from bp_recommender.ban_value import BPBanValueRecommender
-
-        self.ban_value_recommender = BPBanValueRecommender()
-        return self.ban_value_recommender
+        self.shared_recommender = BPSharedRecommender()
+        return self.shared_recommender
 
     def _get_bp_analyzer(self):
         if self.bp_analyzer is not None:
@@ -1024,15 +933,12 @@ class DesktopBPApp:
         return order
 
     def _pick_side_for_order(self, order):
-        if order is None or order < 1 or order > 10:
+        if order is None:
             return None
-        first_pick_side = normalize_name(self.first_pick_var.get())
-        if first_pick_side not in {"me", "enemy"}:
+        side = side_for_order(order, self.first_pick_var.get())
+        if side is None:
             return None
-        first = "my" if first_pick_side == "me" else "enemy"
-        other = "enemy" if first == "my" else "my"
-        pattern = [first, other, other, first, first, other, other, first, first, other]
-        return pattern[order - 1]
+        return "my" if side == "me" else "enemy"
 
     def _current_pick_side(self):
         return self._pick_side_for_order(self._current_pick_order())
@@ -1040,35 +946,6 @@ class DesktopBPApp:
     def _effective_bp_page_size(self):
         raw_size = max(BP_GALLERY_COLUMNS, int(self.bp_page_size_var.get()))
         return int(math.ceil(raw_size / BP_GALLERY_COLUMNS) * BP_GALLERY_COLUMNS)
-
-    def _predict_enemy_ban_target(self):
-        if len(self.my_picks) != 5 or len(self.enemy_picks) != 5:
-            return None
-
-        best_target = None
-        best_wr = None
-        ban_value_recommender = self._get_ban_value_recommender()
-        for monster in self.my_picks:
-            result = ban_value_recommender.evaluate_state(
-                my_picks=self.my_picks,
-                enemy_picks=self.enemy_picks,
-                my_ban=self.my_final_ban,
-                enemy_ban=monster,
-                my_leader=self.my_leader_var.get().strip(),
-                enemy_leader=self.enemy_leader_var.get().strip(),
-                return_detail=True,
-            )
-            win_rate = float(result.get("calibrated_win_rate", 0.0))
-            if best_wr is None or win_rate < best_wr:
-                best_wr = win_rate
-                best_target = monster
-
-        if best_target is None:
-            return None
-        return {
-            "monster": best_target,
-            "estimated_win_rate": best_wr,
-        }
 
     def _box_gallery_primary_buttons(self, monster, owned):
         if owned:
@@ -1079,17 +956,11 @@ class DesktopBPApp:
         if len(self.my_picks) == 5 and len(self.enemy_picks) == 5:
             return "ban" if not self.my_final_ban else None
 
-        stage = infer_bp_stage(
-            self.my_picks,
-            self.enemy_picks,
-            self.first_pick_var.get(),
-        )
-        if stage in {"pick_single", "pick_multi"}:
-            side = self._current_pick_side()
-            if side == "my":
-                return "pick"
-            if side == "enemy":
-                return "enemy_prediction"
+        side = self._current_pick_side()
+        if side == "my":
+            return "pick"
+        if side == "enemy":
+            return "enemy_prediction"
         return None
 
     def _run_auto_recommendation_if_needed(self):
@@ -1689,9 +1560,7 @@ class DesktopBPApp:
         title_label = tk.Label(card, text=f"Pred {idx}", bg="#ffffff", font=("", 9, "bold"))
         title_label.pack(anchor="w", padx=6, pady=(5, 3))
 
-        monsters = [monster for monster in prediction.get("plan") or prediction.get("monsters") or [] if monster]
-        if not monsters and prediction.get("monster"):
-            monsters = [prediction.get("monster")]
+        monsters = [monster for monster in prediction["plan"] if monster]
         image_row = tk.Frame(card, bg="#ffffff")
         image_row.pack(fill=tk.X, padx=6)
         clickable_widgets = [card, title_label, image_row]
@@ -1716,7 +1585,7 @@ class DesktopBPApp:
 
         info = tk.Frame(card, bg="#ffffff")
         info.pack(fill=tk.X, padx=6, pady=(4, 4))
-        info_label = tk.Label(info, text=f"Score {float(prediction.get('final_score', 0.0)):.4f}", bg="#ffffff", anchor="w", font=("", 8))
+        info_label = tk.Label(info, text=f"Score {float(prediction['plan_score']):.4f}", bg="#ffffff", anchor="w", font=("", 8))
         info_label.pack(fill=tk.X)
         clickable_widgets.extend([info, info_label])
         tk.Button(
@@ -1752,6 +1621,8 @@ class DesktopBPApp:
             only_owned=self.only_owned_in_picker_var.get(),
             only_with_image=self.only_with_image_var.get(),
         )
+        occupied = set(self.my_picks) | set(self.enemy_picks)
+        monsters = [monster for monster in monsters if monster not in occupied]
 
         page_size = self._effective_bp_page_size()
         page_items, current_page, total_pages, total_items = self.paginate(monsters, self.bp_gallery_page, page_size)
@@ -1803,11 +1674,14 @@ class DesktopBPApp:
         target = self.my_picks if side == "my" else self.enemy_picks
         if monster in target:
             return
+        other = self.enemy_picks if side == "my" else self.my_picks
+        if monster in other:
+            messagebox.showwarning("提示", "该魔灵已经在另一方阵容中。")
+            return
         if len(target) >= 5:
             messagebox.showwarning("提示", f"{'我方' if side == 'my' else '敌方'}已满，无法继续加入。")
             return
 
-        self.remove_from_all(monster)
         target.append(monster)
         final_status = status_text or f"已将 {monster} 加入 {'我方' if side == 'my' else '敌方'}"
         self._apply_bp_state_change(final_status)
@@ -1826,55 +1700,41 @@ class DesktopBPApp:
         self._apply_bp_state_change("已清空当前 BP 状态")
 
     def apply_pick_plan(self, plan):
-        targets = [
-            self._resolve_monster_name(x) or str(x).strip()
-            for x in plan.get("plan", [])
-            if x
-        ]
-        remain = 5 - len(self.my_picks)
-        unique_targets = []
-        for monster in targets:
-            if monster not in unique_targets:
-                unique_targets.append(monster)
-
-        to_add = [m for m in unique_targets if m not in self.my_picks]
-        if len(to_add) > remain:
-            messagebox.showwarning("提示", f"我方剩余位置不足，仅剩 {remain} 个。")
-            return
-
-        for monster in to_add:
-            self.remove_from_all(monster)
-            self.my_picks.append(monster)
-
-        joined = " + ".join(to_add) if to_add else "当前方案"
-        self._apply_bp_state_change(f"已采用推荐方案：{joined}")
+        self._apply_recommended_event("me", plan["plan"], "推荐方案")
 
     def apply_enemy_prediction(self, prediction):
-        targets = [
-            self._resolve_monster_name(x) or str(x).strip()
-            for x in (prediction.get("plan") or prediction.get("monsters") or [])
-            if x
-        ]
-        if not targets and prediction.get("monster"):
-            target = self._resolve_monster_name(prediction.get("monster"))
-            targets = [target or str(prediction.get("monster")).strip()]
-        remain = 5 - len(self.enemy_picks)
-        unique_targets = []
-        for monster in targets:
-            if monster not in unique_targets:
-                unique_targets.append(monster)
+        self._apply_recommended_event("enemy", prediction["plan"], "对方预测")
 
-        to_add = [monster for monster in unique_targets if monster not in self.enemy_picks]
-        if len(to_add) > remain:
-            messagebox.showwarning("提示", f"敌方剩余位置不足，仅剩 {remain} 个。")
+    def _apply_recommended_event(self, side, raw_targets, label):
+        expected_side = self._current_pick_side()
+        target_side = "my" if side == "me" else "enemy"
+        expected_count = infer_pick_count_for_side(
+            self.my_picks,
+            self.enemy_picks,
+            self.first_pick_var.get(),
+            side,
+        )
+        if expected_side != target_side or expected_count not in {1, 2}:
+            messagebox.showwarning("提示", "当前 BP 轮次与推荐动作不匹配。")
             return
 
-        for monster in to_add:
-            self.remove_from_all(monster)
-            self.enemy_picks.append(monster)
+        targets = []
+        for raw in raw_targets or ():
+            monster = self._resolve_monster_name(raw)
+            if monster and monster not in targets:
+                targets.append(monster)
+        occupied = set(self.my_picks) | set(self.enemy_picks)
+        target = self.my_picks if side == "me" else self.enemy_picks
+        if (
+            len(targets) != expected_count
+            or len(target) + expected_count > 5
+            or any(monster in occupied for monster in targets)
+        ):
+            messagebox.showwarning("提示", "推荐动作不完整、已占用或超出当前空位。")
+            return
 
-        joined = " + ".join(to_add) if to_add else "当前预测"
-        self._apply_bp_state_change(f"已采用对方预测：{joined}")
+        target.extend(targets)
+        self._apply_bp_state_change(f"已采用{label}：{' + '.join(targets)}")
 
     def apply_my_final_ban(self, monster):
         self.my_final_ban = monster
@@ -1883,23 +1743,22 @@ class DesktopBPApp:
     def generate_pick_recommendations(self, silent=False):
         if not self._ensure_core_data_ready(silent=silent):
             return False
-        turn = infer_turn_from_state(self.my_picks, self.enemy_picks, self.first_pick_var.get())
-        stage = infer_bp_stage(
-            self.my_picks,
-            self.enemy_picks,
-            self.first_pick_var.get(),
-        )
-        if stage not in {"pick_single", "pick_multi"} or turn is None:
+        turn = self._current_pick_order()
+        if turn is None or self._current_pick_side() != "my":
             if not silent:
                 messagebox.showinfo("Notice", "It is not my pick turn right now.")
             return False
 
-        pick_count = 1 if stage == "pick_single" else 2
+        pick_count = infer_pick_count_for_side(
+            self.my_picks,
+            self.enemy_picks,
+            self.first_pick_var.get(),
+            "me",
+        )
         state_snapshot = {
             "my_picks": list(self.my_picks),
             "enemy_picks": list(self.enemy_picks),
             "turn": int(turn),
-            "stage": stage,
             "first_pick_side": self.first_pick_var.get(),
             "top_k": max(1, int(self.top_k_var.get())),
             "candidate_pool": list(self.build_candidate_pool()),
@@ -1912,25 +1771,30 @@ class DesktopBPApp:
             "pick_count": pick_count,
             "context_signature": self._recommendation_context_signature(),
         }
+        state_snapshot["events"] = timeline_from_picks(
+            state_snapshot["my_picks"],
+            state_snapshot["enemy_picks"],
+            state_snapshot["first_pick_side"],
+        ).to_dict()
+        state_snapshot["current_side"] = "me"
 
         def work():
-            relation_recommender = self._get_relation_recommender()
-            plans = relation_recommender.recommend_pick_plans(
+            model = self._get_shared_recommender()
+            plans = model.recommend_pick_plans(
                 my_picks=state_snapshot["my_picks"],
                 enemy_picks=state_snapshot["enemy_picks"],
                 pick_count=state_snapshot["pick_count"],
                 turn=state_snapshot["turn"],
                 first_pick_side=state_snapshot["first_pick_side"],
-                top_k=(
-                    state_snapshot["top_k"] * 4
-                    if self._prefix_value_model_bundle_ready()
-                    else state_snapshot["top_k"]
-                ),
+                top_k=state_snapshot["top_k"],
                 candidate_pool=state_snapshot["candidate_pool"],
                 my_box=state_snapshot["my_box"],
                 use_my_box_for_reco=state_snapshot["use_my_box_for_reco"],
+                events=state_snapshot["events"],
             )
-            return self._attach_pick_plan_win_rates(plans, state_snapshot)
+            return BPDecisionEngine(model=model, assets={"options": state_snapshot["candidate_pool"]}).rank_my_plans(
+                plans, state_snapshot, state_snapshot["top_k"]
+            )
 
         def apply_result(plans):
             if state_snapshot["context_signature"] != self._recommendation_context_signature():
@@ -1943,105 +1807,12 @@ class DesktopBPApp:
 
         return self._start_background_task("Generating pick recommendations", work, apply_result)
 
-    def _attach_pick_plan_win_rates(self, plans, state_snapshot):
-        if not plans:
-            return plans
-
-        try:
-            prefix_value_recommender = self._get_prefix_value_recommender()
-            base_eval = prefix_value_recommender.evaluate_state(
-                my_picks=state_snapshot["my_picks"],
-                enemy_picks=state_snapshot["enemy_picks"],
-                turn=state_snapshot["turn"],
-                first_pick_side=state_snapshot["first_pick_side"],
-                current_side="me",
-                my_leader=state_snapshot["my_leader"],
-                enemy_leader=state_snapshot["enemy_leader"],
-                return_detail=True,
-            )
-            base_wr = float(base_eval.get("calibrated_win_rate", 0.0))
-            base_raw_wr = float(base_eval.get("raw_win_rate", 0.0))
-            value_source = "prefix_value"
-        except Exception as exc:
-            print(f"[WARN] prefix value model unavailable for pick ranking: {exc}")
-            for plan in plans:
-                detail = dict(plan.get("detail", {}) or {})
-                detail["win_rate_source"] = "prefix_value_unavailable"
-                detail["ranking_source"] = "relation_only"
-                plan["detail"] = detail
-            return plans[: int(state_snapshot["top_k"])]
-
-        enriched = []
-        for plan in plans:
-            item = dict(plan)
-            plan_picks = [monster for monster in item.get("plan", []) if monster]
-            future_my_picks = list(state_snapshot["my_picks"]) + plan_picks
-            detail = dict(item.get("detail", {}) or {})
-            try:
-                eval_result = prefix_value_recommender.evaluate_state(
-                    my_picks=future_my_picks,
-                    enemy_picks=state_snapshot["enemy_picks"],
-                    turn=state_snapshot["turn"] + len(plan_picks),
-                    first_pick_side=state_snapshot["first_pick_side"],
-                    current_side="enemy",
-                    my_leader=state_snapshot["my_leader"],
-                    enemy_leader=state_snapshot["enemy_leader"],
-                    return_detail=True,
-                )
-                wr = float(eval_result.get("calibrated_win_rate", 0.0))
-                raw_wr = float(eval_result.get("raw_win_rate", 0.0))
-                relation_component = float(
-                    detail.get("normalized_relation_score", item.get("plan_score", 0.0)) or 0.0
-                )
-                draft_stats_component = float(detail.get("draft_stats_score", 0.5) or 0.5)
-                fused_score = (
-                    0.65 * wr + 0.25 * relation_component + 0.10 * draft_stats_component
-                    if detail.get("draft_stats_source") not in {None, "unavailable"}
-                    else 0.70 * wr + 0.30 * relation_component
-                )
-                item["plan_score"] = round(fused_score, 6)
-                item["estimated_win_rate"] = round(wr, 6)
-                item["rerank_value"] = round(wr, 6)
-                detail.update(
-                    {
-                        "pre_pick_win_rate": round(base_wr, 6),
-                        "post_pick_win_rate": round(wr, 6),
-                        "win_rate_gain": round(wr - base_wr, 6),
-                        "raw_pre_pick_win_rate": round(base_raw_wr, 6),
-                        "raw_post_pick_win_rate": round(raw_wr, 6),
-                        "raw_win_rate_gain": round(raw_wr - base_raw_wr, 6),
-                        "win_rate_source": value_source,
-                        "ranking_source": (
-                            "prefix_value_0.65_relation_0.25_stats_0.10"
-                            if detail.get("draft_stats_source") not in {None, "unavailable"}
-                            else "prefix_value_0.70_relation_0.30"
-                        ),
-                        "relation_component": round(relation_component, 6),
-                        "value_component": round(wr, 6),
-                        "draft_stats_component": round(draft_stats_component, 6),
-                        "partial_value_win_rate": round(wr, 6),
-                        "fused_score": round(fused_score, 6),
-                    }
-                )
-            except Exception as exc:
-                print(f"[WARN] failed to evaluate pick plan win rate for {plan_picks}: {exc}")
-                item["estimated_win_rate"] = 0.0
-                detail.setdefault("win_rate_source", "prefix_value_failed")
-            item["detail"] = detail
-            enriched.append(item)
-        enriched.sort(key=lambda row: float(row.get("plan_score", 0.0)), reverse=True)
-        return enriched[: int(state_snapshot["top_k"])]
-
     def generate_enemy_predictions(self, silent=False):
         if not self._ensure_core_data_ready(silent=silent):
             return False
-        stage = infer_bp_stage(
-            self.my_picks,
-            self.enemy_picks,
-            self.first_pick_var.get(),
-        )
+        turn = self._current_pick_order()
         current_side = self._current_pick_side()
-        if stage not in {"pick_single", "pick_multi"} or current_side != "enemy":
+        if turn is None or current_side != "enemy":
             if not silent:
                 messagebox.showinfo("Notice", "It is not the enemy pick turn right now.")
             return False
@@ -2049,7 +1820,7 @@ class DesktopBPApp:
         state_snapshot = {
             "my_picks": list(self.my_picks),
             "enemy_picks": list(self.enemy_picks),
-            "turn": len(self.my_picks) + len(self.enemy_picks) + 1,
+            "turn": turn,
             "first_pick_side": self.first_pick_var.get(),
             "pick_count": infer_pick_count_for_side(
                 self.my_picks,
@@ -2063,25 +1834,29 @@ class DesktopBPApp:
             "enemy_leader": self.enemy_leader_var.get().strip(),
             "context_signature": self._recommendation_context_signature(),
         }
+        state_snapshot["events"] = timeline_from_picks(
+            state_snapshot["my_picks"],
+            state_snapshot["enemy_picks"],
+            state_snapshot["first_pick_side"],
+        ).to_dict()
+        state_snapshot["current_side"] = "enemy"
 
         def work():
-            relation_recommender = self._get_relation_recommender()
-            predictions = relation_recommender.recommend_enemy_next_picks(
+            model = self._get_shared_recommender()
+            predictions = model.recommend_enemy_next_picks(
                 my_picks=state_snapshot["my_picks"],
                 enemy_picks=state_snapshot["enemy_picks"],
                 first_pick_side=state_snapshot["first_pick_side"],
                 pick_count=state_snapshot["pick_count"],
-                top_k=(
-                    state_snapshot["top_k"] * 4
-                    if self._prefix_value_model_bundle_ready()
-                    else state_snapshot["top_k"]
-                ),
+                top_k=state_snapshot["top_k"],
                 candidate_pool=state_snapshot["candidate_pool"],
                 max_pair_candidates=400,
-                my_leader=state_snapshot["my_leader"],
-                enemy_leader=state_snapshot["enemy_leader"],
+                turn=state_snapshot["turn"],
+                events=state_snapshot["events"],
             )
-            return self._attach_enemy_prediction_values(predictions, state_snapshot)
+            return BPDecisionEngine(model=model, assets={"options": state_snapshot["candidate_pool"]}).rank_enemy_plans(
+                predictions, state_snapshot, state_snapshot["top_k"]
+            )
 
         def apply_result(predictions):
             if state_snapshot["context_signature"] != self._recommendation_context_signature():
@@ -2094,77 +1869,6 @@ class DesktopBPApp:
 
         return self._start_background_task("Generating enemy predictions", work, apply_result)
 
-    def _attach_enemy_prediction_values(self, predictions, state_snapshot):
-        if not predictions:
-            return predictions
-        try:
-            prefix_value_recommender = self._get_prefix_value_recommender()
-        except Exception as exc:
-            print(f"[WARN] prefix value model unavailable for enemy ranking: {exc}")
-            return predictions[: int(state_snapshot["top_k"])]
-
-        enriched = []
-        for prediction in predictions:
-            item = dict(prediction)
-            monsters = [monster for monster in item.get("plan") or item.get("monsters") or [] if monster]
-            if not monsters:
-                monster = item.get("monster") or item.get("display_name")
-                monsters = [monster] if monster else []
-            future_enemy_picks = list(state_snapshot["enemy_picks"]) + monsters
-            detail = dict(item.get("detail", {}) or {})
-            try:
-                eval_result = prefix_value_recommender.evaluate_state(
-                    my_picks=state_snapshot["my_picks"],
-                    enemy_picks=future_enemy_picks,
-                    turn=state_snapshot["turn"] + len(monsters),
-                    first_pick_side=state_snapshot["first_pick_side"],
-                    current_side=(
-                        "me"
-                        if infer_side_for_order(
-                            state_snapshot["turn"] + len(monsters),
-                            state_snapshot["first_pick_side"],
-                        )
-                        == "my"
-                        else "enemy"
-                    ),
-                    my_leader=state_snapshot["my_leader"],
-                    enemy_leader=state_snapshot["enemy_leader"],
-                    return_detail=True,
-                )
-                wr = float(eval_result.get("calibrated_win_rate", 0.0))
-                relation_component = float(
-                    detail.get("normalized_relation_score", item.get("final_score", 0.0)) or 0.0
-                )
-                draft_stats_component = float(detail.get("draft_stats_score", 0.5) or 0.5)
-                adversarial_score = (
-                    0.65 * (1.0 - wr) + 0.25 * relation_component + 0.10 * draft_stats_component
-                    if detail.get("draft_stats_source") not in {None, "unavailable"}
-                    else 0.70 * (1.0 - wr) + 0.30 * relation_component
-                )
-                item["estimated_win_rate"] = round(wr, 6)
-                item["final_score"] = round(adversarial_score, 6)
-                detail.update(
-                    {
-                        "post_enemy_pick_win_rate": round(wr, 6),
-                        "enemy_adversarial_score": round(adversarial_score, 6),
-                        "relation_component": round(relation_component, 6),
-                        "win_rate_source": "prefix_value",
-                        "ranking_source": (
-                            "enemy_value_0.65_relation_0.25_stats_0.10"
-                            if detail.get("draft_stats_source") not in {None, "unavailable"}
-                            else "enemy_value_0.70_relation_0.30"
-                        ),
-                        "draft_stats_component": round(draft_stats_component, 6),
-                    }
-                )
-            except Exception as exc:
-                print(f"[WARN] failed to evaluate enemy prediction {monsters}: {exc}")
-                detail.setdefault("win_rate_source", "prefix_value_failed")
-            item["detail"] = detail
-            enriched.append(item)
-        enriched.sort(key=lambda row: float(row.get("final_score", 0.0)), reverse=True)
-        return enriched[: int(state_snapshot["top_k"])]
-
     def generate_ban_recommendations(self, silent=False):
         if not self._ensure_core_data_ready(silent=silent):
             return False
@@ -2176,22 +1880,25 @@ class DesktopBPApp:
         state_snapshot = {
             "my_picks": list(self.my_picks),
             "enemy_picks": list(self.enemy_picks),
-            "my_leader": self.my_leader_var.get().strip(),
-            "enemy_leader": self.enemy_leader_var.get().strip(),
-            "enemy_ban": self.enemy_final_ban,
             "top_k": max(1, int(self.top_k_var.get())),
             "context_signature": self._recommendation_context_signature(),
         }
+        state_snapshot["events"] = timeline_from_picks(
+            state_snapshot["my_picks"],
+            state_snapshot["enemy_picks"],
+            self.first_pick_var.get(),
+        ).to_dict()
+        state_snapshot["turn"] = 11
+        state_snapshot["current_side"] = "me"
 
         def work():
-            ban_value_recommender = self._get_ban_value_recommender()
-            return ban_value_recommender.recommend_bans(
+            model = self._get_shared_recommender()
+            return model.recommend_ban_plans(
                 my_picks=state_snapshot["my_picks"],
                 enemy_picks=state_snapshot["enemy_picks"],
-                my_leader=state_snapshot["my_leader"],
-                enemy_leader=state_snapshot["enemy_leader"],
-                enemy_ban=state_snapshot["enemy_ban"],
                 top_k=state_snapshot["top_k"],
+                first_pick_side=self.first_pick_var.get(),
+                events=state_snapshot["events"],
             )
 
         def apply_result(plans):
@@ -2239,7 +1946,7 @@ class DesktopBPApp:
         self.bp_enemy_candidate_top_n_var.trace_add("write", lambda *_: self.refresh_bp_state_panel())
 
     def render_banned_section(self, parent):
-        section = ttk.LabelFrame(parent, text="对方 Ban 预测", padding=8, style="Section.TLabelframe")
+        section = ttk.LabelFrame(parent, text="我方 Ban 推荐", padding=8, style="Section.TLabelframe")
         section.pack(fill=tk.X, pady=(0, 10))
 
         if len(self.my_picks) != 5 or len(self.enemy_picks) != 5:
@@ -2254,15 +1961,19 @@ class DesktopBPApp:
 
         if self.enemy_final_ban:
             text = f"对方 Ban：{self.enemy_final_ban}"
-        else:
-            prediction = self._predict_enemy_ban_target()
-            if prediction:
-                text = (
-                    f"对方 Ban 预测：{prediction['monster']} "
-                    f"(我方 Ban 后预估胜率 {prediction['estimated_win_rate']:.4f})"
-                )
+        elif self.ban_plans:
+            plan = self.ban_plans[0]
+            monster = plan["plan"][0]
+            if monster:
+                score = plan.get("plan_score")
+                if score is None:
+                    text = f"我方 Ban 推荐：{monster}"
+                else:
+                    text = f"我方 Ban 推荐：{monster}（共享模型评分 {float(score):.4f}）"
             else:
-                text = "对方 Ban 预测：暂无"
+                text = "我方 Ban 推荐：暂无"
+        else:
+            text = "我方 Ban 推荐：暂无"
         ttk.Label(section, text=text, wraplength=600, justify=tk.LEFT).pack(anchor="w")
 
 

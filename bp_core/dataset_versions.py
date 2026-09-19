@@ -134,7 +134,7 @@ def get_dataset_version_weight(
     if explicit_weight is not None:
         try:
             return float(explicit_weight)
-        except Exception:
+        except (TypeError, ValueError):
             pass
 
     normalized = normalize_dataset_version(version)
@@ -149,7 +149,7 @@ def extract_dataset_version_from_path(path: str | Path, dataset_root: Path | str
 
     try:
         rel_path = Path(os.path.relpath(str(path_obj), str(root)))
-    except Exception:
+    except (OSError, ValueError):
         rel_path = path_obj
 
     parts = rel_path.parts

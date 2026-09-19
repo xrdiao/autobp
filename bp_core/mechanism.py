@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from bp_core.transformer_common import PROJECT_ROOT, normalize_name, slugify_fallback
+from bp_core.names import PROJECT_ROOT, normalize_name, slugify_name
 
 
 DEFAULT_MECHANISM_PATH = PROJECT_ROOT / "json" / "sw_mechanism_profiles.json"
@@ -81,7 +81,7 @@ class BPMechanismLayer:
         cached = self._resolve_cache.get(normalized)
         if cached is not None:
             return cached
-        fallback = slugify_fallback(value)
+        fallback = slugify_name(value)
         for key in (normalized, fallback):
             if key in self.profiles:
                 self._resolve_cache[normalized] = key
@@ -233,73 +233,6 @@ class BPMechanismLayer:
             "known_action_count": known_action_count,
             "threats": threat_rows,
             "action_tags": sorted(action_tags),
-            "reasons": reasons[:4],
-            "source": self.source_label,
-        }
-
-    def score_ban(self, my_picks, enemy_picks, target):
-        if not self.ready or not enemy_picks or not target:
-            return {
-                "available": False,
-                "score": 0.5,
-                "threat_reduction": 0.0,
-                "known_enemy_count": 0,
-                "known_target_count": 0,
-                "threats": [],
-                "reasons": [],
-                "source": self.source_label,
-            }
-
-        target_slug = self._resolve_slug(target)
-        before_weights, before_sources, known_enemy_count = self._enemy_threats(enemy_picks)
-        remaining = [
-            value
-            for value in enemy_picks or []
-            if self._resolve_slug(value) != target_slug
-        ]
-        after_weights, _after_sources, _known_remaining_count = self._enemy_threats(remaining)
-        target_profile = self.profile(target)
-        if not before_weights or not target_profile:
-            return {
-                "available": bool(known_enemy_count),
-                "score": 0.5,
-                "threat_reduction": 0.0,
-                "known_enemy_count": known_enemy_count,
-                "known_target_count": 1 if target_profile else 0,
-                "threats": [],
-                "reasons": [],
-                "source": self.source_label,
-            }
-
-        total_weight = sum(before_weights.values())
-        removed_weight = 0.0
-        threat_rows = []
-        reasons = []
-        for threat, before_weight in sorted(before_weights.items(), key=lambda item: item[1], reverse=True):
-            after_weight = after_weights.get(threat, 0.0)
-            reduction = max(0.0, before_weight - after_weight)
-            removed_weight += reduction
-            row = {
-                "threat": threat,
-                "label": THREAT_LABELS.get(threat, threat),
-                "before_weight": round(before_weight, 4),
-                "after_weight": round(after_weight, 4),
-                "reduction": round(reduction, 4),
-                "enemy_sources": sorted(set(before_sources.get(threat, []))),
-            }
-            threat_rows.append(row)
-            if reduction > 0:
-                reasons.append(f"Ban 后削弱{row['label']}")
-
-        threat_reduction = removed_weight / max(total_weight, 1e-6)
-        score = max(0.2, min(0.8, 0.5 + 0.30 * threat_reduction))
-        return {
-            "available": True,
-            "score": round(score, 6),
-            "threat_reduction": round(threat_reduction, 6),
-            "known_enemy_count": known_enemy_count,
-            "known_target_count": 1,
-            "threats": threat_rows,
             "reasons": reasons[:4],
             "source": self.source_label,
         }

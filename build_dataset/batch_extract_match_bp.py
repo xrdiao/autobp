@@ -22,16 +22,12 @@ from bp_core.dataset_versions import (
     sort_dataset_versions,
 )
 
-try:
-    from extract_match_bp import process_html_file
-except ImportError:
-    from build_dataset.extract_match_bp import process_html_file
+from build_dataset.extract_match_bp import process_html_file
 
 INPUT_DIR = PROJECT_ROOT / "dataset"
 DATA_DIR = PROJECT_ROOT / "data"
 OUTPUT_RAW = str(DATA_DIR / "matches_raw.sqlite")
 OUTPUT_DATASET = str(DATA_DIR / "bp_dataset.sqlite")
-OUTPUT_DATASET_PT = str(DATA_DIR / "bp_dataset.pt")
 OUTPUT_VERSION_SUMMARY = "json/dataset_version_summary.json"
 PLAYER_HTML_RE = re.compile(r"^(?:(?:\d+|norank)_(\d+)|my_bp)\.html$", re.IGNORECASE)
 DATASET_TABLE = "bp_dataset"
@@ -49,10 +45,8 @@ def parse_args():
     parser.add_argument("--input-dir", default=str(INPUT_DIR))
     parser.add_argument("--output-raw", default=OUTPUT_RAW)
     parser.add_argument("--output-dataset", default=OUTPUT_DATASET)
-    parser.add_argument("--output-dataset-pt", default=OUTPUT_DATASET_PT)
     parser.add_argument("--output-version-summary", default=OUTPUT_VERSION_SUMMARY)
     parser.add_argument("--max-workers", type=int, default=None)
-    parser.add_argument("--export-dataset-pt", action="store_true", help="Also export legacy bp_dataset.pt.")
     parser.add_argument("--incremental", dest="incremental", action="store_true", default=True)
     parser.add_argument("--force-reextract", dest="incremental", action="store_false")
     return parser.parse_args()
@@ -82,35 +76,6 @@ def handle_file(path_str, dataset_root_str, version_weights):
     return path_str, raw_matches, dataset_matches
 
 
-def load_json_if_exists(path, default):
-    if not os.path.exists(path):
-        return default
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def load_pt_if_exists(path, default):
-    if not os.path.exists(path):
-        return default
-    import torch
-
-    try:
-        return torch.load(path, map_location="cpu", weights_only=False)
-    except TypeError:
-        return torch.load(path, map_location="cpu")
-
-
-def save_pt_atomic(data, path):
-    import torch
-
-    output_dir = os.path.dirname(path)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-    tmp_path = f"{path}.tmp"
-    torch.save(data, tmp_path)
-    os.replace(tmp_path, path)
-
-
 def normalize_source_path(path):
     return str(path or "").replace("/", os.sep).replace("\\", os.sep)
 
@@ -133,22 +98,6 @@ def match_key(item):
 
 def match_key_text(item):
     return "\u001f".join(match_key(item))
-
-
-def merge_records(existing, updates):
-    merged = {match_key(item): item for item in existing if match_key(item)[0] and match_key(item)[2]}
-    appended = 0
-    replaced = 0
-    for item in updates:
-        key = match_key(item)
-        if not key[0] or not key[2]:
-            continue
-        if key in merged:
-            replaced += 1
-        else:
-            appended += 1
-        merged[key] = item
-    return list(merged.values()), appended, replaced
 
 
 def open_raw_match_db(path):
@@ -261,11 +210,9 @@ def batch_extract_match_bp(
     input_dir=INPUT_DIR,
     output_raw=OUTPUT_RAW,
     output_dataset=OUTPUT_DATASET,
-    output_dataset_pt=OUTPUT_DATASET_PT,
     output_version_summary=OUTPUT_VERSION_SUMMARY,
     incremental=True,
     max_workers=None,
-    export_dataset_pt=False,
 ):
     input_root = Path(input_dir)
     processed_sources, existing_raw_count = load_processed_sources_from_db(output_raw) if incremental else (set(), 0)
@@ -291,8 +238,6 @@ def batch_extract_match_bp(
         else:
             print("[INFO] no html files found")
         return
-
-    existing_dataset = load_pt_if_exists(output_dataset_pt, []) if export_dataset_pt and incremental else []
 
     discovered_versions = sort_dataset_versions(
         extract_dataset_version_from_path(path, dataset_root=input_root)
@@ -364,11 +309,6 @@ def batch_extract_match_bp(
             DATASET_INDEX_COLUMNS,
             key_fn=match_key_text,
         )
-        if export_dataset_pt:
-            merged_dataset, dataset_pt_appended, dataset_pt_replaced = merge_records(existing_dataset, all_dataset)
-        else:
-            merged_dataset = []
-            dataset_pt_appended = dataset_pt_replaced = 0
     else:
         if os.path.exists(output_raw):
             os.remove(output_raw)
@@ -382,12 +322,6 @@ def batch_extract_match_bp(
             DATASET_INDEX_COLUMNS,
             key_fn=match_key_text,
         )
-        merged_dataset = all_dataset if export_dataset_pt else []
-        dataset_pt_appended, dataset_pt_replaced = len(all_dataset), 0
-
-    if export_dataset_pt:
-        save_pt_atomic(merged_dataset, output_dataset_pt)
-
     with open(output_version_summary, "w", encoding="utf-8") as f:
         json.dump(version_summary, f, ensure_ascii=False, indent=2)
 
@@ -396,8 +330,6 @@ def batch_extract_match_bp(
     _, total_raw_count = load_processed_sources_from_db(output_raw)
     print(f"Total raw matches: {total_raw_count} (+{raw_appended}, replaced {raw_replaced}, skipped {raw_skipped})")
     print(f"Dataset sqlite: +{dataset_sqlite_appended}, replaced {dataset_sqlite_replaced}, skipped {dataset_sqlite_skipped}")
-    if export_dataset_pt:
-        print(f"Total dataset pt matches: {len(merged_dataset)} (+{dataset_pt_appended}, replaced {dataset_pt_replaced})")
     print(f"Deleted html without bp data: {deleted_html_count}")
 
 
@@ -407,9 +339,7 @@ if __name__ == "__main__":
         input_dir=args.input_dir,
         output_raw=args.output_raw,
         output_dataset=args.output_dataset,
-        output_dataset_pt=args.output_dataset_pt,
         output_version_summary=args.output_version_summary,
         incremental=args.incremental,
         max_workers=args.max_workers,
-        export_dataset_pt=args.export_dataset_pt,
     )

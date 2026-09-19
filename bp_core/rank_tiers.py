@@ -57,7 +57,7 @@ def _safe_int(value):
         return None
     try:
         return int(float(value))
-    except Exception:
+    except (TypeError, ValueError):
         return None
 
 
@@ -83,7 +83,7 @@ def enrich_rank_context(rank=None, tier_key=None, explicit_weight=None):
     rank_value = _safe_int(rank)
     try:
         rank_weight = float(explicit_weight) if explicit_weight is not None else float(spec["rank_weight"])
-    except Exception:
+    except (TypeError, ValueError, KeyError):
         rank_weight = float(spec["rank_weight"])
 
     return {

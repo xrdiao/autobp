@@ -3,11 +3,11 @@
 这个目录现在分成两层：
 
 - 通用层
-  - [monster_bank.py](/d:/jupyter/auto_bp/sw_ui_detection/monster_bank.py)
-  - [detector.py](/d:/jupyter/auto_bp/sw_ui_detection/detector.py)
+  - [monster_bank.py](monster_bank.py)
+  - [detector.py](detector.py)
   - 用来做“这张图里有没有像魔灵头像框的区域”的基础检测
 - BP 专用层
-  - [bp_screen_analyzer.py](/d:/jupyter/auto_bp/sw_ui_detection/bp_screen_analyzer.py)
+  - [bp_screen_analyzer.py](bp_screen_analyzer.py)
   - 用来按世界竞技场 BP 界面的固定布局，直接切出：
     - 我方 5 个选人框
     - 对方 5 个选人框
@@ -30,10 +30,9 @@
 
 ## 直接用 Python 启动
 
-如果你不想走 CLI，现在直接这样跑：
+如果你不想走 CLI，请在仓库根目录直接运行：
 
 ```powershell
-cd D:\jupyter\auto_bp\
 conda activate autobp
 python sw_ui_detection/run_bp_screen.py
 ```
