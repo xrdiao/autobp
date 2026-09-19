@@ -4,6 +4,7 @@ import csv
 import hashlib
 import json
 import os
+import re
 import time
 import random
 import sys
@@ -67,6 +68,13 @@ CHALLENGE_TEXTS = (
     "Performing security verification",
     "Just a moment...",
     "Enable JavaScript and cookies to continue",
+)
+MAINTENANCE_TEXTS = (
+    "scheduled maintenance",
+    "the site may be unavailable at times",
+)
+EMPTY_LEADERBOARD_TEXTS = (
+    "no players found for this selection",
 )
 MATCH_HISTORY_READY_PATTERNS = (
     "victory",
@@ -319,6 +327,24 @@ async def wait_for_leaderboard_ready(page, timeout_ms=45000):
         elapsed += step
 
     return not saw_loading and await page.locator(PLAYER_LINK_SELECTOR).count() > 0
+
+
+def leaderboard_unavailable_reason(page_text):
+    text = " ".join(str(page_text or "").lower().split())
+    if any(marker in text for marker in MAINTENANCE_TEXTS):
+        return "Lucksack 正在计划维护，排行榜暂时不可用"
+    if re.search(r"(?<!\d)0 players found\b", text) or any(
+        marker in text for marker in EMPTY_LEADERBOARD_TEXTS
+    ):
+        return "Lucksack 排行榜明确返回 0 名玩家"
+    return ""
+
+
+async def page_text(page):
+    try:
+        return await page.locator("body").inner_text(timeout=3000)
+    except Exception:
+        return ""
 
 
 async def extract_players_from_page(page):
@@ -989,6 +1015,15 @@ async def goto_ranking(page):
         if not cleared:
             raise RuntimeError("排名页被 Cloudflare 验证页拦截，自动等待后仍未通过")
 
+    unavailable_reason = leaderboard_unavailable_reason(await page_text(page))
+    if "维护" in unavailable_reason:
+        await save_debug(page, "debug_first_page_unavailable")
+        raise RuntimeError(
+            f"{unavailable_reason}。维护结束后重新执行："
+            f"python build_dataset/run_all.py --download --dataset-version {SAVE_DIR.name} --force-rebuild；"
+            "数据生成后再执行：python -m training.pipeline"
+        )
+
     row_count = await wait_for_rows(page, timeout_ms=PAGE_TIMEOUT)
     if row_count == 0:
         await save_debug(page, "debug_first_page_no_rows")
@@ -997,6 +1032,13 @@ async def goto_ranking(page):
     ready = await wait_for_leaderboard_ready(page, timeout_ms=45000)
     if not ready:
         await save_debug(page, "debug_first_page_not_ready")
+        unavailable_reason = leaderboard_unavailable_reason(await page_text(page))
+        if unavailable_reason:
+            raise RuntimeError(
+                f"{unavailable_reason}。请稍后重新执行："
+                f"python build_dataset/run_all.py --download --dataset-version {SAVE_DIR.name} --force-rebuild；"
+                "数据生成后再执行：python -m training.pipeline"
+            )
         raise RuntimeError("排行榜页面已打开，但等待期内没有拿到玩家列表")
 
 

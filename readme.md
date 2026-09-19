@@ -152,6 +152,18 @@ python build_dataset/run_all.py --download
 python build_dataset/run_all.py --force-rebuild
 ```
 
+如果排行榜正在维护，跳过在线同步，直接使用本地 `dataset/` 中已有的比赛页面。
+
+```bash
+python build_dataset/run_all.py --skip-swkit --skip-lucksack --skip-swrt --skip-mechanisms --skip-images --force-rebuild
+```
+
+排行榜恢复后，使用固定版本和已有排行榜清单继续下载。
+
+```bash
+python build_dataset/run_all.py --download --dataset-version v3.0 --use-existing-version-csv --force-rebuild
+```
+
 目录同步时会过滤不可用的未觉醒条目；二次觉醒条目只有在目录明确标记为可搜索时才会保留。
 
 ## 训练

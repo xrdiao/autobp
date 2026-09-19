@@ -2,7 +2,10 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from build_dataset.download_players_by_rank import wait_for_match_history
+from build_dataset.download_players_by_rank import (
+    leaderboard_unavailable_reason,
+    wait_for_match_history,
+)
 from build_dataset.sync_lucksack_data import fetch_rank_group
 
 
@@ -19,6 +22,23 @@ class FakeDetailPage:
 
 
 class DataFetchTests(unittest.IsolatedAsyncioTestCase):
+    def test_leaderboard_maintenance_is_reported(self):
+        page_text = (
+            "Scheduled maintenance from Sat, 09/19, 20:00 GMT+8 to Mon, 09/21, 02:00 GMT+8 "
+            "— the site may be unavailable at times. 0 players found"
+        )
+
+        self.assertIn("维护", leaderboard_unavailable_reason(page_text))
+
+    def test_empty_leaderboard_is_reported(self):
+        self.assertIn(
+            "0 名玩家",
+            leaderboard_unavailable_reason("0 players found No players found for this selection"),
+        )
+
+    def test_ready_leaderboard_has_no_unavailable_reason(self):
+        self.assertEqual(leaderboard_unavailable_reason("Player Leaderboard 50 players found"), "")
+
     async def test_detail_wait_returns_as_soon_as_history_is_ready(self):
         incomplete = "<html><body>Loading...</body></html>"
         ready = "<html>Match History " + ("/monster/x " * 10) + " victory</html>"

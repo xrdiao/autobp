@@ -32,7 +32,16 @@ def parse_args():
     parser.add_argument("--skip-swkit", action="store_true", help="Skip syncing SWKit aliases and RTA tiers.")
     parser.add_argument("--skip-swrt", action="store_true", help="Skip syncing public SWRT RTA statistics.")
     parser.add_argument("--force-rebuild", action="store_true", help="Rebuild expanded samples instead of incremental append.")
-    parser.add_argument("--use-existing-version-csv", action="store_true", help="Reuse the current version CSV when downloading.")
+    parser.add_argument(
+        "--dataset-version",
+        default="",
+        help="Use a fixed dataset version for download/resume, for example v3.0.",
+    )
+    parser.add_argument(
+        "--use-existing-version-csv",
+        action="store_true",
+        help="Reuse dataset/<version>/ranking_list.csv when resuming a download.",
+    )
     parser.add_argument("--detail-concurrency", type=int, default=2, help="Detail-page concurrency for polite crawling.")
     parser.add_argument("--max-detail-fetches", type=int, default=180, help="Max number of detail pages to fetch in one run.")
     parser.add_argument("--detail-min-interval-seconds", type=float, default=1.5, help="Min delay between detail requests.")
@@ -67,6 +76,7 @@ def main():
                 "下载排行榜玩家详情",
                 lambda: asyncio.run(
                     download_players_by_rank(
+                        dataset_version=args.dataset_version or None,
                         use_existing_csv=args.use_existing_version_csv,
                         detail_concurrency=args.detail_concurrency,
                         max_detail_fetches=args.max_detail_fetches,
@@ -111,7 +121,32 @@ def main():
         for index, (label, stage) in enumerate(stages, start=1):
             started = time.perf_counter()
             print(f"\n[{index}/{total_stages}] {label}", flush=True)
-            stage()
+            try:
+                stage()
+            except Exception as exc:
+                progress.set_postfix_str(f"{label} 失败")
+                print(
+                    f"[FAILED] {label}: {exc}\n"
+                    "后续阶段已停止。已完成阶段的输出会保留。",
+                    flush=True,
+                )
+                if label == "下载排行榜玩家详情":
+                    if args.dataset_version:
+                        resume_hint = (
+                            f"--dataset-version {args.dataset_version} "
+                            "--use-existing-version-csv"
+                        )
+                    else:
+                        resume_hint = (
+                            "设置 BP_DATASET_VERSION=<已有版本>，"
+                            "并加 --use-existing-version-csv"
+                        )
+                    print(
+                        "[INFO] 修复网络或验证页后可重新运行下载；"
+                        f"如需复用已有排行榜文件，请{resume_hint}。",
+                        flush=True,
+                    )
+                raise
             elapsed = time.perf_counter() - started
             progress.update(1)
             progress.set_postfix_str(f"{label} {elapsed:.1f}s")
