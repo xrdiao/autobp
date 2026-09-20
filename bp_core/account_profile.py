@@ -40,5 +40,8 @@ def load_account_profile(path: Path) -> AccountProfile | None:
     path = Path(path)
     if not path.exists():
         return None
-    with path.open("r", encoding="utf-8") as file:
-        return AccountProfile.from_payload(json.load(file))
+    try:
+        with path.open("r", encoding="utf-8") as file:
+            return AccountProfile.from_payload(json.load(file))
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        return None

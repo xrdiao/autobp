@@ -19,7 +19,7 @@ from bp_core.lucksack_stats import (
     is_usable_catalog_item,
 )
 from bp_core.bp_common import infer_pick_count, infer_pick_count_for_side, side_for_order
-from bp_recommender.shared import BPSharedRecommender
+from bp_recommender.legacy_adapter import LegacyBPRecommender
 from bp_core.names import normalize_name, slugify_name
 from streamlit.errors import StreamlitInvalidLayoutContextError
 
@@ -46,10 +46,18 @@ LUCK_CATALOG_PATH = JSON_DIR / "lucksack_monster_catalog.json"
 SWKIT_ALIAS_PATH = JSON_DIR / "swkit_monster_aliases.json"
 
 SHARED_BUNDLE = (
-    "Shared BP Core",
-    MODEL_DIR / "bp_shared.pt",
-    MODEL_DIR / "bp_shared_meta.json",
-    MODEL_DIR / "bp_shared_vocab.json",
+    "Legacy Relation + Prefix Value + Ban Value",
+    MODEL_DIR / "bp_relation_net_v2.pt",
+    MODEL_DIR / "bp_relation_meta_v2.json",
+    MODEL_DIR / "bp_relation_vocab_v2.json",
+)
+LEGACY_VALUE_ARTIFACTS = (
+    MODEL_DIR / "bp_prefix_value_net.pt",
+    MODEL_DIR / "bp_prefix_value_meta.json",
+    MODEL_DIR / "bp_prefix_value_vocab.json",
+    MODEL_DIR / "bp_draft_value_net.pt",
+    MODEL_DIR / "bp_draft_value_meta.json",
+    MODEL_DIR / "bp_draft_value_vocab.json",
 )
 
 BP_GALLERY_COLUMNS = 17
@@ -63,7 +71,7 @@ def read_json(path: Path, default):
     try:
         with open(path, "r", encoding="utf-8") as file:
             return json.load(file)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeError, json.JSONDecodeError):
         return default
 
 
@@ -89,6 +97,7 @@ def asset_cache_stamp():
         SWKIT_ALIAS_PATH,
         MY_BOX_PATH,
         *SHARED_BUNDLE[1:],
+        *LEGACY_VALUE_ARTIFACTS,
     )
     return tuple(
         (
@@ -103,7 +112,7 @@ def asset_cache_stamp():
 
 def select_shared_bundle():
     label, model_path, meta_path, vocab_path = SHARED_BUNDLE
-    if not bundle_ready((model_path, meta_path, vocab_path)):
+    if not bundle_ready((model_path, meta_path, vocab_path, *LEGACY_VALUE_ARTIFACTS)):
         return None
     return {
         "label": label,
@@ -216,11 +225,14 @@ def load_image_data_uri(path):
 def build_monster_options(vocab, display_name_map, frequency_map):
     options = []
     seen = set()
-    for slug, raw_id in sorted((vocab or {}).items(), key=lambda item: int(item[1])):
+    vocab_items = []
+    for slug, raw_id in (vocab or {}).items() if isinstance(vocab, dict) else ():
         try:
-            if int(raw_id) <= 1:
-                continue
+            vocab_items.append((slug, int(raw_id)))
         except (TypeError, ValueError):
+            continue
+    for slug, raw_id in sorted(vocab_items, key=lambda item: item[1]):
+        if raw_id <= 1:
             continue
         display_name = str(display_name_map.get(slug) or slug).strip()
         if not display_name:
@@ -231,9 +243,9 @@ def build_monster_options(vocab, display_name_map, frequency_map):
         seen.add(key)
         raw_frequency = frequency_map.get(slug, frequency_map.get(str(raw_id), 0))
         try:
-            frequency = int(float(raw_frequency or 0))
+            frequency = float(raw_frequency or 0)
         except (TypeError, ValueError):
-            frequency = 0
+            frequency = 0.0
         options.append((display_name, frequency))
 
     unique = {}
@@ -243,9 +255,22 @@ def build_monster_options(vocab, display_name_map, frequency_map):
         name
         for name, _frequency in sorted(
             unique.values(),
-            key=lambda item: (-int(item[1]), normalize_name(item[0])),
+            key=lambda item: (-float(item[1]), normalize_name(item[0])),
         )
     ]
+
+
+def matches_monster_search(search_text, searchable_text):
+    """Match a query against names and aliases with the same normalization."""
+    query_variants = value_variants(search_text)
+    if not query_variants:
+        return True
+    searchable_variants = value_variants(searchable_text)
+    return any(
+        query in candidate
+        for query in query_variants
+        for candidate in searchable_variants
+    )
 
 
 @st.cache_data(show_spinner=False)
@@ -259,8 +284,20 @@ def load_web_assets(asset_stamp=None):
         generated_alias_map = {}
     attr_map = read_json(ATTR_MAP_PATH, {})
     family_map = read_json(FAMILY_MAP_PATH, {})
+    if not isinstance(shared_meta, dict):
+        shared_meta = {}
+    if not isinstance(shared_vocab, dict):
+        shared_vocab = {}
+    if not isinstance(image_map, dict):
+        image_map = {}
+    if not isinstance(attr_map, dict):
+        attr_map = {}
+    if not isinstance(family_map, dict):
+        family_map = {}
     luck_stats = BPLucksackStats(stats_path=LUCK_STATS_PATH, catalog_path=LUCK_CATALOG_PATH)
     swkit_alias_data = read_json(SWKIT_ALIAS_PATH, {})
+    if not isinstance(swkit_alias_data, dict):
+        swkit_alias_data = {}
     my_box = read_json(MY_BOX_PATH, [])
     account_profile = load_account_profile(ACCOUNT_PROFILE_PATH)
     if not isinstance(my_box, list):
@@ -348,10 +385,20 @@ def load_web_assets(asset_stamp=None):
         add_aliases(display_name, alias)
         remote_names.add(str(display_name).strip())
 
+    frequency_map = dict(shared_meta.get("monster_frequency", {}) or {})
+    for slug in luck_stats.candidate_slugs():
+        frequency = luck_stats.pick_frequency(slug)
+        try:
+            current_frequency = float(frequency_map.get(slug, 0) or 0)
+        except (TypeError, ValueError):
+            current_frequency = 0.0
+        if frequency > current_frequency:
+            frequency_map[slug] = frequency
+
     options = build_monster_options(
         shared_vocab,
         shared_meta.get("display_name_map", {}) or {},
-        shared_meta.get("monster_frequency", {}) or {},
+        frequency_map,
     )
     if options and usable_catalog_keys:
         options = [
@@ -359,22 +406,55 @@ def load_web_assets(asset_stamp=None):
             for option in options
             if value_variants(option) & usable_catalog_keys
         ]
+    model_options = list(options)
     if not options:
         # The catalog is also the source for the picker and Box editor.  It
-        # must remain usable before a Shared BP model has been trained; the
+        # must remain usable before the legacy model bundle has been trained; the
         # recommender itself will still report that its model bundle is absent.
-        options = sorted(remote_names, key=normalize_name)
-    option_set = set(options)
+        options = sorted(
+            remote_names,
+            key=lambda name: (
+                -luck_stats.pick_frequency(luck_stats.resolve_slug(name)),
+                normalize_name(name),
+            ),
+        )
+    gallery_by_key = {}
+    for name in sorted(
+        set(remote_names) | set(model_options),
+        key=lambda value: (
+            normalize_name(value),
+            str(value).islower(),
+            -len(str(value)),
+            str(value),
+        ),
+    ):
+        gallery_by_key.setdefault(normalize_name(name), name)
+    gallery_options = sorted(
+        gallery_by_key.values(),
+        key=lambda name: (
+            -luck_stats.pick_frequency(luck_stats.resolve_slug(name)),
+            normalize_name(name),
+        ),
+    )
+    model_options = list(
+        dict.fromkeys(
+            gallery_by_key.get(normalize_name(name), name)
+            for name in model_options
+        )
+    )
+    if not gallery_options:
+        gallery_options = list(options)
+    option_set = set(gallery_options)
     if not my_box and account_profile is not None:
         owned_slugs = set(account_profile.owned_monsters)
         my_box = [
             name
-            for name in options
+            for name in gallery_options
             if normalize_name(name) in owned_slugs
         ]
     my_box = [name for name in my_box if name in option_set]
     option_lookup = {}
-    for option in options:
+    for option in gallery_options:
         for variant in value_variants(option):
             option_lookup.setdefault(variant, option)
     alias_targets = {}
@@ -403,6 +483,7 @@ def load_web_assets(asset_stamp=None):
             normalized_box.append(target)
     my_box = normalized_box
     alias_map_sets = {}
+    search_alias_map_sets = {}
     for display_name, aliases in alias_sets.items():
         target = next(
             (
@@ -414,6 +495,7 @@ def load_web_assets(asset_stamp=None):
         )
         if target:
             for alias in aliases | {display_name}:
+                search_alias_map_sets.setdefault(target, set()).add(alias)
                 variants = value_variants(alias)
                 if any(
                     len(alias_targets.get(variant, set())) != 1
@@ -428,9 +510,9 @@ def load_web_assets(asset_stamp=None):
     search_text_map = {
         name: " ".join(
             [name, slugify_name(name)]
-            + list(alias_map.get(name, []))
+            + list(search_alias_map_sets.get(name, []))
         ).lower()
-        for name in options
+        for name in gallery_options
     }
     rank_groups = [
         {
@@ -438,14 +520,16 @@ def load_web_assets(asset_stamp=None):
             "name": str(item.get("group_name") or item.get("group_id")),
         }
         for item in (luck_stats.data.get("rank_groups") or [])
-        if item.get("group_id") is not None
+        if isinstance(item, dict) and item.get("group_id") is not None
     ]
     if not rank_groups:
         rank_groups = [{"id": str(luck_stats.rank_group), "name": "当前数据"}]
 
     return {
         "shared_bundle": shared_bundle,
-        "options": options,
+        "options": gallery_options,
+        "model_options": model_options or list(options),
+        "gallery_options": gallery_options,
         "my_box": sorted(set(my_box), key=normalize_name),
         "account_profile": account_profile,
         "image_lookup": {
@@ -478,12 +562,9 @@ def load_sample_count(path):
 
 
 @st.cache_resource(show_spinner=False)
-def load_shared_recommender(model_path, meta_path, vocab_path, device, rank_group):
+def load_shared_recommender(model_path, meta_path, vocab_path, device, rank_group, model_stamp=None):
     selected_device = None if device == "auto" else device
-    return BPSharedRecommender(
-        model_path=model_path,
-        meta_path=meta_path,
-        vocab_path=vocab_path,
+    return LegacyBPRecommender(
         device=selected_device,
         stats_rank_group=rank_group,
     )
@@ -499,13 +580,33 @@ def phase_label(my_picks, enemy_picks, current_side):
     return "等待输入"
 
 
-def make_signature(my_picks, enemy_picks, first_pick_side, my_leader, enemy_leader):
+def make_signature(
+    my_picks,
+    enemy_picks,
+    first_pick_side,
+    my_leader,
+    enemy_leader,
+    my_box=(),
+    use_my_box=False,
+    rank_group="",
+    device="auto",
+    max_pair_candidates=0,
+    my_final_ban="",
+    enemy_final_ban="",
+):
     payload = {
         "my_picks": list(my_picks),
         "enemy_picks": list(enemy_picks),
         "first_pick_side": first_pick_side,
         "my_leader": my_leader,
         "enemy_leader": enemy_leader,
+        "my_box": sorted(set(my_box or ()), key=normalize_name),
+        "use_my_box": bool(use_my_box),
+        "rank_group": str(rank_group),
+        "device": str(device),
+        "max_pair_candidates": int(max_pair_candidates),
+        "my_final_ban": my_final_ban or "",
+        "enemy_final_ban": enemy_final_ban or "",
     }
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
@@ -523,6 +624,8 @@ def initialize_state(assets):
         "enemy_picks": [],
         "my_leader": "",
         "enemy_leader": "",
+        "my_final_ban": "",
+        "enemy_final_ban": "",
         "my_box": list(assets["my_box"]),
         "use_my_box": True,
         "top_k": 6,
@@ -546,20 +649,37 @@ def initialize_state(assets):
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
 
-    options = set(assets["options"])
+    previous_first_pick_side = st.session_state.setdefault(
+        "_bp_first_pick_side", st.session_state.first_pick_side
+    )
+    if previous_first_pick_side != st.session_state.first_pick_side:
+        st.session_state.my_picks, st.session_state.enemy_picks = legal_pick_prefix(
+            st.session_state.my_picks,
+            st.session_state.enemy_picks,
+            st.session_state.first_pick_side,
+        )
+        clear_results()
+        st.session_state._bp_first_pick_side = st.session_state.first_pick_side
+
+    gallery_options = set(assets.get("gallery_options") or assets["options"])
     st.session_state.my_picks = clean_picker_values(
         st.session_state.my_picks,
-        options,
+        gallery_options,
         assets,
     )
     st.session_state.enemy_picks = clean_picker_values(
         st.session_state.enemy_picks,
-        options,
+        gallery_options,
         assets,
+    )
+    st.session_state.my_picks, st.session_state.enemy_picks = legal_pick_prefix(
+        st.session_state.my_picks,
+        st.session_state.enemy_picks,
+        st.session_state.first_pick_side,
     )
     st.session_state.my_box = clean_picker_values(
         st.session_state.my_box,
-        options,
+        gallery_options,
         assets,
         max_items=None,
     )
@@ -578,7 +698,39 @@ def clear_results():
     st.session_state.ban_results = None
 
 
+def legal_pick_prefix(my_picks, enemy_picks, first_pick_side):
+    """Keep the longest chronological prefix representable by side lists."""
+    best = ([], [])
+    for my_count in range(len(my_picks) + 1):
+        for enemy_count in range(len(enemy_picks) + 1):
+            candidate = (list(my_picks[:my_count]), list(enemy_picks[:enemy_count]))
+            try:
+                timeline_from_picks(*candidate, first_pick_side)
+            except (TypeError, ValueError):
+                continue
+            if sum(map(len, candidate)) > sum(map(len, best)):
+                best = candidate
+    return best
+
+
 def apply_recommendation_plan(result_type, monsters, assets):
+    if result_type == "ban":
+        if len(st.session_state.my_picks) != 5 or len(st.session_state.enemy_picks) != 5:
+            return 0
+        if st.session_state.my_final_ban or st.session_state.enemy_final_ban:
+            return 0
+        resolved = []
+        for raw_monster in monsters:
+            monster = resolve_option_name(raw_monster, assets)
+            if monster and monster in set(assets.get("gallery_options") or assets.get("options") or []) and monster not in resolved:
+                resolved.append(monster)
+        if len(resolved) != 1:
+            return 0
+        if resolved[0] not in st.session_state.enemy_picks:
+            return 0
+        st.session_state.my_final_ban = resolved[0]
+        clear_results()
+        return 1
     if result_type not in {"pick", "enemy"}:
         return 0
 
@@ -597,7 +749,7 @@ def apply_recommendation_plan(result_type, monsters, assets):
         return 0
 
     target = my_picks if target_side == "me" else enemy_picks
-    options = set(assets.get("options") or [])
+    options = set(assets.get("gallery_options") or assets.get("options") or [])
     occupied = set(my_picks) | set(enemy_picks)
     resolved = []
     for raw_monster in monsters:
@@ -627,7 +779,7 @@ def get_shared_model(assets):
     bundle = assets["shared_bundle"]
     if not bundle:
         raise FileNotFoundError(
-            "没有找到 Shared BP Core 模型，请先运行 python -m training.shared_bp"
+            "没有找到旧版 BP 模型，请先运行 python -m training.all_models"
         )
     return load_shared_recommender(
         str(bundle["model_path"]),
@@ -635,6 +787,7 @@ def get_shared_model(assets):
         str(bundle["vocab_path"]),
         st.session_state.device,
         st.session_state.rank_group,
+        asset_cache_stamp(),
     )
 
 
@@ -656,16 +809,17 @@ def calculate_my_recommendations(assets):
     ).to_dict()
     shared_model = get_shared_model(assets)
     top_k = int(st.session_state.top_k)
+    search_top_k = max(top_k * 2, top_k)
     plans = shared_model.recommend_pick_plans(
         my_picks=my_picks,
         enemy_picks=enemy_picks,
         pick_count=pick_count,
         turn=turn,
         first_pick_side=first_pick_side,
-        candidate_pool=assets["options"],
+        candidate_pool=assets.get("gallery_options") or assets["options"],
         my_box=st.session_state.my_box,
         use_my_box_for_reco=bool(st.session_state.use_my_box),
-        top_k=top_k,
+        top_k=search_top_k,
         max_pair_candidates=int(st.session_state.max_pair_candidates),
         events=state["events"],
     )
@@ -705,13 +859,14 @@ def calculate_enemy_recommendations(assets):
     ).to_dict()
     shared_model = get_shared_model(assets)
     top_k = int(st.session_state.top_k)
+    search_top_k = max(top_k * 2, top_k)
     predictions = shared_model.recommend_enemy_next_picks(
         my_picks=my_picks,
         enemy_picks=enemy_picks,
         first_pick_side=first_pick_side,
         pick_count=pick_count,
-        top_k=top_k,
-        candidate_pool=assets["options"],
+        top_k=search_top_k,
+        candidate_pool=assets.get("gallery_options") or assets["options"],
         max_pair_candidates=int(st.session_state.max_pair_candidates),
         turn=turn,
         events=state["events"],
@@ -753,6 +908,9 @@ def calculate_ban_recommendations(assets):
         enemy_picks=enemy_picks,
         top_k=top_k,
         first_pick_side=st.session_state.first_pick_side,
+        my_leader=st.session_state.my_leader,
+        enemy_leader=st.session_state.enemy_leader,
+        enemy_ban=st.session_state.enemy_final_ban or None,
         events=state["events"],
     )
 
@@ -763,12 +921,15 @@ def filter_gallery_monsters(assets, search_text, attr_filter, family_filter, onl
         owned = set(st.session_state.my_box)
         monsters = [monster for monster in monsters if monster in owned]
 
-    search_text = str(search_text or "").strip().lower()
+    search_text = str(search_text or "").strip()
     if search_text:
         monsters = [
             monster
             for monster in monsters
-            if search_text in assets["search_text_map"].get(monster, monster.lower())
+            if matches_monster_search(
+                search_text,
+                assets["search_text_map"].get(monster, monster),
+            )
         ]
     if attr_filter != "全部":
         monsters = [monster for monster in monsters if assets["attr_map"].get(monster) == attr_filter]
@@ -793,6 +954,10 @@ def build_picker_payload(monsters, assets):
         + list(st.session_state.enemy_picks)
     ))
     state_items = {}
+    model_option_keys = {
+        normalize_name(value)
+        for value in (assets.get("gallery_options") or assets.get("options") or [])
+    }
     for monster in state_names:
         image_path = get_image_path(monster, assets["image_lookup"])
         state_items[monster] = {
@@ -800,6 +965,7 @@ def build_picker_payload(monsters, assets):
             "attr": assets["attr_map"].get(monster, ""),
             "family": assets["family_map"].get(monster, ""),
             "image": load_image_data_uri(str(image_path)) if image_path else "",
+            "enabled": normalize_name(monster) in model_option_keys,
         }
 
     return [
@@ -829,9 +995,14 @@ def apply_picker_value(value, assets):
     if not event_id or event_id == st.session_state.picker_event_id:
         return False
 
-    options = set(assets["options"])
+    options = set(assets.get("gallery_options") or assets["options"])
     my_picks = clean_picker_values(value.get("my_picks"), options, assets)
     enemy_picks = clean_picker_values(value.get("enemy_picks"), options, assets)
+    my_picks, enemy_picks = legal_pick_prefix(
+        my_picks,
+        enemy_picks,
+        st.session_state.first_pick_side,
+    )
     my_set = set(my_picks)
     enemy_picks = [monster for monster in enemy_picks if monster not in my_set]
 
@@ -932,12 +1103,29 @@ def render_bp_picker_fragment(assets):
 
     current_turn = len(st.session_state.my_picks) + len(st.session_state.enemy_picks) + 1
     current_side = side_for_order(current_turn, st.session_state.first_pick_side)
+    if st.session_state.my_final_ban or st.session_state.enemy_final_ban:
+        st.info(
+            "；".join(
+                value for value in (
+                    f"我方 Ban：{st.session_state.my_final_ban}" if st.session_state.my_final_ban else "",
+                    f"对方 Ban：{st.session_state.enemy_final_ban}" if st.session_state.enemy_final_ban else "",
+                )
+                if value
+            )
+        )
     signature = make_signature(
         st.session_state.my_picks,
         st.session_state.enemy_picks,
         st.session_state.first_pick_side,
         st.session_state.my_leader,
         st.session_state.enemy_leader,
+        st.session_state.my_box,
+        st.session_state.use_my_box,
+        st.session_state.rank_group,
+        st.session_state.device,
+        st.session_state.max_pair_candidates,
+        st.session_state.my_final_ban,
+        st.session_state.enemy_final_ban,
     )
 
     action_columns = st.columns(4)
@@ -947,6 +1135,8 @@ def render_bp_picker_fragment(assets):
             st.session_state.enemy_picks = []
             st.session_state.my_leader = ""
             st.session_state.enemy_leader = ""
+            st.session_state.my_final_ban = ""
+            st.session_state.enemy_final_ban = ""
             clear_results()
             rerun_fragment_or_app()
     with action_columns[1]:
@@ -1021,6 +1211,7 @@ def toggle_my_box(monster):
             set(st.session_state.my_box + [monster]),
             key=normalize_name,
         )
+    clear_results()
 
 
 def render_box_monsters(monsters, assets):
@@ -1064,12 +1255,15 @@ def render_box_fragment(assets):
         placeholder="搜索魔灵或中文别称",
     )
     monsters = list(assets["options"])
-    search_text = str(st.session_state.box_search or "").strip().lower()
+    search_text = str(st.session_state.box_search or "").strip()
     if search_text:
         monsters = [
             monster
             for monster in monsters
-            if search_text in assets["search_text_map"].get(monster, monster.lower())
+            if matches_monster_search(
+                search_text,
+                assets["search_text_map"].get(monster, monster),
+            )
         ]
     monsters = [
         monster
@@ -1136,27 +1330,43 @@ def render_result_card(index, item, assets, result_type):
 
     detail = item.get("detail", {}) or {}
     win_rate = item.get("estimated_win_rate")
+    primary_label = "估计胜率"
+    if result_type == "pick" and detail.get("adversarial_win_rate") is not None:
+        win_rate = detail.get("adversarial_win_rate")
+        primary_label = "对手反制后胜率"
+    elif result_type == "enemy" and detail.get("best_response_win_rate") is not None:
+        win_rate = detail.get("best_response_win_rate")
+        primary_label = "我方应对后胜率"
+    elif result_type == "ban" and detail.get("post_ban_win_rate") is not None:
+        win_rate = detail.get("post_ban_win_rate")
+        primary_label = "Ban 后胜率"
     if win_rate is not None and float(win_rate or 0.0) > 0.0:
-        win_rate_text = f"{float(win_rate):.1%}"
+        win_rate_text = f"{float(win_rate):.2%}"
     else:
         win_rate_text = "未启用"
 
-    if "win_rate_gain" in detail:
+    if result_type == "ban" and "pre_ban_win_rate" in detail:
+        secondary_label = "Ban 前"
+        secondary_value = f"{float(detail['pre_ban_win_rate']):.2%}"
+    elif "win_rate_gain" in detail:
         secondary_label = "变化"
-        secondary_value = f"{float(detail['win_rate_gain']):+.1%}"
+        secondary_value = f"{float(detail['win_rate_gain']):+.2%}"
     elif "post_enemy_pick_win_rate" in detail:
         secondary_label = "我方胜率"
-        secondary_value = f"{float(detail['post_enemy_pick_win_rate']):.1%}"
+        secondary_value = f"{float(detail['post_enemy_pick_win_rate']):.2%}"
     elif "post_ban_win_rate" in detail:
         secondary_label = "Ban 后"
-        secondary_value = f"{float(detail['post_ban_win_rate']):.1%}"
+        secondary_value = f"{float(detail['post_ban_win_rate']):.2%}"
     else:
         secondary_label = "动作"
         secondary_value = str(detail.get("action_type") or item.get("source", "shared_policy"))
 
     ranking_source = detail.get("ranking_source") or item.get("source") or "shared_policy"
     source_text = {
-        "shared_policy": "Shared BP Core",
+        "shared_policy": "Legacy BP policy",
+        "relation": "Relation + 统计证据",
+        "relation_ban": "Relation Ban",
+        "bp_draft_value_model": "Full Draft Value + Ban",
         "robust_search_value_3ply_shared_stats_mechanism": "三层鲁棒搜索 + Value + 机制",
         "robust_enemy_search_value_shared_stats_mechanism": "对手搜索 + Value + 机制",
     }.get(str(ranking_source), str(ranking_source))
@@ -1193,7 +1403,7 @@ def render_result_card(index, item, assets, result_type):
             </div>
             <div class="recommendation-monsters">{''.join(image_markup)}</div>
             <div class="recommendation-metrics">
-                <div><span>估计胜率</span><b>{win_rate_text}</b></div>
+                <div><span>{html.escape(primary_label)}</span><b>{win_rate_text}</b></div>
                 <div><span>{html.escape(secondary_label)}</span><b>{html.escape(secondary_value)}</b></div>
                 <div><span>来源</span><b>{html.escape(source_text)}</b></div>
             </div>
@@ -1201,7 +1411,7 @@ def render_result_card(index, item, assets, result_type):
         </div>
     """
     st.markdown(card_markup, unsafe_allow_html=True)
-    if result_type in {"pick", "enemy"}:
+    if result_type in {"pick", "enemy", "ban"}:
         if st.button(
             "采用",
             key=f"recommendation_apply_{result_type}_{index}",
@@ -1223,8 +1433,38 @@ def render_results(title, results, assets, result_type):
     if not results:
         st.info("没有可显示的推荐结果。")
         return
-    for start in range(0, len(results), 3):
-        result_row = results[start : start + 3]
+    def display_rate(item):
+        detail = item.get("detail", {}) or {}
+        if result_type == "ban":
+            value = detail.get("post_ban_win_rate", item.get("estimated_win_rate"))
+        elif result_type == "enemy":
+            value = detail.get("best_response_win_rate", item.get("estimated_win_rate"))
+        else:
+            value = detail.get("adversarial_win_rate", item.get("estimated_win_rate"))
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0 if result_type != "enemy" else 1.0
+
+    if result_type == "enemy":
+        ordered_results = sorted(
+            list(results),
+            key=lambda item: (
+                display_rate(item),
+                -float(item.get("plan_score", 0.0)),
+            ),
+        )
+    else:
+        ordered_results = sorted(
+            list(results),
+            key=lambda item: (
+                display_rate(item),
+                float(item.get("plan_score", 0.0)),
+            ),
+            reverse=True,
+        )
+    for start in range(0, len(ordered_results), 3):
+        result_row = ordered_results[start : start + 3]
         columns = st.columns(3)
         for column, (index, item) in zip(
             columns,
@@ -1239,7 +1479,7 @@ def render_model_status(assets):
     if bundle:
         st.success(f"模型：{bundle['label']}")
     else:
-        st.error("Shared BP Core：未找到，请先训练模型")
+        st.error("旧版 BP 模型：未找到，请先运行 python -m training.all_models")
     account_profile = assets.get("account_profile")
     if account_profile is None:
         st.caption("账号档案：未加载，推荐不限制我方 Box")

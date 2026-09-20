@@ -22,7 +22,7 @@ DEFAULT_ALIAS_PATH = PROJECT_ROOT / "json" / "swkit_monster_aliases.json"
 DEFAULT_TIER_PATH = PROJECT_ROOT / "json" / "swkit_rta_tiers.json"
 NO_PROXY_OPENER = urllib.request.build_opener(
     urllib.request.ProxyHandler({}),
-    urllib.request.HTTPSHandler(context=ssl._create_unverified_context()),
+    urllib.request.HTTPSHandler(context=ssl.create_default_context()),
 )
 
 

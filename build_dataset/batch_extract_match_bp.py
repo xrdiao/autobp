@@ -28,7 +28,7 @@ INPUT_DIR = PROJECT_ROOT / "dataset"
 DATA_DIR = PROJECT_ROOT / "data"
 OUTPUT_RAW = str(DATA_DIR / "matches_raw.sqlite")
 OUTPUT_DATASET = str(DATA_DIR / "bp_dataset.sqlite")
-OUTPUT_VERSION_SUMMARY = "json/dataset_version_summary.json"
+OUTPUT_VERSION_SUMMARY = str(PROJECT_ROOT / "json" / "dataset_version_summary.json")
 PLAYER_HTML_RE = re.compile(r"^(?:(?:\d+|norank)_(\d+)|my_bp)\.html$", re.IGNORECASE)
 DATASET_TABLE = "bp_dataset"
 DATASET_INDEX_COLUMNS = [
@@ -192,18 +192,9 @@ def delete_html_if_no_bp(path_str, input_root, raw_matches, dataset_matches):
         print(f"[WARN] {os.path.relpath(path_str, input_root)}: no bp data, keeping personal html")
         return False
 
-    path = Path(path_str)
-    rel_path = os.path.relpath(path, input_root)
-    try:
-        path.unlink()
-        print(f"[DEL] {rel_path}: no bp data")
-        return True
-    except FileNotFoundError:
-        print(f"[WARN] {rel_path}: no bp data, file already removed")
-        return True
-    except OSError as exc:
-        print(f"[WARN] {rel_path}: no bp data, failed to delete html ({exc})")
-        return False
+    rel_path = os.path.relpath(path_str, input_root)
+    print(f"[WARN] {rel_path}: no bp data, keeping source html")
+    return False
 
 
 def batch_extract_match_bp(

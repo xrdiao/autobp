@@ -63,7 +63,11 @@ def parse_args(argv=None):
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
-    parser.add_argument("--negative-count", type=int, default=2)
+    # Two random negatives make the validation score look strong while the
+    # real candidate pool contains hundreds of actions.  Use a wider default
+    # so retraining measures and learns the ranking problem it will face at
+    # inference time; callers can still override it for quick experiments.
+    parser.add_argument("--negative-count", type=int, default=8)
     parser.add_argument("--max-events", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-samples", type=int, default=0)
@@ -93,11 +97,14 @@ def split_samples(samples, val_ratio: float, seed: int):
         groups.setdefault(key, []).append(sample)
     keys = list(groups)
     random.Random(int(seed)).shuffle(keys)
-    target = max(1, int(round(len(samples) * max(0.0, min(0.5, float(val_ratio))))))
+    ratio = max(0.0, min(0.5, float(val_ratio)))
+    target = 0 if ratio == 0.0 else max(1, int(round(len(samples) * ratio)))
     val_keys = set()
     count = 0
     for key in keys:
         if count >= target and val_keys:
+            break
+        if target == 0:
             break
         val_keys.add(key)
         count += len(groups[key])
@@ -122,13 +129,15 @@ def save_split_manifest(samples, train_samples, valid_samples, path, seed, val_r
         groups[key]["sample_count"] += 1
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as file:
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    with temp_path.open("w", encoding="utf-8") as file:
         json.dump(
             {"version": 1, "seed": int(seed), "val_ratio": float(val_ratio), "groups": groups},
             file,
             ensure_ascii=False,
             indent=2,
         )
+    temp_path.replace(path)
 
 
 def build_vocab(samples):
@@ -581,9 +590,13 @@ def save_artifacts(model, vocab, args, metrics, sample_counts, resources=None):
     model_path = prefix.with_suffix(".pt")
     meta_path = prefix.with_name(prefix.name + "_meta.json")
     vocab_path = prefix.with_name(prefix.name + "_vocab.json")
-    torch.save(model.state_dict(), model_path)
-    with open(vocab_path, "w", encoding="utf-8") as file:
+    model_tmp = model_path.with_suffix(model_path.suffix + ".tmp")
+    torch.save(model.state_dict(), model_tmp)
+    model_tmp.replace(model_path)
+    vocab_tmp = vocab_path.with_suffix(vocab_path.suffix + ".tmp")
+    with open(vocab_tmp, "w", encoding="utf-8") as file:
         json.dump(vocab.to_dict(), file, ensure_ascii=False, indent=2)
+    vocab_tmp.replace(vocab_path)
     meta = {
         "architecture": "shared_event_v1",
         "architecture_version": 1,
@@ -604,8 +617,10 @@ def save_artifacts(model, vocab, args, metrics, sample_counts, resources=None):
         "seed": int(args.seed),
         "split_manifest_path": str(prefix.with_name(prefix.name + "_split_manifest.json")),
     }
-    with open(meta_path, "w", encoding="utf-8") as file:
+    meta_tmp = meta_path.with_suffix(meta_path.suffix + ".tmp")
+    with open(meta_tmp, "w", encoding="utf-8") as file:
         json.dump(meta, file, ensure_ascii=False, indent=2)
+    meta_tmp.replace(meta_path)
     return model_path, meta_path, vocab_path
 
 

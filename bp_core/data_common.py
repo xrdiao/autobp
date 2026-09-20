@@ -6,6 +6,7 @@ import pickle
 import sqlite3
 import time
 from collections import Counter
+from io import BytesIO
 from pathlib import Path
 
 from bp_core.action_space import validate_timeline
@@ -13,6 +14,23 @@ from bp_core.names import normalize_name, slugify_name
 
 
 PICK_SIDE_PATTERN = ("me", "enemy", "enemy", "me", "me", "enemy", "enemy", "me", "me", "enemy")
+
+
+class _SafeUnpickler(pickle.Unpickler):
+    _ALLOWED_BUILTINS = {
+        "bool", "bytes", "complex", "dict", "float", "frozenset", "int",
+        "list", "set", "str", "tuple",
+    }
+
+    def find_class(self, module, name):
+        if module == "builtins" and name in self._ALLOWED_BUILTINS:
+            return getattr(__import__(module), name)
+        raise pickle.UnpicklingError(f"unsupported pickle global: {module}.{name}")
+
+
+def safe_pickle_loads(payload):
+    """Load primitive records written by this project without importing classes."""
+    return _SafeUnpickler(BytesIO(payload)).load()
 
 
 def load_json(path, default=None):
@@ -142,7 +160,7 @@ def load_record_rows(path, table_name, where_sql="", params=(), order_by="key"):
         if order_by:
             sql += f" ORDER BY {order_by}"
         rows = conn.execute(sql, tuple(params or ())).fetchall()
-        return [pickle.loads(row[0]) for row in rows]
+        return [safe_pickle_loads(row[0]) for row in rows]
     finally:
         conn.close()
 
@@ -248,12 +266,17 @@ def build_name_resolution_resources(samples):
             raise ValueError("样本缺少 canonical next_action_slugs")
         for slug in next_action:
             _record_name_slug_pair(alias_counters, display_counters, slug, slug)
-        _record_name_slug_pair(
-            alias_counters,
-            display_counters,
-            sample.get("ban_name"),
-            sample.get("ban_slug"),
-        )
+        for ban_name_key, ban_slug_key in (
+            ("ban_name", "ban_slug"),
+            ("my_ban", "my_ban_slug"),
+            ("enemy_ban", "enemy_ban_slug"),
+        ):
+            _record_name_slug_pair(
+                alias_counters,
+                display_counters,
+                sample.get(ban_name_key),
+                sample.get(ban_slug_key),
+            )
         for leader_key in ("my_leader", "enemy_leader"):
             slug_key = f"{leader_key}_slug"
             _record_name_slug_pair(
@@ -373,13 +396,22 @@ def normalize_bp_sample(sample, resolver):
     expected_action = tuple(normalize_name(value) for value in next_event.monsters)
     if tuple(item["next_action_slugs"]) != expected_action:
         raise ValueError("next_action_slugs 与 full_events 的下一事件不一致")
-    raw_ban = item.get("ban_slug")
-    item["ban_slug"] = resolver.to_slug(raw_ban) if raw_ban else ""
-    if raw_ban and not item["ban_slug"]:
-        raise ValueError("ban_slug 无法解析")
+    raw_my_ban = item.get("my_ban_slug") or item.get("ban_slug")
+    raw_enemy_ban = item.get("enemy_ban_slug") or item.get("enemy_ban")
+    item["my_ban_slug"] = resolver.to_slug(raw_my_ban) if raw_my_ban else ""
+    item["enemy_ban_slug"] = resolver.to_slug(raw_enemy_ban) if raw_enemy_ban else ""
+    if raw_my_ban and not item["my_ban_slug"]:
+        raise ValueError("my_ban_slug 无法解析")
+    if raw_enemy_ban and not item["enemy_ban_slug"]:
+        raise ValueError("enemy_ban_slug 无法解析")
     enemy_final = set(normalize_name(value) for value in full_timeline.picks_for("enemy"))
-    if item["ban_slug"] and item["ban_slug"] not in enemy_final:
-        raise ValueError("ban_slug 必须属于敌方最终阵容")
+    my_final = set(normalize_name(value) for value in full_timeline.picks_for("me"))
+    if item["my_ban_slug"] and item["my_ban_slug"] not in enemy_final:
+        raise ValueError("my_ban_slug 必须属于敌方最终阵容")
+    if item["enemy_ban_slug"] and item["enemy_ban_slug"] not in my_final:
+        raise ValueError("enemy_ban_slug 必须属于我方最终阵容")
+    # Keep the historical field as the current player's Ban alias.
+    item["ban_slug"] = item["my_ban_slug"]
     for leader_key in ("my_leader_slug", "enemy_leader_slug"):
         raw_leader = item.get(leader_key)
         item[leader_key] = resolver.to_slug(raw_leader) if raw_leader else ""
@@ -389,6 +421,44 @@ def normalize_bp_sample(sample, resolver):
         raise ValueError("my_leader_slug 必须属于我方最终阵容")
     if item["enemy_leader_slug"] and item["enemy_leader_slug"] not in enemy_final:
         raise ValueError("enemy_leader_slug 必须属于敌方最终阵容")
+    return item
+
+
+def normalize_relation_sample(sample, resolver):
+    """Expose legacy trainer fields from the canonical event sample.
+
+    The relation and prefix trainers are retained for their stronger learned
+    models, while the repository keeps one event-based sample schema.  This
+    bridge derives the old side lists without changing event order or pair
+    semantics.
+    """
+    item = normalize_bp_sample(sample, resolver)
+
+    def side_picks(events, side):
+        values = []
+        for event in events:
+            if event.get("side") == side:
+                values.extend(event.get("monsters") or [])
+        return values
+
+    prefix_events = item["events"]
+    full_events = item["full_events"]
+    my_prefix = side_picks(prefix_events, "me")
+    enemy_prefix = side_picks(prefix_events, "enemy")
+    my_final = side_picks(full_events, "me")
+    enemy_final = side_picks(full_events, "enemy")
+    item["my_picks_slugs"] = list(my_prefix)
+    item["enemy_picks_slugs"] = list(enemy_prefix)
+    item["final_my_pick_slugs"] = list(my_final)
+    item["final_enemy_pick_slugs"] = list(enemy_final)
+    item["remaining_my_pick_slugs"] = list(my_final[len(my_prefix) :])
+    item["remaining_enemy_pick_slugs"] = list(enemy_final[len(enemy_prefix) :])
+    next_action = list(item.get("next_action_slugs") or [])
+    item["next_pick_slug"] = next_action[0] if next_action else ""
+    item["my_ban_slug"] = item.get("my_ban_slug") or ""
+    item["enemy_ban_slug"] = item.get("enemy_ban_slug") or ""
+    item["my_leader_slug"] = item.get("my_leader_slug") or ""
+    item["enemy_leader_slug"] = item.get("enemy_leader_slug") or ""
     return item
 
 

@@ -25,6 +25,7 @@ MAX_PICK_SLOTS = 10
 MAX_TEAM_PICKS = 5
 VALID_SIDES = frozenset({"me", "enemy"})
 VALID_ACTION_TYPES = frozenset({"pick", "ban"})
+_UNSET = object()
 
 
 def normalize_side(value: Any) -> str:
@@ -182,7 +183,7 @@ def coerce_action_event(
     action: Any,
     *,
     side: Any = None,
-    action_type: Any = "pick",
+    action_type: Any = _UNSET,
     order: int | None = None,
 ) -> DraftActionEvent:
     """Convert a mapping, event, or monster sequence to ``DraftActionEvent``."""
@@ -190,11 +191,22 @@ def coerce_action_event(
     if isinstance(action, DraftActionEvent):
         if side is not None and normalize_side(side) != action.side:
             raise ValueError("action side conflicts with the supplied side")
+        if action_type is not _UNSET and normalize_action_type(action_type) != action.action_type:
+            raise ValueError("action type conflicts with the supplied action_type")
         return action
     if isinstance(action, Mapping):
         raw_side = action.get("side", side)
         raw_values = action.get("monsters")
-        raw_type = action.get("action_type", action_type)
+        mapped_type = action.get("action_type")
+        if mapped_type is not None and action_type is not _UNSET:
+            if normalize_action_type(mapped_type) != normalize_action_type(action_type):
+                raise ValueError("action type conflicts with the supplied action_type")
+        raw_type = mapped_type if mapped_type is not None else (
+            "pick" if action_type is _UNSET else action_type
+        )
+        if "side" in action and side is not None:
+            if normalize_side(action.get("side")) != normalize_side(side):
+                raise ValueError("action side conflicts with the supplied side")
         raw_order = action.get("order", order)
         return DraftActionEvent(
             side=raw_side,
@@ -208,7 +220,7 @@ def coerce_action_event(
     return DraftActionEvent(
         side=side,
         monsters=values,
-        action_type=action_type,
+        action_type="pick" if action_type is _UNSET else action_type,
         order=order,
     )
 
@@ -234,7 +246,7 @@ class DraftTimeline:
             normalized.append(event.with_order(index))
         object.__setattr__(self, "events", tuple(normalized))
 
-    def append(self, action: Any, *, side: Any = None, action_type: Any = "pick") -> "DraftTimeline":
+    def append(self, action: Any, *, side: Any = None, action_type: Any = _UNSET) -> "DraftTimeline":
         event = coerce_action_event(
             action,
             side=side,
@@ -289,14 +301,21 @@ def validate_timeline(
     slot = 1
     picked = set()
     banned = set()
+    ban_sides = []
     for event in timeline.events:
         if event.action_type == "ban":
             if not allow_bans or slot != MAX_PICK_SLOTS + 1:
                 raise ValueError("ban events are valid only after all pick slots")
+            expected_side = ("me", "enemy")[len(ban_sides)] if len(ban_sides) < 2 else None
+            if expected_side is None:
+                raise ValueError("each side may ban only once")
+            if event.side != expected_side:
+                raise ValueError("ban event side does not match the ban order")
             key = _monster_key(event.monsters[0])
             if key in banned:
                 raise ValueError("a monster cannot be banned twice")
             banned.add(key)
+            ban_sides.append(event.side)
             continue
         if slot > MAX_PICK_SLOTS:
             raise ValueError("pick events exceed the ten BP slots")
@@ -404,7 +423,13 @@ def legal_action_sizes(state: Any, side: Any = None, action_type: Any = "pick") 
     if not action_type:
         return ()
     if action_type == "ban":
-        return (1,) if _state_turn(state) == MAX_PICK_SLOTS + 1 else ()
+        if _state_turn(state) != MAX_PICK_SLOTS + 1:
+            return ()
+        bans = _state_bans(state)
+        expected_side = ("me", "enemy")[len(bans)] if len(bans) < 2 else None
+        if expected_side is None or (side is not None and normalize_side(side) != expected_side):
+            return ()
+        return (1,)
     size = next_event_size(state, side=side)
     return (size,) if size else ()
 
@@ -423,7 +448,7 @@ def is_legal_action(
     action: Any,
     *,
     side: Any = None,
-    action_type: Any = "pick",
+    action_type: Any = _UNSET,
     require_expected_size: bool = True,
 ) -> bool:
     """Check side, event size, duplicate and ban constraints for an action."""
@@ -431,9 +456,16 @@ def is_legal_action(
     mapping = _state_mapping(state)
     validate_timeline(_state_timeline(mapping), _first_pick_side(mapping))
 
+    requested_type = ""
+    if action_type is not _UNSET:
+        requested_type = normalize_action_type(action_type)
+        if not requested_type:
+            return False
     try:
         event = coerce_action_event(action, side=side, action_type=action_type)
     except (TypeError, ValueError):
+        return False
+    if requested_type and event.action_type != requested_type:
         return False
     if event.action_type == "pick":
         if event.side != next_event_side(state):
@@ -448,6 +480,10 @@ def is_legal_action(
     # the caller decides when that phase is active.  Repeating a ban is never
     # legal, while banning a picked monster remains valid.
     if _state_turn(state) != MAX_PICK_SLOTS + 1:
+        return False
+    existing_bans = _state_bans(state)
+    expected_side = ("me", "enemy")[len(existing_bans)] if len(existing_bans) < 2 else None
+    if expected_side is None or event.side != expected_side:
         return False
     banned_keys = {_monster_key(value) for value in _state_bans(state)}
     return not any(_monster_key(value) in banned_keys for value in event.monsters)
@@ -519,9 +555,11 @@ def transition_state(
         field = "my_ban" if event.side == "me" else "enemy_ban"
         updated[field] = event.monsters[0]
     next_turn = int(updated["turn"])
-    updated["current_side"] = "me" if next_turn == MAX_PICK_SLOTS + 1 else side_for_order(
-        next_turn, updated["first_pick_side"]
-    )
+    if next_turn == MAX_PICK_SLOTS + 1:
+        ban_count = len(_state_bans(updated))
+        updated["current_side"] = ("me", "enemy")[ban_count] if ban_count < 2 else None
+    else:
+        updated["current_side"] = side_for_order(next_turn, updated["first_pick_side"])
     return updated
 
 __all__ = [

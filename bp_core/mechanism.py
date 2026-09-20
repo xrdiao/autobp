@@ -46,8 +46,11 @@ def _load_json(path):
     path = Path(path)
     if not path.exists():
         return {}
-    with path.open("r", encoding="utf-8") as file:
-        return json.load(file)
+    try:
+        with path.open("r", encoding="utf-8") as file:
+            return json.load(file)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
 
 
 class BPMechanismLayer:
@@ -73,6 +76,14 @@ class BPMechanismLayer:
         self._profile_cache = {}
         self._team_tags_cache = {}
         self._enemy_threats_cache = {}
+
+    @staticmethod
+    def _values(values):
+        if values is None:
+            return ()
+        if isinstance(values, str):
+            return (values,)
+        return tuple(values)
 
     def _resolve_slug(self, value):
         normalized = normalize_name(value)
@@ -100,7 +111,7 @@ class BPMechanismLayer:
         return self._profile_cache[normalized]
 
     def _team_tags(self, values):
-        key = tuple(self._resolve_slug(value) for value in values or [])
+        key = tuple(self._resolve_slug(value) for value in self._values(values))
         cached = self._team_tags_cache.get(key)
         if cached is not None:
             tags, known = cached
@@ -122,7 +133,7 @@ class BPMechanismLayer:
         return 1.0 if any(response in tags for response in responses) else 0.0
 
     def _enemy_threats(self, enemy_picks):
-        key = tuple(self._resolve_slug(value) for value in enemy_picks or [])
+        key = tuple(self._resolve_slug(value) for value in self._values(enemy_picks))
         cached = self._enemy_threats_cache.get(key)
         if cached is not None:
             return cached
@@ -149,6 +160,9 @@ class BPMechanismLayer:
         return result
 
     def score_action(self, my_picks, enemy_picks, action):
+        my_picks = self._values(my_picks)
+        enemy_picks = self._values(enemy_picks)
+        action = self._values(action)
         if not self.ready or not enemy_picks or not action:
             return {
                 "available": False,

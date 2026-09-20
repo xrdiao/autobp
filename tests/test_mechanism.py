@@ -52,6 +52,13 @@ class BPMechanismTests(unittest.TestCase):
         self.assertFalse(result["available"])
         self.assertEqual(result["score"], 0.5)
 
+    def test_string_action_is_one_monster(self):
+        layer = BPMechanismLayer(Path("/does/not/exist.json"))
+        self.assertEqual(
+            layer.score_action([], [], "Haegang"),
+            layer.score_action([], [], ["Haegang"]),
+        )
+
     def test_missing_profile_name_uses_slug_in_threat_sources(self):
         snapshot = {
             "source": "test",

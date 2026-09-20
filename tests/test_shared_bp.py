@@ -15,6 +15,7 @@ from bp_core.bp_common import side_for_order
 from bp_core.draft_state import DraftState
 from bp_core.lucksack_stats import is_usable_catalog_item
 from bp_recommender.decision_engine import BPDecisionEngine
+from bp_recommender.shared import BPSharedRecommender
 
 
 def canonical_state(my_picks=(), enemy_picks=(), first_pick_side="me"):
@@ -31,6 +32,14 @@ def canonical_state(my_picks=(), enemy_picks=(), first_pick_side="me"):
 
 
 class ActionSpaceTests(unittest.TestCase):
+    def test_zero_validation_ratio_keeps_all_samples_in_training(self):
+        from training.shared_bp import split_samples
+
+        samples = [{"match_id": "m1"}, {"match_id": "m2"}]
+        train, valid = split_samples(samples, 0.0, seed=7)
+        self.assertEqual(len(train), 2)
+        self.assertEqual(valid, [])
+
     def test_catalog_keeps_awakened_and_secondary_awakened_only(self):
         self.assertTrue(is_usable_catalog_item({"natural_stars": 5, "searchable": True}))
         self.assertTrue(
@@ -172,6 +181,56 @@ class ActionSpaceTests(unittest.TestCase):
             )
         )
 
+    def test_mapping_action_cannot_override_explicit_side_or_type(self):
+        state = canonical_state()
+        action = {"side": "enemy", "action_type": "pick", "monsters": ["x"]}
+        self.assertFalse(is_legal_action(state, action, side="me"))
+        self.assertFalse(is_legal_action(state, action, action_type="ban"))
+
+    def test_bans_follow_me_then_enemy_once(self):
+        complete = canonical_state(
+            ("m1", "m2", "m3", "m4", "m5"),
+            ("e1", "e2", "e3", "e4", "e5"),
+        )
+        first = transition_state(
+            complete,
+            {"side": "me", "action_type": "ban", "monsters": ["b1"]},
+        )
+        self.assertEqual(first["current_side"], "enemy")
+        self.assertEqual(legal_action_sizes(first, side="me", action_type="ban"), ())
+        self.assertEqual(legal_action_sizes(first, side="enemy", action_type="ban"), (1,))
+        second = transition_state(
+            first,
+            {"side": "enemy", "action_type": "ban", "monsters": ["b2"]},
+        )
+        self.assertIsNone(second["current_side"])
+        self.assertFalse(
+            is_legal_action(
+                second,
+                {"side": "me", "action_type": "ban", "monsters": ["b3"]},
+            )
+        )
+
+    def test_draft_state_bans_match_canonical_events(self):
+        timeline = timeline_from_picks(
+            ("m1", "m2", "m3", "m4", "m5"),
+            ("e1", "e2", "e3", "e4", "e5"),
+            "me",
+        )
+        events = timeline.to_dict() + [
+            {"side": "me", "action_type": "ban", "monsters": ["b1"]},
+            {"side": "enemy", "action_type": "ban", "monsters": ["b2"]},
+        ]
+        with self.assertRaises(ValueError):
+            DraftState(
+                turn=11,
+                my_picks=("m1", "m2", "m3", "m4", "m5"),
+                enemy_picks=("e1", "e2", "e3", "e4", "e5"),
+                my_ban="wrong",
+                enemy_ban="b2",
+                events=events,
+            )
+
     def test_bans_are_available_only_after_all_pick_slots(self):
         state = canonical_state()
         action = {"side": "me", "action_type": "ban", "monsters": ["e1"]}
@@ -193,6 +252,29 @@ class DecisionCanonicalizationTests(unittest.TestCase):
     def test_string_action_is_one_monster(self):
         self.assertEqual(BPDecisionEngine.canonicalize_action("foo"), ("foo",))
 
+    def test_display_name_plan_key_matches_plan(self):
+        row = {
+            "plan": ["Wind Aya - Nobara Kugisaki"],
+            "action_key": "wind aya - nobara kugisaki",
+            "action_type": "single",
+            "pick_count": 1,
+            "plan_score": 0.5,
+        }
+        normalized = BPDecisionEngine._normalize_plan(row)
+        self.assertEqual(normalized["plan"], row["plan"])
+        self.assertEqual(normalized["action_key"], row["action_key"])
+
+    def test_display_name_pair_key_is_order_independent(self):
+        row = {
+            "plan": ["Zeta Form", "Alpha Form"],
+            "action_key": "alpha form|zeta form",
+            "action_type": "pair",
+            "pick_count": 2,
+            "plan_score": 0.5,
+        }
+        normalized = BPDecisionEngine._normalize_plan(row)
+        self.assertEqual(normalized["action_key"], row["action_key"])
+
     def test_duplicate_state_values_are_evaluated_once_and_reused(self):
         class ValueModel:
             def __init__(self):
@@ -207,6 +289,72 @@ class DecisionCanonicalizationTests(unittest.TestCase):
         state = canonical_state()
         self.assertEqual(engine._evaluate_states([state, state]), [0.7, 0.7])
         self.assertEqual(model.calls, 1)
+
+    def test_candidate_actions_pass_current_pick_count_to_shared_policy(self):
+        class PickModel:
+            def __init__(self):
+                self.pick_counts = []
+
+            def recommend_pick_plans(self, **kwargs):
+                self.pick_counts.append(kwargs["pick_count"])
+                count = int(kwargs["pick_count"])
+                plan = ["a"] if count == 1 else ["b", "c"]
+                return [{
+                    "plan": plan,
+                    "action_type": "single" if count == 1 else "pair",
+                    "pick_count": count,
+                    "plan_score": 1.0,
+                }]
+
+        model = PickModel()
+        engine = BPDecisionEngine(model=model, assets={"options": ["a", "b", "c"]})
+        engine._candidate_actions(canonical_state(), "me", 1)
+        engine._candidate_actions(canonical_state(("a",), ("b", "c")), "me", 1)
+        self.assertEqual(model.pick_counts, [1, 2])
+
+    def test_ban_plans_include_before_and_after_win_rates(self):
+        my_picks = ["m1", "m2", "m3", "m4", "m5"]
+        enemy_picks = ["e1", "e2", "e3", "e4", "e5"]
+        timeline = timeline_from_picks(my_picks, enemy_picks, "me")
+        state = {
+            "events": timeline.to_dict(),
+            "my_picks": my_picks,
+            "enemy_picks": enemy_picks,
+            "turn": 11,
+            "first_pick_side": "me",
+            "current_side": "me",
+        }
+        recommender = object.__new__(BPSharedRecommender)
+        recommender.known_slugs = frozenset(my_picks + enemy_picks)
+        recommender._to_slug = lambda value: str(value).lower()
+        recommender._to_display_name = lambda value: str(value)
+        recommender._state = lambda *args, **kwargs: state
+        recommender._score_actions = lambda _state, actions, head: [
+            float(index) for index, _action in enumerate(actions)
+        ]
+
+        def evaluate_states(states, return_detail=False):
+            if len(states) == 1:
+                return [{"calibrated_win_rate": 0.4}]
+            return [
+                {"calibrated_win_rate": 0.5 + index / 100.0}
+                for index, _state in enumerate(states)
+            ]
+
+        recommender.evaluate_states = evaluate_states
+        plans = recommender.recommend_ban_plans(
+            my_picks,
+            enemy_picks,
+            events=timeline.to_dict(),
+            top_k=5,
+        )
+        self.assertEqual(len(plans), 5)
+        self.assertEqual(plans[0]["detail"]["pre_ban_win_rate"], 0.4)
+        self.assertIn("post_ban_win_rate", plans[0]["detail"])
+        self.assertEqual(
+            plans[0]["estimated_win_rate"],
+            plans[0]["detail"]["post_ban_win_rate"],
+        )
 
     def test_state_cache_keeps_global_event_order(self):
         first = {

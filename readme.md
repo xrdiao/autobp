@@ -8,10 +8,10 @@ AutoBP 是《Summoners War》世界竞技场（RTA）的客观 BP 决策工具�
 
 ## 功能
 
-- Shared BP Core：一个事件级 Transformer 同时提供单选、双选、对手预测、Ban 和局面价值。
+- 专用推荐模型：Relation 负责选人排序，Prefix Value 负责局面价值，Full Draft Value 负责 Ban 与完整阵容评估。
 - 客观证据：融合 Lucksack、SWKit、SWRT 和 SWARFARM 的公开统计、对位与机制标签。
 - 自动动作大小：根据当前 BP 轮次自动生成单个或两个魔灵的动作。
-- 有限深度搜索：使用共享价值头评估候选动作和对手响应。
+- 有限深度搜索：使用 Prefix Value 价值模型评估候选动作和对手响应。
 - Web 与桌面端：支持手动点选、Box 管理、截图识别和推荐结果应用。
 - 回放评测：固定随机种子抽取历史前缀，统计 Top-k 命中率、价值差、校准误差和延迟。
 - Steam 安全：截图识别只处理用户主动提供的截图，不枚举 Steam 或游戏进程，不读取窗口句柄、内存或图形 Hook。
@@ -21,7 +21,7 @@ AutoBP 是《Summoners War》世界竞技场（RTA）的客观 BP 决策工具�
 ```text
 BP 事件时间线
     ↓
-Shared BP Core（单选 / 双选 / 对手 / Ban / Value）
+Relation（单选 / 双选 / 对手） + Prefix Value（局面价值） + Draft Value（Ban）
     ↓
 公开统计与技能机制证据
     ↓
@@ -110,7 +110,7 @@ http://127.0.0.1:8501
 python -m apps.desktop
 ```
 
-仓库不再携带旧模型权重。完成训练后，Shared BP Core 的模型、元数据、词表和划分清单会写入 `models/`，Web 和桌面端只读取这一组文件。
+完成训练后，Relation、Prefix Value 和 Draft Value 的模型、元数据与词表会写入 `models/`，Web 和桌面端读取这三组专用模型。BP 状态仍使用统一的事件时间线表达。重建样本后必须重新训练 Draft Value，双方 Ban 字段才会进入模型。
 
 ## 数据
 
@@ -168,7 +168,7 @@ python build_dataset/run_all.py --download --dataset-version v3.0 --use-existing
 
 ## 训练
 
-在样本库已生成后，同步公开数据、审计事件级样本并训练唯一的 Shared BP Core。
+在样本库已生成后，同步公开数据、审计事件级样本并训练三组专用模型。
 
 ```bash
 python -m training.pipeline --sync-web-data
@@ -180,34 +180,39 @@ python -m training.pipeline --sync-web-data
 python -m training.pipeline
 ```
 
-只使用本地数据训练 Shared BP Core。
+只使用本地数据训练 Relation、Prefix Value 和 Draft Value。
 
 ```bash
-python -m training.shared_bp --data-path data/bp_samples.sqlite --epochs 8
+python -m training.pipeline --skip-audit --relation-epochs 3 --prefix-epochs 10
 ```
 
 在 CPU 上训练并把进度输出保留在终端。
 
 ```bash
-python -m training.shared_bp --data-path data/bp_samples.sqlite --device cpu --epochs 8
+python -m training.pipeline --skip-audit --device cpu
 ```
 
 训练产物如下：
 
 ```text
-models/bp_shared.pt
-models/bp_shared_meta.json
-models/bp_shared_vocab.json
-models/bp_shared_split_manifest.json
+models/bp_relation_net_v2.pt
+models/bp_relation_meta_v2.json
+models/bp_relation_vocab_v2.json
+models/bp_prefix_value_net.pt
+models/bp_prefix_value_meta.json
+models/bp_prefix_value_vocab.json
+models/bp_draft_value_net.pt
+models/bp_draft_value_meta.json
+models/bp_draft_value_vocab.json
 ```
 
-训练器同时优化四类动作头和一个价值头：我方单选、对方单选、无序双选、Ban，以及局面胜率。双选标签只保留一个 pair action，不把同一事件的第二个槽位当成独立动作。
+Relation 训练器保留双方选人顺序，同时把同一双选事件编码为无序 pair；Prefix Value 按事件前缀训练并进行概率校准；Draft Value 使用完整五选四阵容和 Ban 监督。
 
 常用参数：
 
 - `--epochs`：训练轮数。
 - `--batch-size`：批大小。
-- `--negative-count`：每个正样本的负样本数量。
+- `--negatives-per-positive`：Relation 每个正样本的负样本数量。
 - `--val-ratio`：按比赛分组的验证集比例。
 - `--max-samples`：调试时限制样本数，默认使用全部数据。
 - `--device cuda|cpu`：选择训练设备。
@@ -217,7 +222,7 @@ models/bp_shared_split_manifest.json
 先检查样本的时间线、选人数量和下一手字段。
 
 ```bash
-python -m evaluation.audit_bp_data --data-path data/bp_samples.sqlite
+python -m evaluation.audit_prefix_data --data-path data/bp_samples.sqlite
 ```
 
 从验证集按固定种子随机抽取 2000 个事件前缀进行回放评测。
@@ -235,13 +240,13 @@ python -m evaluation.replay --eval-split val --limit 0 --top-k 6 --seed 42
 把完整评测结果保存为 JSON。
 
 ```bash
-python -m evaluation.replay --limit 2000 --top-k 6 --seed 42 --output evaluation/shared_replay.json
+python -m evaluation.replay --limit 2000 --top-k 6 --seed 42 --output evaluation/legacy_replay.json
 ```
 
 评测输出包括：
 
 - `top1_hit_rate`、`top3_hit_rate`：历史下一手是否出现在推荐前 k 名。
-- `mean_recommended_value`、`mean_actual_value`、`mean_value_lift`：共享价值头对推荐动作和历史动作的比较。
+- `mean_recommended_value`、`mean_actual_value`、`mean_value_lift`：Prefix Value 对推荐动作和历史动作的比较。
 - `brier_score`、`log_loss`、`ece`：按比赛抽取结果样本后的概率校准指标。
 - `mean_latency_ms`：平均推荐延迟。
 
@@ -251,7 +256,7 @@ python -m evaluation.replay --limit 2000 --top-k 6 --seed 42 --output evaluation
 
 Web 页面中，当前对方选人数量决定预测一个还是两个魔灵。点击推荐卡片的应用按钮会把整件动作写入当前 BP 状态；双选成员在显示和缓存中按无序 pair 处理，事件顺序不会被交换。
 
-“我的 Box”只限制我方候选。关闭 Box 限制后，模型可以从完整 Shared 词表中推荐；对方预测始终不使用账号 Box。
+“我的 Box”只限制我方候选。关闭 Box 限制后，Relation 可以从完整目录和统计候选中推荐；对方预测始终不使用账号 Box。
 
 账号 Box 会保存到本地 `json/my_box.json`。可选的 `json/account_profile.json` 只用于初始化拥有列表：
 
@@ -280,23 +285,27 @@ python -m sw_ui_detection --image path/to/bp.png --json-out sw_ui_detection/outp
 ```text
 app_web.py                 Streamlit 入口
 apps/desktop.py            Tk 桌面入口
-bp_core/                   BP 事件、状态、词表、数据和 Shared 网络
-bp_recommender/shared.py   Shared BP Core 推理与候选排序
-bp_recommender/decision_engine.py  有限深度响应搜索
-training/shared_bp.py      唯一模型训练入口
-training/pipeline.py       数据同步、审计和 Shared 训练流水线
+bp_core/                   BP 事件、状态、词表、数据和模型公共组件
+bp_recommender/relation.py  Relation 选人与对手预测
+bp_recommender/prefix_value.py  Prefix Value 局面评估
+bp_recommender/ban_value.py  Draft Value Ban 评估
+bp_recommender/decision_engine.py  统一状态上的有限深度响应搜索
+training/relation.py       Relation 训练入口
+training/prefix_value.py   Prefix Value 训练入口
+training/draft_value.py    Draft Value 训练入口
+training/pipeline.py       数据同步、审计和三模型训练流水线
 training/data_pipeline.py  样本读取与动作标签构造
 evaluation/                回放评测和数据审计
 build_dataset/             公开数据同步与目录生成
 sw_ui_detection/           截图定位和魔灵识别
-models/                    Shared BP Core 训练产物
+models/                    三组专用模型训练产物
 tests/                     单元测试
 ```
 
 运行模块时保持项目根目录为当前目录：
 
 ```bash
-python -m training.shared_bp
+python -m training.pipeline
 python -m evaluation.replay --limit 2000
 ```
 

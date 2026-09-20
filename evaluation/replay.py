@@ -1,4 +1,4 @@
-"""Replay evaluation for the shared event-aware BP model."""
+"""Replay evaluation for the legacy specialized BP models on event states."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from bp_core.action_space import DraftTimeline, transition_state, validate_timel
 from bp_core.data_common import load_record_rows
 from bp_core.bp_common import infer_pick_count, side_for_order
 from bp_core.names import PROJECT_ROOT, normalize_name
-from bp_recommender.shared import BPSharedRecommender
+from bp_recommender.legacy_adapter import LegacyBPRecommender
 
 
 DEFAULT_DATA_PATH = PROJECT_ROOT / "data" / "bp_samples.sqlite"
@@ -50,7 +50,10 @@ def _actual_action_slugs(sample, model, pick_count):
 
 
 def _candidate_pool(model):
-    return sorted(set(model.known_slugs))
+    return sorted(
+        set(model.known_slugs)
+        | set(getattr(model, "external_slugs", ()))
+    )
 
 
 def _plan_action(plan, model):
@@ -85,13 +88,24 @@ def _filter_eval_split(samples, split, manifest_path):
     groups = _load_split_manifest(manifest_path)
     if not groups:
         raise FileNotFoundError(
-            f"Shared BP split manifest is required for --eval-split {split}: {manifest_path}"
+            f"BP split manifest is required for --eval-split {split}: {manifest_path}"
         )
-    return [
+    filtered = [
         sample
         for sample in samples
-        if (groups.get(f"match_id:{_match_id(sample)}") or {}).get("split") == split
+        if (
+            groups.get(_match_id(sample))
+            or groups.get(f"match_id:{_match_id(sample)}")
+            or groups.get(f"sample_id:{_match_id(sample)}")
+            or {}
+        ).get("split") == split
     ]
+    if samples and not filtered:
+        raise ValueError(
+            f"split manifest matched no samples for --eval-split {split}; "
+            "check manifest group keys against sample match_id/sample_id"
+        )
+    return filtered
 
 
 def _select_match_representatives(samples, seed=42):
@@ -315,7 +329,7 @@ def evaluate_replay(shared_model, samples, top_k=6, max_pair_candidates=400,
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Replay historical BP states with the shared BP model.")
+    parser = argparse.ArgumentParser(description="Replay historical BP states with the legacy BP models.")
     parser.add_argument("--data-path", default=str(DEFAULT_DATA_PATH))
     parser.add_argument("--eval-split", choices=("val", "train", "all"), default="val")
     parser.add_argument("--split-manifest", default=str(DEFAULT_SPLIT_MANIFEST_PATH))
@@ -332,13 +346,18 @@ def main():
     samples = load_record_rows(Path(args.data_path), "bp_samples")
     samples = _filter_eval_split(samples, args.eval_split, args.split_manifest)
     samples = _select_samples(samples, int(args.limit), seed=int(args.seed))
-    shared_model = BPSharedRecommender()
+    if not samples:
+        raise RuntimeError(
+            f"no evaluable BP samples remain for --eval-split {args.eval_split}; "
+            "check the dataset, split manifest, and event schema"
+        )
+    shared_model = LegacyBPRecommender()
     summary = evaluate_replay(shared_model, samples, top_k=args.top_k,
                                max_pair_candidates=args.max_pair_candidates, seed=int(args.seed))
     output = {"data_path": str(args.data_path), "eval_split": args.eval_split,
               "split_manifest": str(args.split_manifest),
               "candidate_matches": len({_match_id(sample) for sample in samples}),
-              "model": "shared_event_v1", "sample_limit": int(args.limit),
+              "model": "legacy_relation_prefix_ban", "sample_limit": int(args.limit),
               "sampling_strategy": "seeded_random" if int(args.limit) > 0 else "all",
               "sampling_seed": int(args.seed), "top_k": int(args.top_k),
               "max_pair_candidates": int(args.max_pair_candidates),

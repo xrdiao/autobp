@@ -6,6 +6,8 @@ from bs4 import BeautifulSoup
 from collections import defaultdict
 from pathlib import Path
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
 ATTRS = {"Fire", "Water", "Wind", "Light", "Dark"}
 
 try:
@@ -249,8 +251,8 @@ def make_aliases_for_entry(entry):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Build or incrementally update monster catalog from HTML.")
-    parser.add_argument("--html-dir", default="dataset")
-    parser.add_argument("--output-path", default="json//monster_catalog.json")
+    parser.add_argument("--html-dir", default=str(PROJECT_ROOT / "dataset"))
+    parser.add_argument("--output-path", default=str(PROJECT_ROOT / "json" / "monster_catalog.json"))
     parser.add_argument("--incremental", dest="incremental", action="store_true", default=True)
     parser.add_argument("--force-rebuild", dest="incremental", action="store_false")
     args = parser.parse_args()

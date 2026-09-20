@@ -5,10 +5,11 @@ import re
 import shutil
 from pathlib import Path
 
-DATASET_DIR = "dataset"
-IMAGES_DIR = "images"
-CONFLICT_REPORT = "json//image_conflicts.json"
-SYNC_REPORT = "json//image_sync_report.json"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DATASET_DIR = PROJECT_ROOT / "dataset"
+IMAGES_DIR = PROJECT_ROOT / "images"
+CONFLICT_REPORT = PROJECT_ROOT / "json" / "image_conflicts.json"
+SYNC_REPORT = PROJECT_ROOT / "json" / "image_sync_report.json"
 
 UNIT_ICON_PATTERN = re.compile(r"^unit_icon.*\.(png|jpg|jpeg|webp)$", re.IGNORECASE)
 
@@ -117,8 +118,8 @@ def sync_images():
             detail_records.append(record)
 
     report = {
-        "dataset_dir": DATASET_DIR,
-        "images_dir": IMAGES_DIR,
+        "dataset_dir": str(DATASET_DIR),
+        "images_dir": str(IMAGES_DIR),
         "resource_dir_count": len(resource_dirs),
         "scanned_files": scanned_files,
         "skipped_non_unit_icon": skipped_non_unit_icon,

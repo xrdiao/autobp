@@ -1,5 +1,3 @@
-"""Run the complete data and Shared BP Core training pipeline."""
-
 from __future__ import annotations
 
 import argparse
@@ -11,57 +9,90 @@ from pathlib import Path
 
 from tqdm import tqdm
 
-from bp_core.data_common import count_record_rows
-
 ROOT_DIR = Path(__file__).resolve().parent.parent
-DEFAULT_DATA_PATH = ROOT_DIR / "data" / "bp_samples.sqlite"
 
 
-def parse_args(argv=None):
+def parse_args():
     parser = argparse.ArgumentParser(
-        description="同步公开数据、审计回放并训练唯一的 Shared BP Core。"
+        description="Sync current BP data, audit samples, and train all recommendation models."
     )
     parser.add_argument(
         "--sync-web-data",
         action="store_true",
-        help="先同步 Lucksack、SWKit、SWRT 和 SWARFARM 数据。",
+        help="Sync Lucksack, SWKit, SWRT statistics, and SWARFARM mechanisms first.",
     )
     parser.add_argument(
         "--skip-audit",
         action="store_true",
-        help="跳过逐回合 BP 数据审计。",
+        help="Skip the chronological BP sample audit.",
     )
     parser.add_argument(
-        "--shared-epochs",
+        "--from-scratch",
+        action="store_true",
+        help="Train relation v2 from scratch and rebuild its split manifest.",
+    )
+    parser.add_argument("--skip-relation", action="store_true", help="Skip relation v2 training.")
+    parser.add_argument("--skip-prefix", action="store_true", help="Skip prefix value training.")
+    parser.add_argument("--skip-draft", action="store_true", help="Skip full-draft value training.")
+    parser.add_argument(
+        "--relation-epochs",
         type=int,
         default=None,
-        help="覆盖 Shared BP Core 训练轮数。",
+        help="Override relation epochs. Defaults to the trainer's fine-tune/from-scratch setting.",
+    )
+    parser.add_argument(
+        "--prefix-epochs",
+        type=int,
+        default=None,
+        help="Override prefix value epochs. Defaults to the trainer setting.",
+    )
+    parser.add_argument(
+        "--relation-workers",
+        type=int,
+        default=0,
+        help="Data-loader workers for relation training; 0 is the stable default.",
     )
     parser.add_argument(
         "--device",
         default=None,
-        help="训练设备，例如 cuda 或 cpu。",
+        help="Training device passed to relation/prefix models, for example cuda or cpu.",
     )
     parser.add_argument(
-        "--data-path",
-        default=str(DEFAULT_DATA_PATH),
-        help="事件级 BP 样本 SQLite 路径。",
+        "--combo-limit",
+        type=int,
+        default=2000,
+        help="Maximum duo/trio records fetched during the Lucksack sync.",
     )
-    parser.add_argument("--combo-limit", type=int, default=2000)
-    parser.add_argument("--swrt-monster-limit", type=int, default=400)
-    parser.add_argument("--swrt-workers", type=int, default=4)
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--swrt-monster-limit",
+        type=int,
+        default=400,
+        help="Maximum SWRT monsters for which matchup detail is fetched.",
+    )
+    parser.add_argument(
+        "--swrt-workers",
+        type=int,
+        default=4,
+        help="Concurrent workers used for public SWRT matchup detail requests.",
+    )
+    return parser.parse_args()
 
 
-def run_stage(label, command, env, progress):
+def run_stage(label, command, env=None, progress=None):
     started = time.perf_counter()
     print(f"\n=== {label} ===", flush=True)
     print("$", " ".join(command), flush=True)
-    subprocess.run([sys.executable, *command], cwd=ROOT_DIR, check=True, env=env)
+    subprocess.run(
+        [sys.executable, *command],
+        cwd=ROOT_DIR,
+        check=True,
+        env=env,
+    )
     elapsed = time.perf_counter() - started
     print(f"[DONE] {label} ({elapsed:.1f}s)", flush=True)
-    progress.update(1)
-    progress.set_postfix_str(f"{label} {elapsed:.1f}s")
+    if progress is not None:
+        progress.update(1)
+        progress.set_postfix_str(f"{label} {elapsed:.1f}s")
 
 
 def build_env(device):
@@ -73,43 +104,35 @@ def build_env(device):
     return env
 
 
-def require_samples(data_path):
-    """Fail before audit/training when the dataset stage produced no samples."""
-
-    path = resolve_data_path(data_path)
-    sample_count = count_record_rows(path, "bp_samples")
-    if sample_count <= 0:
-        raise RuntimeError(
-            f"没有可训练的 BP 样本: {path}. "
-            "请先成功完成 `python build_dataset/run_all.py`；"
-            "如果排行榜下载中断，请修复网络或验证页后重新运行，并使用"
-            " `--dataset-version <已有版本> --use-existing-version-csv` 继续已有版本。"
-        )
-    print(f"[INFO] BP samples: {sample_count} ({path})", flush=True)
-    return sample_count
-
-
-def resolve_data_path(data_path):
-    path = Path(data_path)
-    return path if path.is_absolute() else ROOT_DIR / path
-
-
-def main(argv=None):
-    args = parse_args(argv)
+def main():
+    args = parse_args()
     env = build_env(args.device)
-    data_path = resolve_data_path(args.data_path)
-    sync_count = 4 if args.sync_web_data else 0
-    audit_count = 0 if args.skip_audit else 1
-    total_stages = sync_count + audit_count + 1
+    total_stages = (
+        (4 if args.sync_web_data else 0)
+        + (0 if args.skip_audit else 1)
+        + (0 if args.skip_relation else 1)
+        + (0 if args.skip_prefix else 1)
+        + (0 if args.skip_draft else 1)
+    )
     progress = tqdm(total=total_stages, desc="训练流水线", unit="stage", dynamic_ncols=True)
+
     try:
         if args.sync_web_data:
-            run_stage("同步 SWKit 别称和 RTA 评级", ["build_dataset/sync_swkit_data.py"], env, progress)
+            run_stage(
+                "同步 SWKit 别称和 RTA 评级",
+                ["build_dataset/sync_swkit_data.py"],
+                env=env,
+                progress=progress,
+            )
             run_stage(
                 "同步 Lucksack 赛季、段位、BP 统计和魔灵目录",
-                ["build_dataset/sync_lucksack_data.py", "--combo-limit", str(args.combo_limit)],
-                env,
-                progress,
+                [
+                    "build_dataset/sync_lucksack_data.py",
+                    "--combo-limit",
+                    str(args.combo_limit),
+                ],
+                env=env,
+                progress=progress,
             )
             run_stage(
                 "同步 SWRT 怪物统计和对位数据",
@@ -120,30 +143,61 @@ def main(argv=None):
                     "--max-workers",
                     str(args.swrt_workers),
                 ],
-                env,
-                progress,
+                env=env,
+                progress=progress,
             )
-            run_stage("同步 SWARFARM 技能机制", ["build_dataset/sync_swarfarm_mechanisms.py"], env, progress)
-
-        require_samples(data_path)
+            run_stage(
+                "同步 SWARFARM 技能机制",
+                ["build_dataset/sync_swarfarm_mechanisms.py"],
+                env=env,
+                progress=progress,
+            )
 
         if not args.skip_audit:
             run_stage(
                 "审计逐回合 BP 数据",
-                ["-m", "evaluation.audit_bp_data", "--data-path", str(data_path)],
-                env,
-                progress,
+                ["-m", "evaluation.audit_prefix_data"],
+                env=env,
+                progress=progress,
             )
 
-        shared_command = ["-m", "training.shared_bp", "--data-path", str(data_path)]
-        if args.shared_epochs is not None:
-            shared_command.extend(["--epochs", str(args.shared_epochs)])
-        if args.device:
-            shared_command.extend(["--device", args.device])
-        run_stage("训练 Shared BP Core", shared_command, env, progress)
+        if not args.skip_relation:
+            relation_command = [
+                "-m",
+                "training.relation",
+                "--rebuild-preprocessed-cache",
+                "--num-workers",
+                str(args.relation_workers),
+            ]
+            if args.from_scratch:
+                relation_command.extend(["--from-scratch", "--rebuild-split"])
+            else:
+                relation_command.append("--fine-tune")
+            if args.relation_epochs is not None:
+                relation_command.extend(["--epochs", str(args.relation_epochs)])
+            if args.device:
+                relation_command.extend(["--device", args.device])
+            run_stage("训练 relation v2", relation_command, env=env, progress=progress)
+
+        if not args.skip_prefix:
+            prefix_command = ["-m", "training.prefix_value"]
+            if args.prefix_epochs is not None:
+                prefix_command.extend(["--epochs", str(args.prefix_epochs)])
+            if args.device:
+                prefix_command.extend(["--device", args.device])
+            run_stage("训练 prefix value", prefix_command, env=env, progress=progress)
+
+        if not args.skip_draft:
+            run_stage(
+                "训练完整阵容 value / Ban 模型",
+                ["-m", "training.draft_value"],
+                env=env,
+                progress=progress,
+            )
     finally:
         progress.close()
-    print("\n完成：公开数据、回放审计和 Shared BP Core 已更新。", flush=True)
+
+    print("\n完成：网页统计、机制数据和模型已按当前数据快照更新。", flush=True)
 
 
 if __name__ == "__main__":

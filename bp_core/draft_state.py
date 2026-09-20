@@ -39,12 +39,26 @@ class DraftState:
             raise ValueError("my_picks does not match canonical events")
         if tuple(self.enemy_picks) != tuple(timeline.picks_for("enemy")):
             raise ValueError("enemy_picks does not match canonical events")
+        expected_my_bans = timeline.bans_for("me")
+        expected_enemy_bans = timeline.bans_for("enemy")
+        actual_my_bans = (self.my_ban,) if self.my_ban else ()
+        actual_enemy_bans = (self.enemy_ban,) if self.enemy_ban else ()
+        if actual_my_bans != expected_my_bans:
+            raise ValueError("my_ban does not match canonical events")
+        if actual_enemy_bans != expected_enemy_bans:
+            raise ValueError("enemy_ban does not match canonical events")
         object.__setattr__(self, "my_picks", tuple(timeline.picks_for("me")))
         object.__setattr__(self, "enemy_picks", tuple(timeline.picks_for("enemy")))
+        object.__setattr__(self, "my_ban", expected_my_bans[0] if expected_my_bans else "")
+        object.__setattr__(self, "enemy_ban", expected_enemy_bans[0] if expected_enemy_bans else "")
 
     @property
     def current_side(self) -> str | None:
-        return "me" if self.turn == 11 else side_for_order(self.turn, self.first_pick_side)
+        if self.turn != 11:
+            return side_for_order(self.turn, self.first_pick_side)
+        timeline = DraftTimeline(self.events)
+        ban_count = len(timeline.bans_for("me")) + len(timeline.bans_for("enemy"))
+        return ("me", "enemy")[ban_count] if ban_count < 2 else None
 
     def to_dict(self) -> dict:
         payload = asdict(self)

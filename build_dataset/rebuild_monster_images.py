@@ -15,11 +15,11 @@ from bp_core.lucksack_stats import (
     is_usable_catalog_item,
 )
 
-DATASET_DIR = "dataset"
-IMAGES_DIR = "images"
-OUTPUT_PATH = "json//monster_images.json"
-LUCK_CATALOG_PATH = "json//lucksack_monster_catalog.json"
-MISSING_REPORT_PATH = "json//missing_images_report.json"
+DATASET_DIR = PROJECT_ROOT / "dataset"
+IMAGES_DIR = PROJECT_ROOT / "images"
+OUTPUT_PATH = PROJECT_ROOT / "json" / "monster_images.json"
+LUCK_CATALOG_PATH = PROJECT_ROOT / "json" / "lucksack_monster_catalog.json"
+MISSING_REPORT_PATH = PROJECT_ROOT / "json" / "missing_images_report.json"
 
 # 只接受 unit_icon 开头的图片
 UNIT_ICON_PATTERN = re.compile(r"^unit_icon.*\.(png|jpg|jpeg|webp)$", re.IGNORECASE)

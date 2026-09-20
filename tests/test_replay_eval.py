@@ -1,6 +1,9 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
-from evaluation.replay import _binary_metrics, _select_match_representatives
+from evaluation.replay import _binary_metrics, _filter_eval_split, _select_match_representatives
 
 
 class ReplayEvaluationTests(unittest.TestCase):
@@ -31,6 +34,24 @@ class ReplayEvaluationTests(unittest.TestCase):
         self.assertEqual(metrics["evaluated"], 2)
         self.assertAlmostEqual(metrics["brier_score"], 0.01, places=6)
         self.assertAlmostEqual(metrics["ece"], 0.1, places=6)
+
+    def test_filter_eval_split_accepts_training_manifest_keys(self):
+        samples = [{"match_id": "m1"}, {"match_id": "m2"}]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "manifest.json"
+            path.write_text(
+                json.dumps({"groups": {"m1": {"split": "val"}, "m2": {"split": "train"}}}),
+                encoding="utf-8",
+            )
+            self.assertEqual(_filter_eval_split(samples, "val", path), [samples[0]])
+
+    def test_filter_eval_split_fails_loudly_when_manifest_does_not_match(self):
+        samples = [{"match_id": "m1"}]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "manifest.json"
+            path.write_text(json.dumps({"groups": {"other": {"split": "val"}}}), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                _filter_eval_split(samples, "val", path)
 
 
 if __name__ == "__main__":

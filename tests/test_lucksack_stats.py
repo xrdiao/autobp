@@ -119,6 +119,7 @@ class BPLucksackStatsTests(unittest.TestCase):
                 swrt_stats_path=temp_dir / "missing-swrt.json",
             )
             result = stats.score_action([], [], ["Alpha", "Beta"], turn=1)
+            string_result = stats.score_action([], [], "Alpha", turn=1)
 
         self.assertTrue(stats.ready)
         self.assertEqual(stats.resolve_slug("Alpha"), "alpha")
@@ -132,6 +133,7 @@ class BPLucksackStatsTests(unittest.TestCase):
         self.assertGreater(result["draft_position_score"], 0.5)
         self.assertGreater(result["rta_tier_score"], 0.5)
         self.assertGreater(result["score"], 0.5)
+        self.assertEqual(string_result, stats.score_action([], [], ["Alpha"], turn=1))
         self.assertEqual(result["sample_count"], 1000)
         self.assertGreater(result["evidence_confidence"], 0.0)
         self.assertLess(result["evidence_uncertainty"], 1.0)
@@ -172,7 +174,13 @@ class BPLucksackStatsTests(unittest.TestCase):
                     "pickRate": 0.10,
                     "banRate": 0.05,
                     "pickTotal": 5000,
-                }
+                },
+                {
+                    "monsterId": 1099,
+                    "monsterName": "Unawakened",
+                    "winRate": 0.60,
+                    "pickTotal": 5000,
+                },
             ],
             "highdata_by_id": {
                 "1001": {
@@ -215,6 +223,7 @@ class BPLucksackStatsTests(unittest.TestCase):
                         {"slug": "alpha", "slabel": "Alpha", "com2us_id": "1001", "natural_stars": 5},
                         {"slug": "beta", "slabel": "Beta", "com2us_id": "1002", "natural_stars": 5},
                         {"slug": "gamma", "slabel": "Gamma", "com2us_id": "1003", "natural_stars": 5},
+                        {"slug": "unawakened", "slabel": "Unawakened", "com2us_id": "1099", "natural_stars": 3},
                     ]
                 ),
                 encoding="utf-8",
@@ -229,6 +238,7 @@ class BPLucksackStatsTests(unittest.TestCase):
             result = stats.score_action(["Alpha"], ["Beta"], ["Alpha"])
 
         self.assertEqual(stats.resolve_slug("阿尔法"), "alpha")
+        self.assertNotIn("unawakened", stats.candidate_slugs())
         self.assertLess(result["matchup_score"], 0.5)
         self.assertGreater(result["matchup_coverage"], 0.0)
         self.assertIn("swrt_matchup", {item["kind"] for item in result["evidence"]})

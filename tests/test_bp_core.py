@@ -110,6 +110,16 @@ class BPCoreTests(unittest.TestCase):
         allowed = recommender._allowed_candidates(["a"], [], ["a", "b", "unknown"], use_my_box_for_reco=False)
         self.assertEqual(allowed, ["b"])
 
+    def test_shared_candidate_mask_keeps_catalog_external_monsters(self):
+        recommender = object.__new__(BPSharedRecommender)
+        recommender.known_slugs = frozenset({"a", "b"})
+        recommender.external_slugs = frozenset({"catalog-only"})
+        recommender._to_slug = lambda value: str(value or "").lower()
+        allowed = recommender._allowed_candidates(
+            [], [], ["a", "catalog-only"], use_my_box_for_reco=False
+        )
+        self.assertEqual(allowed, ["a", "catalog-only"])
+
     def test_rank_context_prefers_explicit_sample_weight(self):
         context = get_rank_context_from_record({"rank_tier": "three_red", "rank_weight": 1.25, "sample_weight": 0.75})
         self.assertEqual(context["sample_weight"], 0.75)

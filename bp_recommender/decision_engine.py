@@ -1,4 +1,4 @@
-"""Search and ranking on top of the single Shared BP Core."""
+"""Unified event-state search and ranking for BP recommendation models."""
 
 from __future__ import annotations
 
@@ -268,6 +268,12 @@ class BPDecisionEngine:
                 my_picks=list(state["my_picks"]),
                 enemy_picks=list(state["enemy_picks"]),
                 turn=int(state["turn"]),
+                pick_count=infer_pick_count_for_side(
+                    state["my_picks"],
+                    state["enemy_picks"],
+                    state["first_pick_side"],
+                    "me",
+                ),
                 my_box=state.get("my_box"),
                 # A missing Box means "no account constraint".  The UI sets
                 # ``use_my_box`` explicitly when it wants the legality mask.
@@ -492,7 +498,19 @@ class BPDecisionEngine:
             )
             item["detail"] = detail
             enriched.append(item)
-        enriched.sort(key=lambda row: float(row.get("plan_score", 0.0)), reverse=True)
+        # Rank own picks by the value after the modeled opponent response.
+        # The immediate value remains in the detail payload for inspection.
+        enriched.sort(
+            key=lambda row: (
+                float((row.get("detail") or {}).get(
+                    "adversarial_win_rate",
+                    row.get("estimated_win_rate", 0.0),
+                )),
+                float(row.get("estimated_win_rate", 0.0)),
+                float(row.get("plan_score", 0.0)),
+            ),
+            reverse=True,
+        )
         return enriched[: int(top_k)]
 
     def rank_enemy_plans(self, plans, state, top_k):
@@ -569,5 +587,16 @@ class BPDecisionEngine:
             )
             item["detail"] = detail
             enriched.append(item)
-        enriched.sort(key=lambda row: float(row["plan_score"]), reverse=True)
+        # For an opponent prediction, the strongest prediction is the action
+        # that leaves us with the lowest win rate after our best response.
+        enriched.sort(
+            key=lambda row: (
+                float((row.get("detail") or {}).get(
+                    "best_response_win_rate",
+                    row.get("estimated_win_rate", 1.0),
+                )),
+                float(row.get("estimated_win_rate", 1.0)),
+                -float(row.get("plan_score", 0.0)),
+            )
+        )
         return enriched[: int(top_k)]

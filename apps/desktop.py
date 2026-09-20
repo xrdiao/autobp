@@ -33,11 +33,16 @@ ALIAS_MAP_PATH = ROOT_DIR / "json" / "monster_alias_map.json"
 SWKIT_ALIAS_PATH = ROOT_DIR / "json" / "swkit_monster_aliases.json"
 ATTR_MAP_PATH = ROOT_DIR / "json" / "monster_attributes.json"
 FAMILY_MAP_PATH = ROOT_DIR / "json" / "monster_families.json"
-SHARED_META_PATH = ROOT_DIR / "models" / "bp_shared_meta.json"
-SHARED_VOCAB_PATH = ROOT_DIR / "models" / "bp_shared_vocab.json"
-SHARED_MODEL_PATH = ROOT_DIR / "models" / "bp_shared.pt"
-SHARED_BUNDLE_READY = all(
-    path.exists() for path in (SHARED_MODEL_PATH, SHARED_META_PATH, SHARED_VOCAB_PATH)
+SHARED_META_PATH = ROOT_DIR / "models" / "bp_relation_meta_v2.json"
+SHARED_VOCAB_PATH = ROOT_DIR / "models" / "bp_relation_vocab_v2.json"
+SHARED_MODEL_PATH = ROOT_DIR / "models" / "bp_relation_net_v2.pt"
+LEGACY_VALUE_ARTIFACTS = (
+    ROOT_DIR / "models" / "bp_prefix_value_net.pt",
+    ROOT_DIR / "models" / "bp_prefix_value_meta.json",
+    ROOT_DIR / "models" / "bp_prefix_value_vocab.json",
+    ROOT_DIR / "models" / "bp_draft_value_net.pt",
+    ROOT_DIR / "models" / "bp_draft_value_meta.json",
+    ROOT_DIR / "models" / "bp_draft_value_vocab.json",
 )
 SW_UI_DIR = ROOT_DIR / "sw_ui_detection"
 SW_UI_OUTPUT_DIR = SW_UI_DIR / "output"
@@ -54,6 +59,42 @@ SIDEBAR_PLAN_IMAGE_SIZE = (40, 40)
 SIDEBAR_RESULT_IMAGE_SIZE = (48, 48)
 STATE_SLOT_IMAGE_SIZE = (58, 58)
 STATE_SLOT_CARD_SIZE = {"width": 50, "height": 130}
+
+
+def legal_pick_prefix(my_picks, enemy_picks, first_pick_side):
+    """Return the longest side-list prefix that forms a legal BP timeline."""
+    best = ([], [])
+    for my_count in range(len(my_picks) + 1):
+        for enemy_count in range(len(enemy_picks) + 1):
+            candidate = (list(my_picks[:my_count]), list(enemy_picks[:enemy_count]))
+            try:
+                timeline_from_picks(*candidate, first_pick_side)
+            except (TypeError, ValueError):
+                continue
+            if sum(map(len, candidate)) > sum(map(len, best)):
+                best = candidate
+    return best
+
+
+def slot_order_key(slot):
+    raw = str((slot or {}).get("slot_id", ""))
+    suffix = raw.rsplit("_", 1)[-1]
+    try:
+        return (0, int(suffix))
+    except (TypeError, ValueError):
+        return (1, raw)
+
+
+def shared_model_stamp():
+    paths = (
+        SHARED_MODEL_PATH,
+        SHARED_META_PATH,
+        SHARED_VOCAB_PATH,
+        *LEGACY_VALUE_ARTIFACTS,
+    )
+    if not all(path.exists() for path in paths):
+        return None
+    return tuple((int(path.stat().st_mtime_ns), int(path.stat().st_size)) for path in paths)
 
 
 def bootstrap_tk_env():
@@ -82,8 +123,11 @@ def bootstrap_tk_env():
 
 def load_json_file(path: Path, default):
     if path.exists():
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return default
     return default
 
 
@@ -171,25 +215,60 @@ def get_image_path_for_monster(monster, image_lookup):
     return None
 
 
+def matches_monster_search(search_text, searchable_text):
+    query = normalize_name(search_text)
+    if not query:
+        return True
+    query_variants = {
+        query,
+        query.replace("-", " "),
+        query.replace("_", " "),
+        slugify_name(query),
+    }
+    searchable = normalize_name(searchable_text)
+    searchable_variants = {
+        searchable,
+        searchable.replace("-", " "),
+        searchable.replace("_", " "),
+        slugify_name(searchable),
+    }
+    return any(
+        variant in candidate
+        for variant in query_variants
+        for candidate in searchable_variants
+    )
+
+
 def load_shared_monster_metadata():
     meta = load_json_file(SHARED_META_PATH, {})
     vocab = load_json_file(SHARED_VOCAB_PATH, {})
+    if not isinstance(meta, dict):
+        meta = {}
     display_name_map = meta.get("display_name_map", {}) or {}
     monster_frequency = meta.get("monster_frequency", {}) or {}
 
     blocked = {"[PAD]", "[UNK]", "", None}
+    slug_items = []
     if isinstance(vocab, dict):
-        slug_items = sorted(vocab.items(), key=lambda item: int(item[1]))
-    else:
-        slug_items = []
+        for slug, raw_id in vocab.items():
+            try:
+                slug_items.append((slug, int(raw_id)))
+            except (TypeError, ValueError):
+                continue
+        slug_items.sort(key=lambda item: item[1])
 
+    from bp_core.lucksack_stats import BPLucksackStats
+
+    luck_stats = BPLucksackStats()
     monster_pool = []
     pick_freq = Counter()
     seen = set()
     for slug, _idx in slug_items:
         if slug in blocked:
             continue
-        display_name = str(display_name_map.get(slug) or slug).strip()
+        mapped_name = str(display_name_map.get(slug) or "").strip()
+        catalog_name = str(luck_stats.to_display_name(slug) or slug).strip()
+        display_name = mapped_name if mapped_name and normalize_name(mapped_name) != normalize_name(slug) else catalog_name
         if not display_name or display_name in seen:
             continue
         seen.add(display_name)
@@ -199,9 +278,16 @@ def load_shared_monster_metadata():
         except (TypeError, ValueError):
             pick_freq[display_name] = 0
 
-    from bp_core.lucksack_stats import BPLucksackStats
-
-    luck_stats = BPLucksackStats()
+    for slug, _idx in slug_items:
+        mapped_name = str(display_name_map.get(slug) or "").strip()
+        catalog_name = str(luck_stats.to_display_name(slug) or slug).strip()
+        display_name = mapped_name if mapped_name and normalize_name(mapped_name) != normalize_name(slug) else catalog_name
+        if display_name not in pick_freq:
+            continue
+        pick_freq[display_name] = max(
+            int(pick_freq.get(display_name, 0)),
+            int(luck_stats.pick_frequency(slug)),
+        )
     usable_names = {
         normalize_name(
             luck_stats.to_display_name(item.get("slug"))
@@ -295,6 +381,7 @@ class DesktopBPApp:
         self.root.minsize(1500, 900)
 
         self.shared_recommender = None
+        self.shared_recommender_stamp = None
         self.bp_analyzer = None
         self._core_data_ready = False
         self._box_tab_loaded = False
@@ -309,7 +396,12 @@ class DesktopBPApp:
         self.pick_freq = Counter()
 
         self.photo_cache = {}
-        self.my_box_state = sorted(set(load_json_file(MY_BOX_PATH, [])))
+        raw_box = load_json_file(MY_BOX_PATH, [])
+        self.my_box_state = sorted(
+            set(value for value in raw_box if isinstance(value, str))
+            if isinstance(raw_box, list)
+            else []
+        )
         self.my_picks = []
         self.enemy_picks = []
         self.my_final_ban = None
@@ -399,6 +491,12 @@ class DesktopBPApp:
             swkit_alias_data = {}
         attr_map = load_json_file(ATTR_MAP_PATH, {})
         family_map = load_json_file(FAMILY_MAP_PATH, {})
+        if not isinstance(image_map, dict):
+            image_map = {}
+        if not isinstance(attr_map, dict):
+            attr_map = {}
+        if not isinstance(family_map, dict):
+            family_map = {}
         from bp_core.lucksack_stats import BPLucksackStats
 
         luck_stats = BPLucksackStats()
@@ -406,9 +504,15 @@ class DesktopBPApp:
         catalog_by_slug = {
             str(item.get("slug") or "").strip().lower(): item
             for item in (luck_stats.catalog if isinstance(luck_stats.catalog, list) else [])
-            if item.get("slug")
+            if isinstance(item, dict) and item.get("slug")
         }
         alias_entries = dict(generated_alias_map)
+        search_aliases_by_display = {}
+        for alias, display_name in generated_alias_map.items():
+            display_name = str(display_name or "").strip()
+            alias = str(alias or "").strip()
+            if display_name and alias:
+                search_aliases_by_display.setdefault(display_name, set()).add(alias)
         aliases_by_id = swkit_alias_data.get("aliases_by_id") or {}
         for item in (luck_stats.catalog if isinstance(luck_stats.catalog, list) else []):
             if not is_usable_catalog_item(item):
@@ -416,7 +520,11 @@ class DesktopBPApp:
             display_name = luck_stats.to_display_name(item.get("slug"))
             unit_id = str(item.get("com2us_id") or "").strip()
             if display_name and unit_id:
-                for alias in aliases_by_id.get(unit_id, []):
+                aliases = aliases_by_id.get(unit_id, [])
+                search_aliases_by_display.setdefault(display_name, set()).update(
+                    str(alias).strip() for alias in aliases if str(alias).strip()
+                )
+                for alias in aliases:
                     alias = str(alias).strip()
                     if not alias:
                         continue
@@ -478,9 +586,16 @@ class DesktopBPApp:
                 continue
             aliases_by_target.setdefault(target, set()).add(alias)
             alias_lookup[alias] = target
+        search_aliases_by_target = {}
+        for display_name, aliases in search_aliases_by_display.items():
+            target = pool_lookup.get(normalize_name(display_name))
+            if target:
+                search_aliases_by_target.setdefault(target, set()).update(aliases)
+        for target, aliases in aliases_by_target.items():
+            search_aliases_by_target.setdefault(target, set()).update(aliases)
         for monster in monster_pool:
             alias_lookup.setdefault(normalize_name(monster), monster)
-            aliases = sorted(aliases_by_target.get(monster, set()))
+            aliases = sorted(search_aliases_by_target.get(monster, set()))
             search_text_map[monster] = " ".join(
                 [monster, slugify_name(monster), *aliases]
             ).lower()
@@ -507,6 +622,15 @@ class DesktopBPApp:
         self.image_lookup = result["image_lookup"]
         self.alias_lookup = result["alias_lookup"]
         self.search_text_map = result["search_text_map"]
+        self.my_box_state = sorted(
+            {
+                self.alias_lookup.get(normalize_name(value), value)
+                for value in self.my_box_state
+                if isinstance(value, str)
+                and self.alias_lookup.get(normalize_name(value), value) in set(self.monster_pool)
+            },
+            key=normalize_name,
+        )
         self.attributes = ["全部"] + sorted(set(v for v in self.attr_map.values() if v))
         self.families = ["全部"] + sorted(set(v for v in self.family_map.values() if v))
         self._refresh_filter_widget_values()
@@ -678,8 +802,40 @@ class DesktopBPApp:
         detail = plan.get("detail", {}) if isinstance(plan.get("detail"), dict) else {}
         info = tk.Frame(card, bg="#ffffff")
         info.pack(fill=tk.X, padx=6, pady=(4, 4))
-        tk.Label(info, text=f"Win {self._format_plan_win_rate(plan)}", bg="#ffffff", anchor="w", font=("", 8)).pack(fill=tk.X)
-        tk.Label(info, text=f"Gain {float(detail.get('win_rate_gain', 0.0)):+.4f}", bg="#ffffff", anchor="w", font=("", 8)).pack(fill=tk.X)
+        post_ban = detail.get("post_ban_win_rate")
+        pre_ban = detail.get("pre_ban_win_rate")
+        if post_ban is not None:
+            tk.Label(
+                info,
+                text=f"Ban 后胜率 {float(post_ban):.4f}",
+                bg="#ffffff",
+                anchor="w",
+                font=("", 8),
+            ).pack(fill=tk.X)
+        else:
+            tk.Label(
+                info,
+                text=f"Win {self._format_plan_win_rate(plan)}",
+                bg="#ffffff",
+                anchor="w",
+                font=("", 8),
+            ).pack(fill=tk.X)
+        if pre_ban is not None:
+            tk.Label(
+                info,
+                text=f"Ban 前胜率 {float(pre_ban):.4f}",
+                bg="#ffffff",
+                anchor="w",
+                font=("", 8),
+            ).pack(fill=tk.X)
+        if "win_rate_gain" in detail:
+            tk.Label(
+                info,
+                text=f"变化 {float(detail['win_rate_gain']):+.4f}",
+                bg="#ffffff",
+                anchor="w",
+                font=("", 8),
+            ).pack(fill=tk.X)
 
         tk.Button(card, text="Apply Ban", command=lambda m=monster: self.apply_my_final_ban(m), font=("", 8, "bold"), height=1).pack(fill=tk.X, padx=6, pady=(0, 6))
         return card
@@ -887,16 +1043,26 @@ class DesktopBPApp:
         self.status_var.set(text)
 
     def _shared_model_bundle_ready(self):
-        return SHARED_BUNDLE_READY
+        return all(
+            path.exists()
+            for path in (
+                SHARED_MODEL_PATH,
+                SHARED_META_PATH,
+                SHARED_VOCAB_PATH,
+                *LEGACY_VALUE_ARTIFACTS,
+            )
+        )
 
     def _get_shared_recommender(self):
-        if self.shared_recommender is not None:
+        stamp = shared_model_stamp()
+        if self.shared_recommender is not None and stamp == self.shared_recommender_stamp:
             return self.shared_recommender
         if not self._shared_model_bundle_ready():
-            raise RuntimeError("Shared BP Core is not available. Run python -m training.shared_bp first.")
-        from bp_recommender.shared import BPSharedRecommender
+            raise RuntimeError("Legacy BP models are not available. Run python -m training.all_models first.")
+        from bp_recommender.legacy_adapter import LegacyBPRecommender
 
-        self.shared_recommender = BPSharedRecommender()
+        self.shared_recommender = LegacyBPRecommender()
+        self.shared_recommender_stamp = stamp
         return self.shared_recommender
 
     def _get_bp_analyzer(self):
@@ -988,6 +1154,15 @@ class DesktopBPApp:
         self._run_auto_recommendation_if_needed()
 
     def on_first_pick_side_changed(self, *_args):
+        self.my_picks, self.enemy_picks = legal_pick_prefix(
+            self.my_picks,
+            self.enemy_picks,
+            self.first_pick_var.get(),
+        )
+        if self.my_leader_var.get() not in self.my_picks:
+            self.my_leader_var.set("")
+        if self.enemy_leader_var.get() not in self.enemy_picks:
+            self.enemy_leader_var.set("")
         self._clear_recommendation_results()
         self.set_status("已切换先手设置")
         self.root.after(0, self._run_auto_recommendation_if_needed)
@@ -1081,10 +1256,9 @@ class DesktopBPApp:
             output_json_path=APP_BP_JSON_PATH,
             validate_monsters=True,
             candidate_top_k=candidate_top_k,
-            validate_sides=("enemy",),
+            validate_sides=("my", "enemy"),
         )
         analysis_dict = analysis.to_dict()
-        analysis_dict["my_slots"] = []
         return {
             "analysis": analysis_dict,
             "source": source_label,
@@ -1098,6 +1272,36 @@ class DesktopBPApp:
         self.bp_recognition_result = result
         self.bp_recognition_source = result.get("source")
         self.bp_recognition_image_path = Path(result["image_path"]) if result.get("image_path") else None
+        analysis = result.get("analysis") or {}
+        detected_first = str(analysis.get("first_pick_side") or "").strip().lower()
+        if detected_first in {"me", "enemy"}:
+            self.first_pick_var.set(detected_first)
+        def detected_side(side):
+            values = []
+            for slot in sorted(
+                analysis.get(f"{side}_slots") or [],
+                key=slot_order_key,
+            ):
+                name = self._resolve_monster_name(slot.get("monster_name"))
+                if not name:
+                    break
+                values.append(name)
+            return values[:5]
+
+        detected_my = detected_side("my")
+        detected_enemy = detected_side("enemy")
+        if detected_my or detected_enemy:
+            if detected_my:
+                self.my_picks = detected_my
+            if detected_enemy:
+                self.enemy_picks = detected_enemy
+            self.my_picks, self.enemy_picks = legal_pick_prefix(
+                self.my_picks,
+                self.enemy_picks,
+                self.first_pick_var.get(),
+            )
+            self.my_final_ban = None
+            self.enemy_final_ban = None
         self.set_status("BP recognition finished")
         self.refresh_bp_state_panel()
 
@@ -1217,11 +1421,14 @@ class DesktopBPApp:
             monsters = [m for m in monsters if m in owned]
 
         if search_text:
-            search_text = search_text.strip().lower()
+            search_text = search_text.strip()
             monsters = [
                 m
                 for m in monsters
-                if search_text in self.search_text_map.get(m, m.lower())
+                if matches_monster_search(
+                    search_text,
+                    self.search_text_map.get(m, m),
+                )
             ]
 
         if attr_filter != "全部":
@@ -1358,7 +1565,7 @@ class DesktopBPApp:
 
         ordered_slots = sorted(
             slots,
-            key=lambda slot: int(str(slot.get("slot_id", "0")).split("_")[-1]),
+            key=slot_order_key,
         )
         if not ordered_slots:
             return
@@ -1392,7 +1599,7 @@ class DesktopBPApp:
                     size=(52, 52),
                     subtitle=subtitle,
                     badge_text=f"#{idx}",
-                    card_command=lambda m=monster: self.add_unique("enemy", m),
+                    card_command=lambda m=monster: self.add_detected_enemy_candidate(m),
                 )
                 card.pack(anchor="w", pady=3)
 
@@ -1510,6 +1717,15 @@ class DesktopBPApp:
             self.my_leader_var.set("")
         if self.enemy_leader_var.get() == monster:
             self.enemy_leader_var.set("")
+        self.my_picks, self.enemy_picks = legal_pick_prefix(
+            self.my_picks,
+            self.enemy_picks,
+            self.first_pick_var.get(),
+        )
+        if self.my_leader_var.get() not in self.my_picks:
+            self.my_leader_var.set("")
+        if self.enemy_leader_var.get() not in self.enemy_picks:
+            self.enemy_leader_var.set("")
 
 
 
@@ -1527,6 +1743,7 @@ class DesktopBPApp:
         else:
             self.my_box_state = sorted(set(self.my_box_state + [monster]))
             self.set_status(f"已加入我的 Box：{monster}")
+        self._clear_recommendation_results()
         self.refresh_bp_gallery()
         self.refresh_box_tab()
 
@@ -1537,7 +1754,13 @@ class DesktopBPApp:
         self.refresh_box_tab()
 
     def reload_my_box(self):
-        self.my_box_state = sorted(set(load_json_file(MY_BOX_PATH, [])))
+        raw_box = load_json_file(MY_BOX_PATH, [])
+        self.my_box_state = sorted(
+            set(value for value in raw_box if isinstance(value, str))
+            if isinstance(raw_box, list)
+            else []
+        )
+        self._clear_recommendation_results()
         self.set_status(f"已重新载入 my_box.json，共 {len(self.my_box_state)} 个魔灵")
         self.refresh_all()
 
@@ -1658,6 +1881,17 @@ class DesktopBPApp:
         side_label = "我方" if side == "my" else "敌方"
         self.add_unique(side, monster, status_text=f"已将 {monster} 填入{side_label}第 {order} 手")
 
+    def add_detected_enemy_candidate(self, monster):
+        """Apply a recognition candidate only during an enemy pick turn."""
+        if self._current_pick_side() != "enemy":
+            messagebox.showwarning("提示", "当前不是对方选人轮次，不能写入识别候选。")
+            return
+        resolved = self._resolve_monster_name(monster)
+        if not resolved or resolved not in self.monster_pool:
+            messagebox.showwarning("提示", "识别候选不在当前魔灵目录中。")
+            return
+        self.add_unique("enemy", resolved, status_text=f"已采用识别候选：{resolved}")
+
     def _resolve_monster_name(self, value):
         text = str(value or "").strip()
         if not text:
@@ -1737,6 +1971,19 @@ class DesktopBPApp:
         self._apply_bp_state_change(f"已采用{label}：{' + '.join(targets)}")
 
     def apply_my_final_ban(self, monster):
+        if len(self.my_picks) != 5 or len(self.enemy_picks) != 5:
+            messagebox.showwarning("提示", "双方完成五个选人后才能 Ban。")
+            return
+        if self.my_final_ban or self.enemy_final_ban:
+            messagebox.showwarning("提示", "当前 BP 已经存在 Ban。")
+            return
+        monster = self._resolve_monster_name(monster)
+        if not monster or monster not in self.monster_pool:
+            messagebox.showwarning("提示", "Ban 目标不在当前魔灵目录中。")
+            return
+        if monster not in self.enemy_picks:
+            messagebox.showwarning("提示", "我方 Ban 只能选择对方已选魔灵。")
+            return
         self.my_final_ban = monster
         self._apply_bp_state_change(f"已采用我方 Ban：{monster}")
 
@@ -1786,7 +2033,7 @@ class DesktopBPApp:
                 pick_count=state_snapshot["pick_count"],
                 turn=state_snapshot["turn"],
                 first_pick_side=state_snapshot["first_pick_side"],
-                top_k=state_snapshot["top_k"],
+                top_k=max(2 * state_snapshot["top_k"], state_snapshot["top_k"]),
                 candidate_pool=state_snapshot["candidate_pool"],
                 my_box=state_snapshot["my_box"],
                 use_my_box_for_reco=state_snapshot["use_my_box_for_reco"],
@@ -1848,7 +2095,7 @@ class DesktopBPApp:
                 enemy_picks=state_snapshot["enemy_picks"],
                 first_pick_side=state_snapshot["first_pick_side"],
                 pick_count=state_snapshot["pick_count"],
-                top_k=state_snapshot["top_k"],
+                top_k=max(2 * state_snapshot["top_k"], state_snapshot["top_k"]),
                 candidate_pool=state_snapshot["candidate_pool"],
                 max_pair_candidates=400,
                 turn=state_snapshot["turn"],
@@ -1898,6 +2145,9 @@ class DesktopBPApp:
                 enemy_picks=state_snapshot["enemy_picks"],
                 top_k=state_snapshot["top_k"],
                 first_pick_side=self.first_pick_var.get(),
+                my_leader=self.my_leader_var.get().strip(),
+                enemy_leader=self.enemy_leader_var.get().strip(),
+                enemy_ban=self.enemy_final_ban or None,
                 events=state_snapshot["events"],
             )
 
@@ -1943,6 +2193,9 @@ class DesktopBPApp:
         ]:
             variable.trace_add("write", lambda *_: self.on_box_filter_changed())
 
+        for variable in (self.use_my_box_for_reco_var, self.top_k_var):
+            variable.trace_add("write", lambda *_: self._clear_recommendation_results())
+
         self.bp_enemy_candidate_top_n_var.trace_add("write", lambda *_: self.refresh_bp_state_panel())
 
     def render_banned_section(self, parent):
@@ -1959,22 +2212,37 @@ class DesktopBPApp:
             ).pack(anchor="w")
             return
 
-        if self.enemy_final_ban:
-            text = f"对方 Ban：{self.enemy_final_ban}"
+        if self.my_final_ban or self.enemy_final_ban:
+            bans = []
+            if self.my_final_ban:
+                bans.append(f"我方 Ban：{self.my_final_ban}")
+            if self.enemy_final_ban:
+                bans.append(f"对方 Ban：{self.enemy_final_ban}")
+            text = "；".join(bans)
         elif self.ban_plans:
             plan = self.ban_plans[0]
             monster = plan["plan"][0]
             if monster:
                 score = plan.get("plan_score")
+                post_ban = (plan.get("detail") or {}).get("post_ban_win_rate")
+                rate_text = "" if post_ban is None else f"，Ban 后胜率 {float(post_ban):.4f}"
                 if score is None:
-                    text = f"我方 Ban 推荐：{monster}"
+                    text = f"我方 Ban 推荐：{monster}{rate_text}"
                 else:
-                    text = f"我方 Ban 推荐：{monster}（共享模型评分 {float(score):.4f}）"
+                    text = f"我方 Ban 推荐：{monster}{rate_text}（共享模型评分 {float(score):.4f}）"
             else:
                 text = "我方 Ban 推荐：暂无"
         else:
             text = "我方 Ban 推荐：暂无"
         ttk.Label(section, text=text, wraplength=600, justify=tk.LEFT).pack(anchor="w")
+        if self.ban_plans and not self.my_final_ban and not self.enemy_final_ban:
+            monster = self.ban_plans[0].get("plan", [""])[0]
+            if monster:
+                ttk.Button(
+                    section,
+                    text="采用我方 Ban",
+                    command=lambda m=monster: self.apply_my_final_ban(m),
+                ).pack(anchor="w", pady=(5, 0))
 
 
 

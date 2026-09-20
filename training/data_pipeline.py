@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import os
-import pickle
 import sqlite3
 from tqdm import tqdm
 
@@ -18,6 +17,7 @@ from bp_core.bp_common import (
     infer_pick_count,
     side_for_order,
 )
+from bp_core.data_common import safe_pickle_loads
 from bp_core.names import PAD_TOKEN, normalize_name
 
 
@@ -37,7 +37,7 @@ def load_sqlite_samples(path, table_name="bp_samples", fetch_size=FEATURE_FETCH_
                 rows = cursor.fetchmany(int(fetch_size))
                 if not rows:
                     break
-                samples.extend(pickle.loads(row[0]) for row in rows)
+                samples.extend(safe_pickle_loads(row[0]) for row in rows)
                 progress.update(len(rows))
         return samples
     finally:
@@ -85,9 +85,10 @@ def extract_all_slugs_from_sample(sample):
             if not slug:
                 raise ValueError(f"{key} 不能包含空魔灵")
             out.append(slug)
-    ban_slug = normalize_name(sample.get("ban_slug"))
-    if ban_slug:
-        out.append(ban_slug)
+    for ban_key in ("ban_slug", "my_ban_slug", "enemy_ban_slug"):
+        ban_slug = normalize_name(sample.get(ban_key))
+        if ban_slug:
+            out.append(ban_slug)
     for key in ("my_leader_slug", "enemy_leader_slug"):
         value = sample.get(key)
         if value:

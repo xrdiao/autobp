@@ -591,13 +591,13 @@ class BPSharedNetwork(nn.Module):
             normalized = normalize_name(value)
             if not normalized:
                 raise KeyError("timeline contains an empty monster")
-            monster_id = int(vocab.get_id(value))
-            if monster_id <= 1 and normalized not in {
-                normalize_name(PAD_TOKEN),
-                normalize_name(UNK_TOKEN),
-            }:
-                raise KeyError(f"monster is outside the vocabulary: {value}")
-            return monster_id
+            try:
+                return int(vocab.get_id(value))
+            except KeyError:
+                # Public catalog entries can be newer than the checkpoint.
+                # Keep the event usable and let the statistical evidence
+                # layer rank that action while the network uses [UNK].
+                return int(vocab.get_id(UNK_TOKEN))
 
         ids = torch.zeros((1, int(max_events), 2), dtype=torch.long, device=device)
         mask = torch.zeros((1, int(max_events), 2), dtype=torch.bool, device=device)

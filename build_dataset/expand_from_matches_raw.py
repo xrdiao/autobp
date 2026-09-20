@@ -1,6 +1,5 @@
 import os
 import argparse
-import pickle
 import sqlite3
 import sys
 import time
@@ -12,7 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from bp_core.data_common import count_record_rows, load_json, save_json, upsert_record_rows
+from bp_core.data_common import count_record_rows, load_json, safe_pickle_loads, save_json, upsert_record_rows
 from bp_core.bp_common import side_for_order
 from bp_core.names import normalize_name
 
@@ -45,7 +44,7 @@ def iter_raw_matches_from_sqlite(path: str, batch_size: int = DEFAULT_FETCH_BATC
                 break
             for key, record in rows:
                 try:
-                    match = pickle.loads(record)
+                    match = safe_pickle_loads(record)
                 except Exception as exc:
                     print(f"[WARN] failed to decode raw match {key}: {exc}", flush=True)
                     continue
@@ -155,9 +154,8 @@ def expand_one_match(match: dict):
     my_leader_slug = get_side_value(my_picks_raw, "is_leader", "slug")
     enemy_leader_slug = get_side_value(enemy_picks_raw, "is_leader", "slug")
 
-    # The enemy-side ban field is the sole Ban target.  Do not infer a target
-    # from the other side's metadata: an ambiguous source row must simply
-    # produce no Ban label.
+    # Keep both Ban directions. ``ban_slug`` remains the historical alias for
+    # the current player's Ban target (an enemy monster).
     enemy_final_slugs = {
         normalize_name(item.get("slug") or item.get("name"))
         for item in enemy_picks_raw
@@ -166,6 +164,14 @@ def expand_one_match(match: dict):
     ban_slug = normalize_name(get_side_value(enemy_picks_raw, "is_banned", "slug"))
     if ban_slug not in enemy_final_slugs:
         ban_slug = ""
+    my_final_slugs = {
+        normalize_name(item.get("slug") or item.get("name"))
+        for item in my_picks_raw
+        if item.get("slug") or item.get("name")
+    }
+    enemy_ban_slug = normalize_name(get_side_value(my_picks_raw, "is_banned", "slug"))
+    if enemy_ban_slug not in my_final_slugs:
+        enemy_ban_slug = ""
 
     player_id = match.get("page_player_id")
     player_rank = match.get("player_rank")
@@ -226,6 +232,8 @@ def expand_one_match(match: dict):
             "my_leader_slug": my_leader_slug,
             "enemy_leader_slug": enemy_leader_slug,
             "ban_slug": ban_slug,
+            "my_ban_slug": ban_slug,
+            "enemy_ban_slug": enemy_ban_slug,
         }
         samples.append(sample)
 

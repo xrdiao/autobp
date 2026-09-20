@@ -24,7 +24,7 @@ DEFAULT_PAGE_SIZE = 500
 DEFAULT_MAX_WORKERS = 4
 NO_PROXY_OPENER = urllib.request.build_opener(
     urllib.request.ProxyHandler({}),
-    urllib.request.HTTPSHandler(context=ssl._create_unverified_context()),
+    urllib.request.HTTPSHandler(context=ssl.create_default_context()),
 )
 
 

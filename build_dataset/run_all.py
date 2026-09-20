@@ -103,7 +103,13 @@ def main():
                     max_workers=args.expand_max_workers,
                 ),
             ),
-            ("构建魔灵目录", lambda: build_catalog("dataset", "json//monster_catalog.json")),
+            (
+                "构建魔灵目录",
+                lambda: build_catalog(
+                    str(PROJECT_ROOT / "dataset"),
+                    str(PROJECT_ROOT / "json" / "monster_catalog.json"),
+                ),
+            ),
             ("生成别称和图片映射", generate_alias_and_images),
         ]
     )

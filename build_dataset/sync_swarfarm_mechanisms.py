@@ -20,7 +20,7 @@ DEFAULT_CATALOG_PATH = PROJECT_ROOT / "json" / "lucksack_monster_catalog.json"
 DEFAULT_OUTPUT_PATH = PROJECT_ROOT / "json" / "sw_mechanism_profiles.json"
 OPENER = urllib.request.build_opener(
     urllib.request.ProxyHandler({}),
-    urllib.request.HTTPSHandler(context=ssl._create_unverified_context()),
+    urllib.request.HTTPSHandler(context=ssl.create_default_context()),
 )
 
 EFFECT_TAGS = {

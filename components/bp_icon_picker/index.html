@@ -79,6 +79,20 @@
       transform: translateY(-1px);
     }
 
+    .monster-card.disabled {
+      color: #8a94a6;
+      background: #f7f9fc;
+      border-color: #e1e6ef;
+      cursor: not-allowed;
+      opacity: 0.72;
+    }
+
+    .monster-card.disabled:hover {
+      border-color: #e1e6ef;
+      box-shadow: none;
+      transform: none;
+    }
+
     .monster-card:focus-visible {
       outline: 2px solid #4b72c2;
       outline-offset: 1px;
@@ -336,7 +350,26 @@
     }
 
     function getCurrentSide(args) {
-      return args.current_side || "me";
+      if (Object.prototype.hasOwnProperty.call(args, "current_side")) {
+        return args.current_side || "none";
+      }
+      return "me";
+    }
+
+    function expectedActionSize(myCount, enemyCount, firstPickSide) {
+      const pattern = firstPickSide === "enemy"
+        ? ["enemy", "me", "me", "enemy", "enemy", "me", "me", "enemy", "enemy", "me"]
+        : ["me", "enemy", "enemy", "me", "me", "enemy", "enemy", "me", "me", "enemy"];
+      const slot = myCount + enemyCount;
+      if (slot >= pattern.length) {
+        return 0;
+      }
+      const side = pattern[slot];
+      let size = 1;
+      while (slot + size < pattern.length && pattern[slot + size] === side) {
+        size += 1;
+      }
+      return size;
     }
 
     function render(args) {
@@ -346,19 +379,24 @@
         my_picks: uniqueValues(incoming.my_picks, 5),
         enemy_picks: uniqueValues(incoming.enemy_picks, 5),
         my_leader: incoming.my_leader || "",
-        enemy_leader: incoming.enemy_leader || ""
+        enemy_leader: incoming.enemy_leader || "",
+        pending_action: incoming.pending_action || {side: "", values: []}
       };
 
       const currentSide = getCurrentSide(incoming);
-      const occupied = new Set([...localState.my_picks, ...localState.enemy_picks]);
+      const pendingValues = uniqueValues(localState.pending_action.values, 2);
+      const occupied = new Set([...localState.my_picks, ...localState.enemy_picks, ...pendingValues]);
       const items = incoming.items || [];
       const galleryMarkup = items.map((item) => {
         const name = String(item.name || "");
+        const enabled = item.enabled !== false;
+        const cardClass = enabled ? "monster-card" : "monster-card disabled";
+        const subtitle = enabled ? (item.attr || "") : "未进入当前模型词表";
         return `
-          <button class="monster-card" type="button" data-action="add" data-name="${escapeHtml(name)}">
+          <button class="${cardClass}" type="button" data-action="add" data-name="${escapeHtml(name)}"${enabled ? "" : " disabled"} title="${enabled ? "" : "当前模型暂不支持该魔灵"}">
             ${imageMarkup(item, false)}
             <div class="monster-name">${escapeHtml(name)}</div>
-            <div class="monster-subtitle">${escapeHtml(item.attr || "")}</div>
+            <div class="monster-subtitle">${escapeHtml(subtitle)}</div>
           </button>
         `;
       }).join("");
@@ -412,7 +450,7 @@
           </section>
           <aside class="state-panel">
             <h1 class="panel-title">当前 BP</h1>
-            <p class="turn-line">第 ${Math.min(Number(incoming.current_turn || 1), 10)} 回合 · ${escapeHtml(incoming.phase || "")} · 当前轮到：${currentSide === "me" ? "我方" : currentSide === "enemy" ? "对方" : "无"}</p>
+            <p class="turn-line">第 ${Number(incoming.current_turn || 1)} 回合 · ${escapeHtml(incoming.phase || "")} · 当前轮到：${currentSide === "me" ? "我方" : currentSide === "enemy" ? "对方" : "无"}${pendingValues.length ? ` · 已选 ${pendingValues.length}/${expectedActionSize(localState.my_picks.length, localState.enemy_picks.length, localState.first_pick_side)}` : ""}</p>
             ${stateMarkup("my", "我方已选", localState.my_picks, localState.my_leader)}
             ${stateMarkup("enemy", "对方已选", localState.enemy_picks, localState.enemy_leader)}
           </aside>
@@ -424,16 +462,36 @@
           const action = element.dataset.action;
           const name = element.dataset.name || "";
           if (action === "add") {
-            if (!name || occupied.has(name) || currentSide === "none") {
+            if (element.disabled || !name || occupied.has(name) || currentSide === "none") {
               return;
             }
-            if (currentSide === "me" && localState.my_picks.length < 5) {
-              localState.my_picks.push(name);
-            } else if (currentSide === "enemy" && localState.enemy_picks.length < 5) {
-              localState.enemy_picks.push(name);
-            } else {
+            const actionSize = expectedActionSize(
+              localState.my_picks.length,
+              localState.enemy_picks.length,
+              localState.first_pick_side,
+            );
+            if (!actionSize) {
               return;
             }
+            const pending = localState.pending_action;
+            if (pending.side !== currentSide) {
+              pending.side = currentSide;
+              pending.values = [];
+            }
+            pending.values.push(name);
+            if (pending.values.length < actionSize) {
+              render(Object.assign({}, incoming, localState));
+              return;
+            }
+            const target = currentSide === "me" ? localState.my_picks : localState.enemy_picks;
+            if (target.length + pending.values.length > 5) {
+              pending.values = [];
+              pending.side = "";
+              return;
+            }
+            target.push(...pending.values);
+            pending.values = [];
+            pending.side = "";
             render(Object.assign({}, incoming, localState));
             setComponentValue("add");
             return;

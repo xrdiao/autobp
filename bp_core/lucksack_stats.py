@@ -154,9 +154,23 @@ class BPLucksackStats:
         self.swrt_stats_path = Path(swrt_stats_path)
         self.mechanism_path = Path(mechanism_path)
         self.data = self._load_json(self.stats_path, {})
+        if not isinstance(self.data, dict):
+            self.data = {}
         self.catalog = self._load_json(self.catalog_path, [])
+        if not isinstance(self.catalog, list):
+            self.catalog = []
+        catalog_items = self.catalog if isinstance(self.catalog, list) else []
+        self._usable_catalog_slugs = {
+            normalize_name(item.get("slug"))
+            for item in catalog_items
+            if is_usable_catalog_item(item) and normalize_name(item.get("slug"))
+        }
         self.swkit_tiers = self._load_json(self.swkit_tier_path, {})
+        if not isinstance(self.swkit_tiers, dict):
+            self.swkit_tiers = {}
         self.swrt_stats = self._load_json(self.swrt_stats_path, {})
+        if not isinstance(self.swrt_stats, dict):
+            self.swrt_stats = {}
         self.mechanisms = BPMechanismLayer(self.mechanism_path)
         self.rank_group = str(
             rank_group
@@ -183,14 +197,17 @@ class BPLucksackStats:
         self._resolve_cache = {}
         self._candidate_slug_cache = None
         self._score_cache = {}
+        self._ban_score_cache = {}
 
     @staticmethod
     def _load_json(path, default):
         if not Path(path).exists():
             return default
-        with open(path, "r", encoding="utf-8") as file:
-            value = json.load(file)
-        return value
+        try:
+            with open(path, "r", encoding="utf-8") as file:
+                return json.load(file)
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return default
 
     @property
     def ready(self):
@@ -282,10 +299,12 @@ class BPLucksackStats:
 
     def _build_rta_tier_index(self):
         entries = self.swkit_tiers.get("entries_by_id") or {}
+        if not isinstance(entries, dict):
+            entries = {}
         catalog_by_id = {
             str(item.get("com2us_id")): normalize_name(item.get("slug"))
             for item in self.catalog
-            if item.get("com2us_id") and item.get("slug")
+            if isinstance(item, dict) and item.get("com2us_id") and item.get("slug")
         }
         return {
             catalog_by_id[unit_id]: record
@@ -299,18 +318,30 @@ class BPLucksackStats:
         self._swrt_id_to_slug = {
             str(item.get("com2us_id")): normalize_name(item.get("slug"))
             for item in self.catalog
-            if item.get("com2us_id") and item.get("slug")
+            if isinstance(item, dict)
+            and item.get("com2us_id")
+            and item.get("slug")
+            and is_usable_catalog_item(item)
         }
         statistics = self.swrt_stats.get("statistics") or []
-        for record in statistics:
+        for record in statistics if isinstance(statistics, list) else []:
+            if not isinstance(record, dict):
+                continue
             unit_id = str(record.get("monsterId") or "")
             slug = self._swrt_id_to_slug.get(unit_id)
             if not slug:
+                # When a catalog is present, an unknown ID is either an
+                # unsearchable variant or stale data; do not alias it to a
+                # searchable unit solely from its display name.
+                if unit_id and self.catalog:
+                    continue
                 slug = slugify_name(
                     record.get("monsterName")
                     or record.get("monsterNameCn")
                     or record.get("monsterNameZho")
                 )
+                if slug and self.catalog and slug not in self._usable_catalog_slugs:
+                    slug = ""
                 if slug:
                     self._swrt_id_to_slug[unit_id] = slug
             if not slug:
@@ -396,6 +427,60 @@ class BPLucksackStats:
             + 0.35 * (0.5 + (pick_win_rate - 0.5) * confidence)
         )
         return _clamp(score, 0.2, 0.8), confidence, record
+
+    def _solo_contest_score(self, slug):
+        record = self._solo_record(slug)
+        if not record:
+            return 0.5, 0.0
+        ban_rate = max(0.0, min(1.0, _as_float(record.get("ban_rate"), 0.0)))
+        confidence = self._confidence(record.get("played_count"))
+        return _clamp(0.5 + (ban_rate - 0.10) * confidence, 0.2, 0.8), confidence
+
+    def score_ban_action(self, my_picks, enemy_picks, target):
+        """Return the evidence fields consumed by the legacy Ban model."""
+        key = (
+            tuple(self.resolve_slug(value) for value in (my_picks or [])),
+            tuple(self.resolve_slug(value) for value in (enemy_picks or [])),
+            self.resolve_slug(target),
+        )
+        cached = self._ban_score_cache.get(key)
+        if cached is not None:
+            return cached
+        target_slug = self.resolve_slug(target)
+        record = self._solo_record(target_slug)
+        solo_score, solo_coverage, _ = self._solo_score(target_slug)
+        contest_score, contest_coverage = self._solo_contest_score(target_slug)
+        matchup_score, matchup_coverage, evidence = self._swrt_matchup_score(
+            [target_slug],
+            [self.resolve_slug(value) for value in (my_picks or [])],
+        )
+        score = (
+            0.55 * solo_score + 0.30 * contest_score + 0.15 * matchup_score
+            if matchup_coverage > 0.0
+            else 0.65 * solo_score + 0.35 * contest_score
+        )
+        result = {
+            "score": 0.5,
+            "mechanism_score": 0.5,
+            "mechanism_available": False,
+            "mechanism_threat_reduction": 0.0,
+            "mechanism_threats": [],
+            "mechanism_reasons": [],
+            "target_solo_score": solo_score,
+            "target_solo_coverage": solo_coverage,
+            "target_contest_score": contest_score,
+            "target_contest_coverage": contest_coverage,
+            "ban_priority_score": score,
+            "target_matchup_score": matchup_score,
+            "target_matchup_coverage": matchup_coverage,
+            "target_solo_played": _as_int((record or {}).get("played_count")),
+            "target_solo_win_rate": _as_float((record or {}).get("win_rate"), 0.5),
+            "target_solo_ban_rate": _as_float((record or {}).get("ban_rate"), 0.0),
+            "source": self.source_label,
+            "evidence": evidence[:12],
+        }
+        self._ban_score_cache[key] = result
+        return result
 
     def _combo_record(self, kind, slugs):
         key = _combo_key(slugs)
@@ -540,6 +625,8 @@ class BPLucksackStats:
         """Return current RTA candidates plus searchable four-star catalog entries."""
         if self._candidate_slug_cache is None:
             slugs = set(self._solo) | set(self._swrt_by_slug)
+            if self.catalog:
+                slugs.intersection_update(self._usable_catalog_slugs)
             for item in self.catalog if isinstance(self.catalog, list) else []:
                 if not is_usable_catalog_item(item):
                     continue
@@ -590,23 +677,37 @@ class BPLucksackStats:
         record = self._solo_record(slug)
         return _as_int((record or {}).get("played_count"))
 
+    @staticmethod
+    def _values(value):
+        if value is None:
+            return ()
+        if isinstance(value, str):
+            return (value,)
+        return tuple(value)
+
     def score_action(self, my_picks, enemy_picks, action, turn=None):
+        my_values = self._values(my_picks)
+        enemy_values = self._values(enemy_picks)
+        action_values = self._values(action)
         key = (
-            tuple(self.resolve_slug(value) for value in my_picks or []),
-            tuple(self.resolve_slug(value) for value in enemy_picks or []),
-            tuple(self.resolve_slug(value) for value in action or []),
+            tuple(self.resolve_slug(value) for value in my_values),
+            tuple(self.resolve_slug(value) for value in enemy_values),
+            tuple(self.resolve_slug(value) for value in action_values),
             None if turn is None else int(turn),
         )
         cached = self._score_cache.get(key)
         if cached is None:
-            cached = self._score_action_uncached(my_picks, enemy_picks, action, turn)
+            cached = self._score_action_uncached(my_values, enemy_values, action_values, turn)
             self._score_cache[key] = cached
         return cached
 
     def _score_action_uncached(self, my_picks, enemy_picks, action, turn=None):
-        action_slugs = [self.resolve_slug(value) for value in (action or [])]
+        action = self._values(action)
+        my_picks = self._values(my_picks)
+        enemy_picks = self._values(enemy_picks)
+        action_slugs = [self.resolve_slug(value) for value in action]
         action_slugs = [slug for slug in action_slugs if slug]
-        own_slugs = [self.resolve_slug(value) for value in (my_picks or [])]
+        own_slugs = [self.resolve_slug(value) for value in my_picks]
         all_own = list(dict.fromkeys(own_slugs + action_slugs))
         mechanism_detail = self.mechanisms.score_action(
             my_picks=my_picks,

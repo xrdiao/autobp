@@ -10,7 +10,13 @@ from pathlib import Path
 
 import torch
 
-from bp_core.action_space import DraftActionEvent, DraftTimeline, timeline_from_picks, validate_timeline
+from bp_core.action_space import (
+    DraftActionEvent,
+    DraftTimeline,
+    timeline_from_picks,
+    transition_state,
+    validate_timeline,
+)
 from bp_core.bp_network import BPSharedNetwork
 from bp_core.lucksack_stats import BPLucksackStats, DEFAULT_STATS_PATH
 from bp_core.bp_common import (
@@ -97,6 +103,12 @@ class BPSharedRecommender:
             rank_group=stats_rank_group,
         )
         self.pad_id = self.vocab.get_id(PAD_TOKEN)
+        self.unk_id = self.vocab.get_id(UNK_TOKEN)
+        self.external_slugs = frozenset(
+            normalize_name(value)
+            for value in self.lucksack_stats.candidate_slugs()
+            if normalize_name(value)
+        )
         self.model = BPSharedNetwork(
             vocab_size=len(self.vocab),
             embed_dim=int(self.meta["embed_dim"]),
@@ -125,7 +137,14 @@ class BPSharedRecommender:
             if resolved and normalize_name(resolved) in self.known_slugs:
                 return normalize_name(resolved)
         resolved = normalize_name(self.lucksack_stats.resolve_slug(value))
-        return resolved if resolved in self.known_slugs else ""
+        return resolved if resolved in self.known_slugs or resolved in self.external_slugs else ""
+
+    def _vocab_id(self, value):
+        """Map an external catalog monster to the model's unknown token."""
+        try:
+            return self.vocab.get_id(value)
+        except KeyError:
+            return self.unk_id
 
     def _to_display_name(self, slug):
         slug = normalize_name(slug)
@@ -154,11 +173,12 @@ class BPSharedRecommender:
         use_my_box_for_reco=False,
     ):
         occupied = {self._to_slug(value) for value in [*(my_picks or ()), *(enemy_picks or ())]}
+        external_slugs = set(getattr(self, "external_slugs", ()))
         if candidate_pool is None:
-            allowed = set(self.known_slugs)
+            allowed = set(self.known_slugs) | external_slugs
         else:
             allowed = {self._to_slug(value) for value in candidate_pool if value}
-            allowed &= self.known_slugs
+            allowed &= set(self.known_slugs) | external_slugs
         allowed -= {"", normalize_name(PAD_TOKEN), normalize_name(UNK_TOKEN), *occupied}
         if use_my_box_for_reco:
             allowed &= self._owned_slugs(my_box)
@@ -256,13 +276,13 @@ class BPSharedRecommender:
                 "opponent": output["opponent_logits"],
                 "ban": output["ban_logits"],
             }[head][0]
-            return [float(logits[self.vocab.get_id(action[0])].detach().cpu()) for action in actions]
+            return [float(logits[self._vocab_id(action[0])].detach().cpu()) for action in actions]
 
         scores = []
         for start in range(0, len(actions), int(batch_size)):
             chunk = actions[start : start + int(batch_size)]
             pair_ids = torch.tensor(
-                [[self.vocab.get_id(first), self.vocab.get_id(second)] for first, second in chunk],
+                [[self._vocab_id(first), self._vocab_id(second)] for first, second in chunk],
                 dtype=torch.long,
                 device=self.device,
             )
@@ -326,22 +346,44 @@ class BPSharedRecommender:
         if int(pick_count) != 2 or len(allowed) < 2:
             return []
 
+        # A pair can be strong because of its interaction even when neither
+        # singleton is near the top of the policy head.  Keep a broad seed
+        # pool, then let the pair head score the combinations.  The previous
+        # sqrt(limit) pool made a 400-pair budget use only 29 singletons and
+        # discarded most real double-pick actions before pair scoring.
         limit = max(int(top_k), int(max_pair_candidates))
+        generation_limit = max(2048, limit * 12)
         singleton_actions = [(slug,) for slug in allowed]
         singleton_scores = self._score_actions(state, singleton_actions, head=head)
         ranked = [slug for _score, slug in sorted(zip(singleton_scores, allowed), reverse=True)]
-        pool_size = max(2, int((1 + math.sqrt(1 + 8 * limit)) // 2))
+        pool_size = int((1 + math.sqrt(1 + 8 * generation_limit)) // 2)
+        pool_size = max(64, min(128, pool_size, len(ranked)))
         pool = ranked[: min(len(ranked), pool_size)]
+        synergy_rows = self.lucksack_stats.candidate_synergy_pairs(
+            allowed,
+            limit=max(32, int(top_k) * 16),
+        )
         actions = {tuple(sorted(pair)) for pair in combinations(pool, 2)}
-        for row in self.lucksack_stats.candidate_synergy_pairs(allowed, limit=max(8, int(top_k) * 4)):
+        synergy_actions = set()
+        for row in synergy_rows:
             pair = self._canonical_action(row.get("slugs") or ())
             if len(pair) == 2:
                 actions.add(pair)
+                synergy_actions.add(pair)
         if len(actions) > limit:
             rank = {slug: index for index, slug in enumerate(ranked)}
-            actions = set(
-                sorted(actions, key=lambda pair: (rank.get(pair[0], len(rank)) + rank.get(pair[1], len(rank)), pair))[:limit]
+            # Keep the stats anchors in the scoring set.  The final cap is
+            # applied after pair logits are available, so this stage only
+            # bounds inference work and does not decide the recommendation.
+            ranked_actions = sorted(
+                actions - synergy_actions,
+                key=lambda pair: (
+                    rank.get(pair[0], len(rank)) + rank.get(pair[1], len(rank)),
+                    pair,
+                ),
             )
+            actions = set(synergy_actions)
+            actions.update(ranked_actions[: max(0, generation_limit - len(actions))])
         return sorted(actions)
 
     def recommend_pick_plans(
@@ -378,6 +420,14 @@ class BPSharedRecommender:
         if not actions:
             raise RuntimeError("当前候选池没有满足本轮动作大小的合法魔灵")
         logits = self._score_actions(state, actions, head="pick")
+        if expected == 2 and len(actions) > int(max_pair_candidates):
+            selected = sorted(
+                range(len(actions)),
+                key=lambda index: logits[index],
+                reverse=True,
+            )[: int(max_pair_candidates)]
+            actions = [actions[index] for index in selected]
+            logits = [logits[index] for index in selected]
         plans = []
         for action, logit in zip(actions, logits):
             policy_score = self._sigmoid(logit)
@@ -395,7 +445,7 @@ class BPSharedRecommender:
             plans.append(
                 {
                     "plan": display,
-                    "action_key": "|".join(action),
+                    "action_key": "|".join(self._canonical_action(display)),
                     "action_type": detail["action_type"],
                     "pick_count": len(action),
                     "plan_score": float(final_score),
@@ -436,6 +486,14 @@ class BPSharedRecommender:
         if not actions:
             raise RuntimeError("当前候选池没有满足本轮对方动作大小的合法魔灵")
         logits = self._score_actions(model_state, actions, head="opponent")
+        if pick_count == 2 and len(actions) > int(max_pair_candidates):
+            selected = sorted(
+                range(len(actions)),
+                key=lambda index: logits[index],
+                reverse=True,
+            )[: int(max_pair_candidates)]
+            actions = [actions[index] for index in selected]
+            logits = [logits[index] for index in selected]
         if not logits:
             raise RuntimeError("Shared opponent head 没有返回候选分数")
         probabilities = torch.softmax(torch.tensor(logits, dtype=torch.float32), dim=0).tolist()
@@ -445,7 +503,7 @@ class BPSharedRecommender:
             rows.append(
                 {
                     "plan": display,
-                    "action_key": "|".join(action),
+                    "action_key": "|".join(self._canonical_action(display)),
                     "probability": float(probability),
                     "plan_score": float(probability),
                     "source": "shared_opponent_policy",
@@ -617,28 +675,46 @@ class BPSharedRecommender:
         if len(my_picks or ()) != 5 or len(enemy_picks or ()) != 5:
             raise ValueError("Ban 推荐要求双方各完成五个选人")
         enemy_slugs = list(dict.fromkeys(self._to_slug(value) for value in enemy_picks))
-        if len(enemy_slugs) != 5 or any(slug not in self.known_slugs for slug in enemy_slugs):
+        supported_slugs = set(self.known_slugs) | set(getattr(self, "external_slugs", ()))
+        if len(enemy_slugs) != 5 or any(slug not in supported_slugs for slug in enemy_slugs):
             raise ValueError("敌方最终阵容包含未知或重复魔灵")
         state = self._state(my_picks, enemy_picks, first_pick_side, 11, events, "me")
         actions = [(slug,) for slug in enemy_slugs]
         logits = self._score_actions(state, actions, head="ban")
+        baseline = self.evaluate_states([state], return_detail=True)[0]
+        post_ban_states = [
+            transition_state(
+                state,
+                {"side": "me", "action_type": "ban", "monsters": [slug]},
+            )
+            for slug in enemy_slugs
+        ]
+        post_ban_values = self.evaluate_states(
+            post_ban_states,
+            return_detail=True,
+        )
+        pre_ban_win_rate = float(baseline["calibrated_win_rate"])
         plans = []
-        for action, logit in zip(actions, logits):
+        for action, logit, post_ban in zip(actions, logits, post_ban_values):
             score = self._sigmoid(logit)
             display = self._to_display_name(action[0])
+            post_ban_win_rate = float(post_ban["calibrated_win_rate"])
             plans.append(
                 {
                     "plan": [display],
-                    "action_key": action[0],
+                    "action_key": self._canonical_action((display,))[0],
                     "action_type": "ban",
                     "pick_count": 1,
                     "plan_score": score,
-                    "estimated_win_rate": None,
+                    "estimated_win_rate": post_ban_win_rate,
                     "source": "shared_ban",
                     "detail": {
                         "ban_logit": float(logit),
                         "policy_score": score,
                         "plan_score": score,
+                        "pre_ban_win_rate": pre_ban_win_rate,
+                        "post_ban_win_rate": post_ban_win_rate,
+                        "win_rate_gain": post_ban_win_rate - pre_ban_win_rate,
                     },
                 }
             )
@@ -658,6 +734,7 @@ def main(argv=None):
     plans = recommender.recommend_pick_plans(
         my_picks=[],
         enemy_picks=[],
+        pick_count=1,
         first_pick_side="me",
         turn=1,
         events=timeline.to_dict(),
