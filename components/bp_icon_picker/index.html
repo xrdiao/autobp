@@ -379,13 +379,11 @@
         my_picks: uniqueValues(incoming.my_picks, 5),
         enemy_picks: uniqueValues(incoming.enemy_picks, 5),
         my_leader: incoming.my_leader || "",
-        enemy_leader: incoming.enemy_leader || "",
-        pending_action: incoming.pending_action || {side: "", values: []}
+        enemy_leader: incoming.enemy_leader || ""
       };
 
       const currentSide = getCurrentSide(incoming);
-      const pendingValues = uniqueValues(localState.pending_action.values, 2);
-      const occupied = new Set([...localState.my_picks, ...localState.enemy_picks, ...pendingValues]);
+      const occupied = new Set([...localState.my_picks, ...localState.enemy_picks]);
       const items = incoming.items || [];
       const galleryMarkup = items.map((item) => {
         const name = String(item.name || "");
@@ -450,7 +448,7 @@
           </section>
           <aside class="state-panel">
             <h1 class="panel-title">当前 BP</h1>
-            <p class="turn-line">第 ${Number(incoming.current_turn || 1)} 回合 · ${escapeHtml(incoming.phase || "")} · 当前轮到：${currentSide === "me" ? "我方" : currentSide === "enemy" ? "对方" : "无"}${pendingValues.length ? ` · 已选 ${pendingValues.length}/${expectedActionSize(localState.my_picks.length, localState.enemy_picks.length, localState.first_pick_side)}` : ""}</p>
+            <p class="turn-line">第 ${Number(incoming.current_turn || 1)} 回合 · ${escapeHtml(incoming.phase || "")} · 当前轮到：${currentSide === "me" ? "我方" : currentSide === "enemy" ? "对方" : "无"}</p>
             ${stateMarkup("my", "我方已选", localState.my_picks, localState.my_leader)}
             ${stateMarkup("enemy", "对方已选", localState.enemy_picks, localState.enemy_leader)}
           </aside>
@@ -473,25 +471,11 @@
             if (!actionSize) {
               return;
             }
-            const pending = localState.pending_action;
-            if (pending.side !== currentSide) {
-              pending.side = currentSide;
-              pending.values = [];
-            }
-            pending.values.push(name);
-            if (pending.values.length < actionSize) {
-              render(Object.assign({}, incoming, localState));
-              return;
-            }
             const target = currentSide === "me" ? localState.my_picks : localState.enemy_picks;
-            if (target.length + pending.values.length > 5) {
-              pending.values = [];
-              pending.side = "";
+            if (target.length >= 5) {
               return;
             }
-            target.push(...pending.values);
-            pending.values = [];
-            pending.side = "";
+            target.push(name);
             render(Object.assign({}, incoming, localState));
             setComponentValue("add");
             return;
