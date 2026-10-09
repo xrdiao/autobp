@@ -459,13 +459,15 @@ class BPLucksackStats:
             if matchup_coverage > 0.0
             else 0.65 * solo_score + 0.35 * contest_score
         )
+        removal = self.mechanisms.score_removal(enemy_picks, target_slug)
         result = {
             "score": 0.5,
-            "mechanism_score": 0.5,
-            "mechanism_available": False,
-            "mechanism_threat_reduction": 0.0,
-            "mechanism_threats": [],
-            "mechanism_reasons": [],
+            "mechanism_score": float(removal.get("score", 0.5)),
+            "mechanism_available": bool(removal.get("available")),
+            "mechanism_coverage": float(removal.get("coverage", 0.0) or 0.0),
+            "mechanism_threat_reduction": float(removal.get("reduction", 0.0) or 0.0),
+            "mechanism_threats": list(removal.get("threats") or []),
+            "mechanism_reasons": list(removal.get("reasons") or []),
             "target_solo_score": solo_score,
             "target_solo_coverage": solo_coverage,
             "target_contest_score": contest_score,

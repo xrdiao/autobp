@@ -14,6 +14,7 @@ from bp_core.action_space import DraftTimeline, transition_state, validate_timel
 from bp_core.data_common import load_record_rows
 from bp_core.bp_common import infer_pick_count, side_for_order
 from bp_core.names import PROJECT_ROOT, normalize_name
+from bp_recommender.decision_engine import BPDecisionEngine
 from bp_recommender.legacy_adapter import LegacyBPRecommender
 
 
@@ -206,6 +207,19 @@ def _state_after_action(sample, action):
     )
 
 
+def _percentile(values, quantile):
+    ordered = sorted(float(value) for value in values or [])
+    if not ordered:
+        return 0.0
+    if len(ordered) == 1:
+        return ordered[0]
+    position = min(1.0, max(0.0, float(quantile))) * (len(ordered) - 1)
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = position - lower
+    return ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
+
+
 def _plan_values(model, states):
     """Evaluate resulting states with the shared value head."""
     if not states:
@@ -220,25 +234,47 @@ def evaluate_replay(shared_model, samples, top_k=6, max_pair_candidates=400,
     rows, value_pairs = [], []
     hit_counts, turn_counts = defaultdict(int), defaultdict(int)
     total_latency = 0.0
+    latencies = []
+    influenced = 0
+    ranks = []
+    for rank in (1, 3, int(top_k)):
+        if rank > 0 and rank not in ranks:
+            ranks.append(rank)
+    engine = BPDecisionEngine(model=shared_model)
     for sample in samples:
         my_picks, enemy_picks = _sample_slugs(sample, "me"), _sample_slugs(sample, "enemy")
         first_pick_side = normalize_name(sample["first_pick_side"])
         turn = int(sample["turn"])
-        if DraftTimeline(sample["events"]).slots_used != turn - 1:
+        timeline = DraftTimeline(sample["events"])
+        if timeline.slots_used != turn - 1:
             continue
         pick_count = infer_pick_count(my_picks, enemy_picks, first_pick_side)
         actual_action = _actual_action_slugs(sample, shared_model, pick_count)
         if pick_count <= 0 or len(actual_action) != pick_count:
             continue
+        state = {
+            "my_picks": my_picks,
+            "enemy_picks": enemy_picks,
+            "turn": turn,
+            "first_pick_side": first_pick_side,
+            "current_side": side_for_order(turn, first_pick_side),
+            "events": timeline.to_dict(),
+            "my_leader": sample.get("my_leader_slug") or "",
+            "enemy_leader": sample.get("enemy_leader_slug") or "",
+        }
         started = time.perf_counter()
         plans = shared_model.recommend_pick_plans(
             my_picks=my_picks, enemy_picks=enemy_picks, pick_count=pick_count,
             turn=turn, first_pick_side=first_pick_side, candidate_pool=candidate_pool,
-            use_my_box_for_reco=False, top_k=max(int(top_k), 3),
-            max_pair_candidates=max_pair_candidates, events=sample["events"],
+            use_my_box_for_reco=False, top_k=max(int(top_k) * 2, int(top_k)),
+            max_pair_candidates=max_pair_candidates, events=state["events"],
         )
+        plans = engine.rank_my_plans(plans, state, int(top_k))
         elapsed = time.perf_counter() - started
         total_latency += elapsed
+        latencies.append(elapsed * 1000.0)
+        if plans and float((plans[0].get("detail") or {}).get("value_influence") or 0.0) > 0.0:
+            influenced += 1
         actions = [_plan_action(plan, shared_model) for plan in (plans or [])]
         actions = [action for action in actions if len(action) == pick_count]
         top_actions = actions[: int(top_k)]
@@ -259,11 +295,12 @@ def evaluate_replay(shared_model, samples, top_k=6, max_pair_candidates=400,
             "latency_ms": round(elapsed * 1000.0, 3),
         }
         actual_key = frozenset(actual_action)
-        for rank in (1, 3):
+        for rank in ranks:
             hit = any(len(action) == pick_count and frozenset(action) == actual_key
                       for action in actions[:rank])
             hit_counts[f"top{rank}"] += int(hit)
             hit_row[f"top{rank}"] = bool(hit)
+        hit_row["value_influence"] = float((plans[0].get("detail") or {}).get("value_influence") or 0.0) if plans else 0.0
         if top_value is not None:
             hit_row.update({"recommended_value": round(top_value, 6),
                             "actual_value": round(actual_value, 6),
@@ -312,7 +349,11 @@ def evaluate_replay(shared_model, samples, top_k=6, max_pair_candidates=400,
         "evaluated": evaluated,
         "top1_hit_rate": hit_counts["top1"] / evaluated if evaluated else 0.0,
         "top3_hit_rate": hit_counts["top3"] / evaluated if evaluated else 0.0,
+        f"top{int(top_k)}_hit_rate": hit_counts[f"top{int(top_k)}"] / evaluated if evaluated else 0.0,
         "mean_latency_ms": total_latency * 1000.0 / evaluated if evaluated else 0.0,
+        "latency_p95_ms": _percentile(latencies, 0.95) if evaluated else 0.0,
+        "value_influence_rate": influenced / evaluated if evaluated else 0.0,
+        "candidate_pool_size": len(candidate_pool),
         "value_comparison_evaluated": value_count,
         "mean_recommended_value": sum(r["recommended_value"] for r in value_pairs) / value_count if value_count else None,
         "mean_actual_value": sum(r["actual_value"] for r in value_pairs) / value_count if value_count else None,

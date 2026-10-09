@@ -5,14 +5,14 @@ import torch
 from bp_core.lucksack_stats import BPLucksackStats, DEFAULT_STATS_PATH
 from bp_core.probability_calibration import apply_probability_calibration, resolve_probability_calibration
 from bp_core.transformer_common import PAD_TOKEN, PROJECT_ROOT, UNK_TOKEN, normalize_name, slugify_fallback
+from bp_recommender.value_influence import resolve_value_noise, value_adjustments
 from training.draft_value import BPDraftValueNet as TransformerDraftValueNet
 
 DEFAULT_MODEL_PATH = PROJECT_ROOT / "models" / "bp_draft_value_net.pt"
 DEFAULT_META_PATH = PROJECT_ROOT / "models" / "bp_draft_value_meta.json"
 DEFAULT_VOCAB_PATH = PROJECT_ROOT / "models" / "bp_draft_value_vocab.json"
-BAN_VALUE_WEIGHT = 0.75
-BAN_MECHANISM_WEIGHT = 0.25
-BAN_STATS_WEIGHT = 0.10
+BAN_MECHANISM_WEIGHT = 0.60
+BAN_STATS_WEIGHT = 0.40
 BAN_WORST_RESPONSE_WEIGHT = 0.70
 
 
@@ -332,24 +332,27 @@ class BPBanValueRecommender:
             )
             mechanism_score = float(ban_stats.get("mechanism_score", 0.5))
             mechanism_available = bool(ban_stats.get("mechanism_available"))
+            mechanism_coverage = float(ban_stats.get("mechanism_coverage", 0.0) or 0.0)
             stats_score = float(ban_stats.get("ban_priority_score", 0.5))
-            stats_available = (
-                float(ban_stats.get("target_solo_coverage", 0.0)) > 0.0
-                or float(ban_stats.get("target_contest_coverage", 0.0)) > 0.0
+            stats_coverage = max(
+                float(ban_stats.get("target_solo_coverage", 0.0) or 0.0),
+                float(ban_stats.get("target_contest_coverage", 0.0) or 0.0),
             )
-            weighted_score = BAN_VALUE_WEIGHT * wr
-            weight_total = BAN_VALUE_WEIGHT
-            source_parts = ["value_0.75"]
-            if mechanism_available:
-                weighted_score += BAN_MECHANISM_WEIGHT * mechanism_score
-                weight_total += BAN_MECHANISM_WEIGHT
-                source_parts.append("mechanism_0.25")
-            if stats_available:
-                weighted_score += BAN_STATS_WEIGHT * stats_score
-                weight_total += BAN_STATS_WEIGHT
-                source_parts.append("stats_0.10")
-            decision_score = weighted_score / max(weight_total, 1e-6)
-            ranking_source = "ban_robust_response_" + "_".join(source_parts)
+            evidence_weights = []
+            evidence_values = []
+            if mechanism_available and mechanism_coverage > 0.0:
+                evidence_weights.append(BAN_MECHANISM_WEIGHT * mechanism_coverage)
+                evidence_values.append(mechanism_score)
+            if stats_coverage > 0.0:
+                evidence_weights.append(BAN_STATS_WEIGHT * stats_coverage)
+                evidence_values.append(stats_score)
+            evidence_total = sum(evidence_weights)
+            evidence_score = (
+                sum(value * weight for value, weight in zip(evidence_values, evidence_weights)) / evidence_total
+                if evidence_total > 0.0
+                else 0.5
+            )
+            ranking_source = "ban_evidence_value_shrinkage"
 
             display = self._to_display_name(target)
             image_name = self._to_image_name(target)
@@ -376,20 +379,21 @@ class BPBanValueRecommender:
                     "plan": [display],
                     "plan_slugs": [target],
                     "image_names": [image_name],
-                    "score": round(decision_score, 6),
-                    "plan_score": round(decision_score, 6),
+                    "score": round(evidence_score, 6),
+                    "plan_score": round(evidence_score, 6),
                     "estimated_win_rate": round(wr, 6),
                     "source": str(self.meta.get("model_type", "bp_draft_value_model")),
-                    "summary": "Response-aware ban recommendation from full-draft value model",
+                    "summary": "Ban ranked by mechanism threat and public ban stats",
                     "reasons": [
-                        "Compares full draft win rate before and after banning the target",
-                        "Includes the strongest opposing ban response",
-                        "Ranks bans by learned value plus mechanism threat removal",
+                        "Ranks the ban by mechanism threat removed from the enemy draft",
+                        "Includes public solo, contest, and matchup ban priority",
+                        "Lets the draft value move the score only after candidates separate past its residual",
                         *list(ban_stats.get("mechanism_reasons") or []),
                     ],
                     "detail": {
                         "ban_target": display,
-                        "decision_score": round(decision_score, 6),
+                        "evidence_score": round(evidence_score, 6),
+                        "decision_score": round(evidence_score, 6),
                         "pre_ban_win_rate": round(base_wr, 6),
                         "post_ban_win_rate": round(wr, 6),
                         "win_rate_gain": round(gain, 6),
@@ -420,6 +424,7 @@ class BPBanValueRecommender:
                         "response_aware": response_count > 1,
                         "mechanism_score": round(mechanism_score, 6),
                         "mechanism_available": mechanism_available,
+                        "mechanism_coverage": round(mechanism_coverage, 6),
                         "mechanism_threat_reduction": round(
                             float(ban_stats.get("mechanism_threat_reduction", 0.0)),
                             6,
@@ -455,11 +460,20 @@ class BPBanValueRecommender:
                 }
             )
 
-        plans.sort(
-            key=lambda row: (
-                float((row.get("detail") or {}).get("post_ban_win_rate", row.get("estimated_win_rate", 0.0))),
-                float(row.get("plan_score", 0.0)),
-            ),
-            reverse=True,
+        noise = resolve_value_noise(self.meta)
+        weight, center, adjustments = value_adjustments(
+            [float(row["estimated_win_rate"]) for row in plans],
+            noise,
         )
+        for row, adjustment in zip(plans, adjustments):
+            evidence_score = float(row["detail"]["evidence_score"])
+            score = evidence_score + adjustment
+            row["score"] = round(score, 6)
+            row["plan_score"] = round(score, 6)
+            row["detail"]["decision_score"] = round(score, 6)
+            row["detail"]["value_influence"] = round(weight, 6)
+            row["detail"]["value_median"] = round(center, 6)
+            row["detail"]["value_adjustment"] = round(adjustment, 6)
+            row["detail"]["value_noise"] = None if noise is None else round(noise, 6)
+        plans.sort(key=lambda row: float(row["plan_score"]), reverse=True)
         return plans[:top_k]

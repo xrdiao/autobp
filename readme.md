@@ -67,11 +67,7 @@ python -c "import sys, torch; print(sys.executable); print(torch.__version__); p
 
 ## 快速使用
 
-首次使用先同步魔灵目录、别称、图片地址和公开统计。
-
-```bash
-python build_dataset/sync_lucksack_data.py --combo-limit 2000 --group-concurrency 2
-```
+Lucksack 比赛页面按数据一节启动本机 Chrome 后再下载。
 
 同步 SWKit 别称和 RTA 评级。
 
@@ -114,14 +110,34 @@ python -m apps.desktop
 
 ## 数据
 
-同步公开统计并从已有比赛 HTML 构建事件级样本；首次获取比赛页面时加上 `--download`。
+下载 Lucksack 比赛页面前，先启动本机 Chrome。
+
+```bash
+google-chrome --remote-debugging-port=9333 --user-data-dir="$HOME/.config/chrome-lucksack"
+```
+
+在打开的窗口中访问排行榜并完成验证，然后保持窗口不关闭。
+
+```text
+https://lucksack.gg/players
+```
+
+另开终端，连接该窗口并下载选手页面。
+
+```bash
+python build_dataset/download_players_by_rank.py --headful --detail-concurrency 1 --max-detail-fetches 1250
+```
+
+中断后使用固定版本和已有排行榜清单继续下载。
+
+```bash
+python build_dataset/download_players_by_rank.py --headful --dataset-version v3.0 --use-existing-version-csv
+```
+
+从已有比赛 HTML 构建事件级样本。
 
 ```bash
 python build_dataset/run_all.py
-```
-
-```bash
-python build_dataset/run_all.py --download
 ```
 
 主要数据源如下：
@@ -156,12 +172,6 @@ python build_dataset/run_all.py --force-rebuild
 
 ```bash
 python build_dataset/run_all.py --skip-swkit --skip-lucksack --skip-swrt --skip-mechanisms --skip-images --force-rebuild
-```
-
-排行榜恢复后，使用固定版本和已有排行榜清单继续下载。
-
-```bash
-python build_dataset/run_all.py --download --dataset-version v3.0 --use-existing-version-csv --force-rebuild
 ```
 
 目录同步时会过滤不可用的未觉醒条目；二次觉醒条目只有在目录明确标记为可搜索时才会保留。

@@ -841,6 +841,9 @@ class DesktopBPApp:
         return card
 
     def _format_plan_win_rate(self, plan):
+        detail = plan.get("detail") or {}
+        if "value_influence" in detail and float(detail.get("value_influence") or 0.0) <= 0.0:
+            return "未拉开"
         if plan.get("estimated_win_rate") is None:
             return "N/A"
         try:

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from bp_core.action_space import events_from_state, transition_state, validate_timeline
 from bp_core.bp_common import infer_pick_count_for_side, side_for_order
 from bp_core.names import normalize_name
+from bp_recommender.value_influence import resolve_value_noise, value_adjustments
 
 
 @dataclass(frozen=True)
@@ -418,6 +419,27 @@ class BPDecisionEngine:
                 )
         return rows, response_rows, response_meta
 
+    def _value_noise(self):
+        """Residual noise of the value head, measured when that head was trained."""
+        model = self.model
+        metas = []
+        value_model = getattr(model, "value", None)
+        if value_model is not None:
+            metas.append(getattr(value_model, "meta", None))
+        metas.append(getattr(model, "meta", None))
+        for meta in metas:
+            noise = resolve_value_noise(meta)
+            if noise is not None:
+                return noise
+        return None
+
+    def _apply_value_shrinkage(self, rows, value_of):
+        """Move each policy score by the centered value, scaled by one shared weight."""
+        values = [float(value_of(row)) for row in rows]
+        noise = self._value_noise()
+        weight, center, adjustments = value_adjustments(values, noise)
+        return weight, center, adjustments, noise
+
     def rank_my_plans(self, plans, state, top_k):
         plans = self._normalize_plans(plans)
         if not plans:
@@ -450,32 +472,19 @@ class BPDecisionEngine:
             )
             item = dict(plan)
             detail = dict(item.get("detail", {}) or {})
-            policy_score = float(detail["normalized_policy_score"])
-            evidence_score = self._evidence_score(detail)
-            decision_confidence = self._decision_confidence(detail)
-            policy_component = policy_score
-            uncertainty_penalty = 0.025 * (1.0 - decision_confidence)
-            fused = (
-                self.config.robust_weight * robust
-                + self.config.immediate_weight * immediate
-                + self.config.policy_weight * policy_component
-                + self.config.evidence_weight * evidence_score
-                - uncertainty_penalty
-            )
-            item["plan_score"] = round(fused, 6)
+            policy_score = float(item["plan_score"])
+            item["robust_value"] = float(robust)
             item["estimated_win_rate"] = round(immediate, 6)
             detail.update(
                 {
+                    "policy_score": round(policy_score, 6),
+                    "policy_component": round(policy_score, 6),
                     "pre_pick_win_rate": round(base_value, 6),
                     "post_pick_win_rate": round(immediate, 6),
                     "adversarial_win_rate": round(robust, 6),
                     "win_rate_gain": round(immediate - base_value, 6),
                     "value_component": round(immediate, 6),
                     "adversarial_value_component": round(robust, 6),
-                    "policy_component": round(policy_component, 6),
-                    "evidence_component": round(evidence_score, 6),
-                    "decision_confidence": round(decision_confidence, 6),
-                    "uncertainty_penalty": round(uncertainty_penalty, 6),
                     "worst_counter_win_rate": None if worst is None else round(worst, 6),
                     "mean_counter_win_rate": None if expected is None else round(expected, 6),
                     "counter_plans": [
@@ -493,24 +502,29 @@ class BPDecisionEngine:
                         for row in response_values
                     ],
                     "search_depth": 3,
-                    "ranking_source": "robust_search_value_3ply_shared_stats_mechanism",
+                    "ranking_source": "policy_value_shrinkage",
                 }
             )
             item["detail"] = detail
             enriched.append(item)
-        # Rank own picks by the value after the modeled opponent response.
-        # The immediate value remains in the detail payload for inspection.
-        enriched.sort(
-            key=lambda row: (
-                float((row.get("detail") or {}).get(
-                    "adversarial_win_rate",
-                    row.get("estimated_win_rate", 0.0),
-                )),
-                float(row.get("estimated_win_rate", 0.0)),
-                float(row.get("plan_score", 0.0)),
-            ),
-            reverse=True,
+        weight, center, adjustments, noise = self._apply_value_shrinkage(
+            enriched,
+            lambda row: row["robust_value"],
         )
+        for item, adjustment in zip(enriched, adjustments):
+            policy_score = float(item["detail"]["policy_score"])
+            item["plan_score"] = round(policy_score + adjustment, 6)
+            item["detail"].update(
+                {
+                    "value_influence": round(weight, 6),
+                    "value_median": round(center, 6),
+                    "value_adjustment": round(adjustment, 6),
+                    "value_noise": None if noise is None else round(noise, 6),
+                }
+            )
+        # Policy order stays put while the value head is inside its residual.
+        # A real separation adds the centered robust value, scaled by one weight.
+        enriched.sort(key=lambda row: float(row["plan_score"]), reverse=True)
         return enriched[: int(top_k)]
 
     def rank_enemy_plans(self, plans, state, top_k):
@@ -548,18 +562,7 @@ class BPDecisionEngine:
             best_response = max(response_values) if response_values else immediate
             item = dict(plan)
             detail = dict(item.get("detail", {}) or {})
-            policy_score = float(detail["normalized_policy_score"])
-            evidence_score = self._evidence_score(detail)
-            decision_confidence = self._decision_confidence(detail)
-            policy_component = policy_score
-            uncertainty_penalty = 0.025 * (1.0 - decision_confidence)
-            final_score = (
-                0.60 * (1.0 - best_response)
-                + 0.15 * (1.0 - immediate)
-                + 0.15 * policy_component
-                + 0.10 * evidence_score
-                - uncertainty_penalty
-            )
+            policy_score = float(item["plan_score"])
             response_rows = []
             for response_plan, response_value in zip(response_plans, response_values):
                 response_rows.append(
@@ -569,34 +572,36 @@ class BPDecisionEngine:
                         "priority": round(float(response_plan["plan_score"]), 6),
                     }
                 )
+            item["robust_value"] = float(best_response)
             item["estimated_win_rate"] = round(immediate, 6)
-            item["plan_score"] = round(final_score, 6)
+            item["plan_score"] = round(policy_score, 6)
             detail.update(
                 {
+                    "policy_score": round(policy_score, 6),
+                    "policy_component": round(policy_score, 6),
                     "post_enemy_pick_win_rate": round(immediate, 6),
                     "best_response_win_rate": round(best_response, 6),
-                    "enemy_adversarial_score": round(final_score, 6),
-                    "policy_component": round(policy_component, 6),
-                    "evidence_component": round(evidence_score, 6),
-                    "decision_confidence": round(decision_confidence, 6),
-                    "uncertainty_penalty": round(uncertainty_penalty, 6),
                     "response_plans": response_rows,
                     "search_depth": 2,
-                    "ranking_source": "robust_enemy_search_value_shared_stats_mechanism",
+                    "ranking_source": "opponent_policy",
                 }
             )
             item["detail"] = detail
             enriched.append(item)
-        # For an opponent prediction, the strongest prediction is the action
-        # that leaves us with the lowest win rate after our best response.
-        enriched.sort(
-            key=lambda row: (
-                float((row.get("detail") or {}).get(
-                    "best_response_win_rate",
-                    row.get("estimated_win_rate", 1.0),
-                )),
-                float(row.get("estimated_win_rate", 1.0)),
-                -float(row.get("plan_score", 0.0)),
-            )
+        weight, center, adjustments, noise = self._apply_value_shrinkage(
+            enriched,
+            lambda row: row["robust_value"],
         )
+        for item, adjustment in zip(enriched, adjustments):
+            item["detail"].update(
+                {
+                    "value_influence": round(weight, 6),
+                    "value_median": round(center, 6),
+                    "value_adjustment": round(adjustment, 6),
+                    "value_noise": None if noise is None else round(noise, 6),
+                }
+            )
+        # Opponent order is the policy: what they are likely to lock next.
+        # The value annotation stays on the card and does not reorder the list.
+        enriched.sort(key=lambda row: float(row["plan_score"]), reverse=True)
         return enriched[: int(top_k)]

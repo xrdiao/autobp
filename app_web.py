@@ -1324,42 +1324,40 @@ def render_box_fragment(assets):
             rerun_fragment_or_app()
 
 
+def _metric_text(value, percent=False):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    return f"{number:.2%}" if percent else f"{number:.3f}"
+
+
 def render_result_card(index, item, assets, result_type):
     monsters = [value for value in item["plan"] if value]
     score = item["plan_score"]
 
     detail = item.get("detail", {}) or {}
-    win_rate = item.get("estimated_win_rate")
-    primary_label = "估计胜率"
-    if result_type == "pick" and detail.get("adversarial_win_rate") is not None:
-        win_rate = detail.get("adversarial_win_rate")
-        primary_label = "对手反制后胜率"
-    elif result_type == "enemy" and detail.get("best_response_win_rate") is not None:
-        win_rate = detail.get("best_response_win_rate")
-        primary_label = "我方应对后胜率"
-    elif result_type == "ban" and detail.get("post_ban_win_rate") is not None:
-        win_rate = detail.get("post_ban_win_rate")
-        primary_label = "Ban 后胜率"
-    if win_rate is not None and float(win_rate or 0.0) > 0.0:
-        win_rate_text = f"{float(win_rate):.2%}"
+    influence = float(detail.get("value_influence") or 0.0)
+    if result_type == "ban":
+        primary_label = "机制"
+        primary_value = _metric_text(detail.get("mechanism_score"), percent=True)
+        secondary_label = "Ban 统计"
+        secondary_value = _metric_text(detail.get("ban_priority_score"), percent=True)
     else:
-        win_rate_text = "未启用"
-
-    if result_type == "ban" and "pre_ban_win_rate" in detail:
-        secondary_label = "Ban 前"
-        secondary_value = f"{float(detail['pre_ban_win_rate']):.2%}"
-    elif "win_rate_gain" in detail:
-        secondary_label = "变化"
-        secondary_value = f"{float(detail['win_rate_gain']):+.2%}"
-    elif "post_enemy_pick_win_rate" in detail:
-        secondary_label = "我方胜率"
-        secondary_value = f"{float(detail['post_enemy_pick_win_rate']):.2%}"
-    elif "post_ban_win_rate" in detail:
-        secondary_label = "Ban 后"
-        secondary_value = f"{float(detail['post_ban_win_rate']):.2%}"
+        primary_label = "常见程度"
+        primary_value = _metric_text(detail.get("policy_score", item.get("plan_score")))
+        if detail.get("mechanism_available"):
+            secondary_label = "机制"
+            secondary_value = _metric_text(detail.get("mechanism_score"), percent=True)
+        else:
+            secondary_label = "搭配"
+            secondary_value = _metric_text(detail.get("draft_stats_score"), percent=True)
+    if influence > 0.0 and detail.get("value_adjustment") is not None:
+        tertiary_label = "胜率差"
+        tertiary_value = f"{float(detail['value_adjustment']):+.3f}"
     else:
-        secondary_label = "动作"
-        secondary_value = str(detail.get("action_type") or item.get("source", "shared_policy"))
+        tertiary_label = "胜率差"
+        tertiary_value = "未拉开"
 
     ranking_source = detail.get("ranking_source") or item.get("source") or "shared_policy"
     source_text = {
@@ -1367,6 +1365,9 @@ def render_result_card(index, item, assets, result_type):
         "relation": "Relation + 统计证据",
         "relation_ban": "Relation Ban",
         "bp_draft_value_model": "Full Draft Value + Ban",
+        "policy_value_shrinkage": "Relation + 胜率缩权",
+        "opponent_policy": "对手出手概率",
+        "ban_evidence_value_shrinkage": "机制 + Ban 统计",
         "robust_search_value_3ply_shared_stats_mechanism": "三层鲁棒搜索 + Value + 机制",
         "robust_enemy_search_value_shared_stats_mechanism": "对手搜索 + Value + 机制",
     }.get(str(ranking_source), str(ranking_source))
@@ -1403,10 +1404,11 @@ def render_result_card(index, item, assets, result_type):
             </div>
             <div class="recommendation-monsters">{''.join(image_markup)}</div>
             <div class="recommendation-metrics">
-                <div><span>{html.escape(primary_label)}</span><b>{win_rate_text}</b></div>
+                <div><span>{html.escape(primary_label)}</span><b>{html.escape(primary_value)}</b></div>
                 <div><span>{html.escape(secondary_label)}</span><b>{html.escape(secondary_value)}</b></div>
-                <div><span>来源</span><b>{html.escape(source_text)}</b></div>
+                <div><span>{html.escape(tertiary_label)}</span><b>{html.escape(tertiary_value)}</b></div>
             </div>
+            <div class="recommendation-reason">{html.escape(source_text)}</div>
             {reason_markup}
         </div>
     """
@@ -1433,36 +1435,7 @@ def render_results(title, results, assets, result_type):
     if not results:
         st.info("没有可显示的推荐结果。")
         return
-    def display_rate(item):
-        detail = item.get("detail", {}) or {}
-        if result_type == "ban":
-            value = detail.get("post_ban_win_rate", item.get("estimated_win_rate"))
-        elif result_type == "enemy":
-            value = detail.get("best_response_win_rate", item.get("estimated_win_rate"))
-        else:
-            value = detail.get("adversarial_win_rate", item.get("estimated_win_rate"))
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return 0.0 if result_type != "enemy" else 1.0
-
-    if result_type == "enemy":
-        ordered_results = sorted(
-            list(results),
-            key=lambda item: (
-                display_rate(item),
-                -float(item.get("plan_score", 0.0)),
-            ),
-        )
-    else:
-        ordered_results = sorted(
-            list(results),
-            key=lambda item: (
-                display_rate(item),
-                float(item.get("plan_score", 0.0)),
-            ),
-            reverse=True,
-        )
+    ordered_results = list(results)
     for start in range(0, len(ordered_results), 3):
         result_row = ordered_results[start : start + 3]
         columns = st.columns(3)

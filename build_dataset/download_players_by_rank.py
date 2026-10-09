@@ -12,6 +12,8 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import urllib.request
+
 import aiofiles
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
@@ -48,18 +50,12 @@ MAX_PAGES = 160
 MAX_RANK_TO_SCAN = MAX_DEFAULT_RANK_TO_SCAN
 TARGET_PLAYERS_PER_TIER = dict(RANK_TIER_TARGET_PLAYERS)
 OTHER_TIER_MIN_RANK = next(spec["rank_min"] for spec in RANK_TIER_SPECS if spec["key"] == "other")
-BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
 HEADLESS = os.getenv("PLAYWRIGHT_HEADLESS", "1") != "0"
 BROWSER_PROFILE_DIR = Path(os.getenv("BP_BROWSER_PROFILE_DIR", "./.playwright_profile/lucksack"))
 USE_EXISTING_VERSION_CSV = os.getenv("BP_USE_EXISTING_VERSION_CSV", "0") == "1"
 CHALLENGE_TIMEOUT_MS = int(os.getenv("BP_CF_AUTO_WAIT_MS", "60000"))
 MANUAL_CHALLENGE_TIMEOUT_MS = int(os.getenv("BP_CF_MANUAL_WAIT_MS", "300000"))
 ENABLE_MANUAL_CHALLENGE = os.getenv("BP_CF_ALLOW_MANUAL", "1") != "0"
-DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/136.0.0.0 Safari/537.36"
-)
 
 ROW_SELECTOR = 'tbody[data-slot="table-body"] tr[data-slot="table-row"]'
 NEXT_SELECTOR = 'button:has-text("Next")'
@@ -104,7 +100,12 @@ def parse_args():
     parser.add_argument(
         "--headful",
         action="store_true",
-        help="Run browser with UI so Cloudflare can be solved manually if needed.",
+        help="Attach to a Chrome window you already opened, instead of launching a browser.",
+    )
+    parser.add_argument(
+        "--cdp-url",
+        default="http://127.0.0.1:9333",
+        help="DevTools address of the Chrome window used with --headful.",
     )
     parser.add_argument(
         "--challenge-timeout-ms",
@@ -159,7 +160,6 @@ def configure_output_paths(dataset_version):
 
 async def build_context(browser):
     return await browser.new_context(
-        user_agent=DEFAULT_USER_AGENT,
         viewport={"width": 1440, "height": 900},
         locale="en-US",
     )
@@ -169,24 +169,40 @@ async def build_persistent_context(playwright):
     profile_dir = BROWSER_PROFILE_DIR.expanduser()
     profile_dir.mkdir(parents=True, exist_ok=True)
     print(f"[INFO] using persistent browser profile: {profile_dir.resolve()}")
+    # Bundled Chromium is often reset by the site before a page exists.
+    # The installed Chrome keeps one verification across later navigations.
     return await playwright.chromium.launch_persistent_context(
         str(profile_dir),
+        channel="chrome",
         headless=False,
-        args=["--disable-blink-features=AutomationControlled"],
-        user_agent=DEFAULT_USER_AGENT,
         viewport={"width": 1440, "height": 900},
         locale="en-US",
     )
 
 
-async def setup_page(page):
-    async def handle_route(route):
-        if route.request.resource_type in BLOCKED_RESOURCE_TYPES:
-            await route.abort()
-            return
-        await route.continue_()
+def _connection_closed(exc):
+    return "ERR_CONNECTION_CLOSED" in str(exc) or "ERR_CONNECTION_RESET" in str(exc)
 
-    await page.route("**/*", handle_route)
+
+async def goto_with_retry(page, url, timeout=PAGE_TIMEOUT, attempts=4):
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+        except Exception as exc:
+            last_error = exc
+            if not _connection_closed(exc) or attempt == attempts:
+                raise
+            wait_seconds = 2 * attempt
+            print(f"[WARN] connection closed for {url}; retry {attempt}/{attempts - 1} in {wait_seconds}s")
+            await page.wait_for_timeout(wait_seconds * 1000)
+    raise last_error
+
+
+async def setup_page(page):
+    # Leave images and scripts alone. Aborting them reloads the Cloudflare
+    # widget on the next navigation, so a solved check does not stick.
+    return None
 
 
 async def save_debug(page, name):
@@ -203,6 +219,12 @@ async def save_debug(page, name):
 
 
 async def is_challenge_page(page):
+    """Detect the top-level Cloudflare page only.
+
+    Hidden challenge frames stay in the document after a successful check.
+    Searching every frame made the script treat a cleared page as a new
+    challenge and ask for verification again.
+    """
     try:
         title = (await page.title()).strip().lower()
     except Exception:
@@ -210,15 +232,14 @@ async def is_challenge_page(page):
 
     if title in {"just a moment...", "attention required!"}:
         return True
+    if "__cf_chl_" in page.url or "challenge-platform" in page.url:
+        return True
 
-    for text in CHALLENGE_TEXTS:
-        try:
-            if await page.get_by_text(text, exact=False).count() > 0:
-                return True
-        except Exception:
-            pass
-
-    return "__cf_chl_" in page.url or "challenge-platform" in page.url
+    try:
+        body = (await page.locator("body").inner_text(timeout=2000)).lower()
+    except Exception:
+        return False
+    return any(text.lower() in body for text in CHALLENGE_TEXTS) or "performing security verification" in body
 
 
 async def wait_for_challenge_clear(page, timeout_ms=45000):
@@ -1007,7 +1028,7 @@ async def player_detail_worker(
 
 
 async def goto_ranking(page):
-    await page.goto(RANKING_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
+    await goto_with_retry(page, RANKING_URL)
     await page.wait_for_timeout(LEADERBOARD_SETTLE_MS)
 
     if await is_challenge_page(page):
@@ -1128,7 +1149,7 @@ async def save_player_page(page, item, state):
         return
 
     try:
-        response = await page.goto(DETAIL_URL.format(player_id), wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
+        response = await goto_with_retry(page, DETAIL_URL.format(player_id))
         status = response.status if response else None
 
         if await is_challenge_page(page):
@@ -1195,6 +1216,67 @@ async def save_player_page(page, item, state):
         state[pid] = state_row
 
 
+def disable_local_proxy():
+    """Keep DevTools discovery off the HTTP proxy.
+
+    A proxy in the environment turns http://[::1]:9222/json/version into a
+    502, so Playwright never sees the Chrome endpoint.
+    """
+    for key in ("http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        os.environ.pop(key, None)
+    existing = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
+    hosts = [part.strip() for part in existing.split(",") if part.strip()]
+    for host in ("localhost", "127.0.0.1", "::1"):
+        if host not in hosts:
+            hosts.append(host)
+    joined = ",".join(hosts)
+    os.environ["NO_PROXY"] = joined
+    os.environ["no_proxy"] = joined
+
+
+def resolve_chrome_cdp_url(preferred):
+    candidates = []
+    for url in (preferred, "http://127.0.0.1:9333", "http://[::1]:9333"):
+        if url and url not in candidates:
+            candidates.append(url)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    errors = []
+    for url in candidates:
+        try:
+            with opener.open(url.rstrip("/") + "/json/version", timeout=5) as response:
+                info = json.loads(response.read().decode("utf-8"))
+        except Exception as exc:
+            errors.append(f"{url}: {exc}")
+            continue
+        browser_name = str(info.get("Browser") or "")
+        if browser_name.startswith("Chrome/") and "Electron" not in browser_name:
+            return url, browser_name
+        errors.append(f"{url}: {browser_name or 'unknown'} 不是要连接的 Chrome")
+    raise RuntimeError(
+        "没有找到可用的 Chrome 调试端口。请用 9333 启动 Chrome，9222 已被 Cursor 占用。\n"
+        + "\n".join(errors)
+    )
+
+
+async def connect_existing_chrome(playwright, cdp_url):
+    try:
+        browser = await playwright.chromium.connect_over_cdp(cdp_url)
+    except Exception as exc:
+        raise RuntimeError(
+            "没有连上本机 Chrome。"
+            "先关掉所有 Chrome 窗口，再执行：\n"
+            "google-chrome --remote-debugging-port=9333 "
+            f"--user-data-dir={Path.home() / '.config' / 'chrome-lucksack'}\n"
+            "在打开的窗口里访问 https://lucksack.gg/players ，"
+            "手动通过验证并确认排行榜已经显示，然后再运行下载脚本。\n"
+            f"连接地址：{cdp_url}\n{exc}"
+        ) from exc
+    if not browser.contexts:
+        raise RuntimeError("Chrome 已连接，但没有可用的浏览窗口")
+    print(f"[INFO] attached to existing Chrome at {cdp_url}")
+    return browser, browser.contexts[0]
+
+
 async def download_players_by_rank(
     dataset_version=None,
     use_existing_csv=USE_EXISTING_VERSION_CSV,
@@ -1202,6 +1284,7 @@ async def download_players_by_rank(
     max_detail_fetches=MAX_DETAIL_FETCHES_PER_RUN,
     detail_min_interval_seconds=DETAIL_MIN_INTERVAL_SECONDS,
     detail_max_interval_seconds=DETAIL_MAX_INTERVAL_SECONDS,
+    cdp_url="http://127.0.0.1:9333",
 ):
     resolved_version = resolve_target_dataset_version(DATASET_ROOT, requested_version=dataset_version)
     configure_output_paths(resolved_version)
@@ -1230,18 +1313,22 @@ async def download_players_by_rank(
     elif CSV_PATH.exists():
         print(f"[INFO] ignoring existing csv for fresh crawl: {CSV_PATH}")
 
+    if not HEADLESS:
+        disable_local_proxy()
+        cdp_url, browser_name = resolve_chrome_cdp_url(cdp_url)
+        print(f"[INFO] Chrome DevTools: {browser_name} at {cdp_url}")
+
     async with async_playwright() as p:
         browser = None
         context = None
 
+        attached_chrome = False
         if HEADLESS:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=["--disable-blink-features=AutomationControlled"],
-            )
+            browser = await p.chromium.launch(headless=True)
             context = await build_context(browser)
         else:
-            context = await build_persistent_context(p)
+            browser, context = await connect_existing_chrome(p, cdp_url)
+            attached_chrome = True
 
         try:
             if not players:
@@ -1305,10 +1392,11 @@ async def download_players_by_rank(
             csv_counts, ready_counts, missing_counts = dataset_completion_by_tier(merged_players)
             print(f"[INFO] dataset completion after fetch: {format_completion_counts(csv_counts, ready_counts, missing_counts)}")
         finally:
-            if context is not None:
-                await context.close()
-            if browser is not None:
-                await browser.close()
+            if not attached_chrome:
+                if context is not None:
+                    await context.close()
+                if browser is not None:
+                    await browser.close()
 
 
 if __name__ == "__main__":
@@ -1325,5 +1413,6 @@ if __name__ == "__main__":
             max_detail_fetches=args.max_detail_fetches,
             detail_min_interval_seconds=args.detail_min_interval_seconds,
             detail_max_interval_seconds=args.detail_max_interval_seconds,
+            cdp_url=args.cdp_url,
         )
     )

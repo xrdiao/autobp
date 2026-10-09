@@ -250,3 +250,49 @@ class BPMechanismLayer:
             "reasons": reasons[:4],
             "source": self.source_label,
         }
+
+    def score_removal(self, enemy_picks, target):
+        """Score how much enemy threat weight disappears when ``target`` is banned."""
+        enemy_picks = self._values(enemy_picks)
+        if not self.ready or not enemy_picks or not target:
+            return {
+                "available": False,
+                "score": 0.5,
+                "coverage": 0.0,
+                "reduction": 0.0,
+                "threats": [],
+                "reasons": [],
+                "source": self.source_label,
+            }
+        target_slug = self._resolve_slug(target)
+        before_weights, _sources, known = self._enemy_threats(enemy_picks)
+        remaining = [
+            value
+            for value in enemy_picks
+            if self._resolve_slug(value) != target_slug
+        ]
+        after_weights, _, _remaining_known = self._enemy_threats(remaining)
+        before_total = sum(before_weights.values())
+        after_total = sum(after_weights.values())
+        reduction = 0.0 if before_total <= 0.0 else max(0.0, before_total - after_total) / before_total
+        profile = self.profile(target)
+        available = profile is not None and known > 0
+        threats = []
+        reasons = []
+        for threat, weight in sorted(before_weights.items(), key=lambda item: item[1], reverse=True):
+            drop = weight - after_weights.get(threat, 0.0)
+            if drop <= 0.0:
+                continue
+            label = THREAT_LABELS.get(threat, threat)
+            threats.append({"threat": threat, "label": label, "drop": round(drop, 6)})
+            reasons.append(f"去掉{label}")
+        score = max(0.2, min(0.8, 0.5 + 0.30 * reduction))
+        return {
+            "available": available,
+            "score": round(score, 6),
+            "coverage": 1.0 if available else 0.0,
+            "reduction": round(reduction, 6),
+            "threats": threats,
+            "reasons": reasons[:4],
+            "source": self.source_label,
+        }

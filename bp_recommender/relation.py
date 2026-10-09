@@ -458,6 +458,63 @@ class BPRelationRecommender:
                 break
         return selected
 
+    @staticmethod
+    def _select_pair_indices_with_synergy(actions, pruning_scores, synergy_keys, score_limit, reserve_count):
+        """Keep public synergy pairs in the set that receives a full relation score."""
+        score_limit = max(1, min(len(actions), int(score_limit)))
+        minimum_synergy = max(0, min(int(reserve_count), score_limit))
+        synergy_indices = [
+            index
+            for index, action in enumerate(actions)
+            if frozenset(action) in synergy_keys
+        ]
+        synergy_indices.sort(key=lambda index: float(pruning_scores[index]), reverse=True)
+        synergy_keep = min(len(synergy_indices), max(minimum_synergy, min(len(synergy_indices), score_limit)))
+        selected = list(synergy_indices[:synergy_keep])
+        selected_set = set(selected)
+        others = sorted(
+            (index for index in range(len(actions)) if index not in selected_set),
+            key=lambda index: float(pruning_scores[index]),
+            reverse=True,
+        )
+        for index in others:
+            if len(selected) >= score_limit:
+                break
+            selected.append(index)
+        return selected
+
+    @staticmethod
+    def _reserve_synergy_plans(plans, top_k):
+        """Hold half of the returned shortlist for the strongest public synergy pairs."""
+        limit = max(0, int(top_k))
+        if limit <= 0:
+            return []
+        ranked = sorted(plans or [], key=lambda row: float(row.get("plan_score", 0.0)), reverse=True)
+        anchors = [
+            row
+            for row in ranked
+            if bool((row.get("detail") or {}).get("pair_candidate_anchor"))
+        ]
+        quota = min(len(anchors), limit if limit == 1 else max(1, limit // 2))
+        selected = []
+        seen = set()
+        for row in anchors[:quota]:
+            key = row.get("action_key") or id(row)
+            if key in seen:
+                continue
+            selected.append(row)
+            seen.add(key)
+        for row in ranked:
+            key = row.get("action_key") or id(row)
+            if key in seen:
+                continue
+            selected.append(row)
+            seen.add(key)
+            if len(selected) >= limit:
+                break
+        selected.sort(key=lambda row: float(row.get("plan_score", 0.0)), reverse=True)
+        return selected[:limit]
+
     def _score_actions_with_unknowns(
         self,
         my_picks,
@@ -645,6 +702,10 @@ class BPRelationRecommender:
             first_pick_side,
         )
         normalized_relation = self._normalize_scores(relation_scores)
+        synergy_pair_keys = {
+            frozenset(pair.get("slugs", []))
+            for pair in synergy_pairs
+        }
         if pick_count == 2 and len(actions) > max(64, int(top_k) * 8):
             score_limit = min(len(actions), max(96, int(top_k) * 16))
             pruning_scores = []
@@ -653,11 +714,13 @@ class BPRelationRecommender:
                     quick_score_by_slug.get(slug, 0.5) for slug in action
                 ) / len(action)
                 pruning_scores.append(0.75 * norm_score + 0.25 * singleton_score)
-            selected_indices = sorted(
-                range(len(actions)),
-                key=lambda index: pruning_scores[index],
-                reverse=True,
-            )[:score_limit]
+            selected_indices = self._select_pair_indices_with_synergy(
+                actions,
+                pruning_scores,
+                synergy_pair_keys,
+                score_limit,
+                reserve_count=int(top_k),
+            )
             actions = [actions[index] for index in selected_indices]
             relation_scores = [relation_scores[index] for index in selected_indices]
             normalized_relation = [normalized_relation[index] for index in selected_indices]
@@ -666,10 +729,6 @@ class BPRelationRecommender:
 
         plans = []
         action_type = "pair" if pick_count == 2 else "single"
-        synergy_pair_keys = {
-            frozenset(pair.get("slugs", []))
-            for pair in synergy_pairs
-        }
         for action, raw_score, norm_score, policy_prob in zip(
             actions, relation_scores, normalized_relation, policy_probabilities
         ):
@@ -794,6 +853,8 @@ class BPRelationRecommender:
                     },
                 }
             )
+        if pick_count == 2:
+            return self._reserve_synergy_plans(plans, top_k)
         if preserve_evidence:
             plans = self._select_evidence_diverse_plans(plans, top_k)
         plans.sort(key=lambda row: row["plan_score"], reverse=True)

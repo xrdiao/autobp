@@ -111,6 +111,34 @@ class BPMechanismTests(unittest.TestCase):
         self.assertEqual(profile["skills"][0]["scales_with"], ["ATK"])
         self.assertEqual(profile["skills"][0]["hits"], 2)
 
+    def test_banning_a_threat_reduces_enemy_weight(self):
+        snapshot = {
+            "source": "test",
+            "aliases_by_slug": {},
+            "profiles_by_slug": {
+                "giana": {
+                    "name": "Giana",
+                    "tags": ["control"],
+                    "threat_tags": ["control"],
+                },
+                "plain": {
+                    "name": "Plain",
+                    "tags": [],
+                    "threat_tags": [],
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "mechanisms.json"
+            path.write_text(json.dumps(snapshot), encoding="utf-8")
+            layer = BPMechanismLayer(path)
+            removed = layer.score_removal(["giana", "plain"], "giana")
+            kept = layer.score_removal(["giana", "plain"], "plain")
+
+        self.assertTrue(removed["available"])
+        self.assertGreater(removed["reduction"], kept["reduction"])
+        self.assertGreater(removed["score"], kept["score"])
+
 
 if __name__ == "__main__":
     unittest.main()

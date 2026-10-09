@@ -20,6 +20,7 @@ from bp_recommender.prefix_value_common import (
     build_prefix_value_vocab,
     encode_prefix_list,
 )
+from bp_recommender.value_influence import median_absolute_residual
 from bp_core.transformer_common import PAD_TOKEN, PROJECT_ROOT, normalize_name
 from bp_core.rank_tiers import get_rank_context_from_record
 
@@ -346,6 +347,12 @@ def main():
     val_logits, val_labels, val_weights = collect_eval_outputs(model, val_loader, device)
     best_temperature, calibrated_val_loss = find_best_temperature(val_logits, val_labels, val_weights)
     uncalibrated_val_loss = weighted_bce(val_logits, val_labels, val_weights, 1.0)
+    calibrated_probabilities = torch.sigmoid(val_logits / max(float(best_temperature), 1e-6))
+    value_residual_noise = median_absolute_residual(
+        calibrated_probabilities.tolist(),
+        val_labels.tolist(),
+        val_weights.tolist(),
+    )
 
     torch.save(model.state_dict(), args.model_path)
     save_vocab(vocab, args.vocab_path)
@@ -375,6 +382,7 @@ def main():
         "uncalibrated_val_loss": uncalibrated_val_loss,
         "calibrated_val_loss": calibrated_val_loss,
         "best_val_loss": best_val_loss,
+        "value_residual_noise": value_residual_noise,
         "name_slug_aliases": resources["name_slug_aliases"],
         "display_name_map": resources["display_name_map"],
         "image_name_map": resources["image_name_map"],

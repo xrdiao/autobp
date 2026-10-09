@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from bp_core.data_common import load_record_rows
+from bp_recommender.value_influence import median_absolute_residual
 from bp_core.transformer_common import (
     PAD_TOKEN,
     PROJECT_ROOT,
@@ -684,6 +685,12 @@ def main():
     val_logits, val_labels, val_weights = collect_eval_outputs(model, val_loader)
     best_temperature, calibrated_val_loss = find_best_temperature(val_logits, val_labels, val_weights, candidates=TEMPERATURE_CANDIDATES)
     uncalibrated_val_loss = compute_weighted_bce_from_logits(val_logits, val_labels, val_weights, temperature=1.0)
+    calibrated_probabilities = torch.sigmoid(val_logits / max(float(best_temperature), 1e-6))
+    value_residual_noise = median_absolute_residual(
+        calibrated_probabilities.detach().cpu().tolist(),
+        val_labels.detach().cpu().tolist(),
+        val_weights.detach().cpu().tolist(),
+    )
     print(
         "temperature calibration:",
         {
@@ -724,6 +731,7 @@ def main():
         "best_val_loss": float(best_val_loss),
         "uncalibrated_val_loss": float(uncalibrated_val_loss),
         "calibrated_val_loss": float(calibrated_val_loss),
+        "value_residual_noise": float(value_residual_noise),
         "notes": [
             "transformer encoder full-draft evaluator for counterfactual ban recommendation",
             "trained from the current chronological bp_samples.sqlite full-draft states",
